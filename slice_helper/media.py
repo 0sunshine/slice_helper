@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import shutil
+from pathlib import Path
+
+from .config import Settings
+from .models import CutMode, MediaProbe
+
+
+class MediaError(RuntimeError):
+    pass
+
+
+class MediaService:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+    async def _run(self, *args: str, timeout: float) -> tuple[str, str]:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise MediaError(f"Executable not found: {args[0]}") from exc
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except TimeoutError as exc:
+            process.kill()
+            await process.communicate()
+            raise MediaError(f"Command timed out after {timeout:.0f}s") from exc
+        stdout_text = stdout.decode("utf-8", errors="replace")
+        stderr_text = stderr.decode("utf-8", errors="replace")
+        if process.returncode != 0:
+            message = stderr_text.strip().splitlines()[-1] if stderr_text.strip() else "unknown error"
+            raise MediaError(f"{Path(args[0]).name} failed: {message}")
+        return stdout_text, stderr_text
+
+    async def probe(self, path: Path) -> MediaProbe:
+        stdout, _ = await self._run(
+            self.settings.ffprobe_path,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration,format_name:stream=index,codec_type,codec_name",
+            "-of",
+            "json",
+            str(path),
+            timeout=120.0,
+        )
+        try:
+            payload = json.loads(stdout)
+            duration = float(payload["format"]["duration"])
+            format_name = str(payload["format"].get("format_name") or "")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise MediaError("FFprobe did not return a valid media duration") from exc
+        if duration <= 0:
+            raise MediaError("Media duration must be positive")
+        streams = payload.get("streams") or []
+        video = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
+        audio = next((stream for stream in streams if stream.get("codec_type") == "audio"), None)
+        if video is None:
+            raise MediaError("No video stream was found")
+        return MediaProbe(
+            duration=duration,
+            format_name=format_name,
+            video_codec=str(video.get("codec_name") or "unknown"),
+            audio_codec=str(audio.get("codec_name")) if audio else None,
+        )
+
+    async def cut(
+        self,
+        source: Path,
+        target: Path,
+        start: float,
+        end: float,
+        mode: CutMode | str,
+    ) -> MediaProbe:
+        duration = end - start
+        if start < 0 or duration <= 0:
+            raise MediaError("Invalid cut range")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial = target.with_name(f"{target.stem}.partial{target.suffix}")
+        partial.unlink(missing_ok=True)
+
+        command = [
+            self.settings.ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            f"{start:.3f}",
+            "-i",
+            str(source),
+            "-t",
+            f"{duration:.3f}",
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+        ]
+        if str(mode) == CutMode.TRANSCODE.value:
+            command.extend(
+                [
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "20",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                ]
+            )
+        else:
+            command.extend(["-c", "copy"])
+        command.extend(["-f", "mpegts", str(partial)])
+
+        try:
+            await self._run(*command, timeout=self.settings.ffmpeg_timeout_seconds)
+            result = await self.probe(partial)
+            if abs(result.duration - duration) > 60.0:
+                raise MediaError(
+                    f"Cut duration differs by more than 60s: expected {duration:.2f}, got {result.duration:.2f}"
+                )
+            os.replace(partial, target)
+            return await self.probe(target)
+        except Exception:
+            partial.unlink(missing_ok=True)
+            raise
+
+    async def tools_ready(self) -> tuple[bool, str]:
+        missing: list[str] = []
+        for value in (self.settings.ffmpeg_path, self.settings.ffprobe_path):
+            path = Path(value)
+            if path.is_absolute():
+                exists = path.is_file()
+            else:
+                exists = shutil.which(value) is not None
+            if not exists:
+                missing.append(value)
+        if missing:
+            return False, f"Missing executable(s): {', '.join(missing)}"
+        versions: list[str] = []
+        for executable in (self.settings.ffmpeg_path, self.settings.ffprobe_path):
+            try:
+                stdout, _ = await self._run(executable, "-version", timeout=10.0)
+            except MediaError as exc:
+                return False, str(exc)
+            first_line = stdout.splitlines()[0] if stdout.splitlines() else ""
+            match = re.search(r"\bversion\s+(\d+)", first_line)
+            if match and int(match.group(1)) < 6:
+                return False, f"{Path(executable).name} 6 or newer is required"
+            versions.append(first_line or f"{Path(executable).name} ok")
+        return True, "; ".join(versions)
