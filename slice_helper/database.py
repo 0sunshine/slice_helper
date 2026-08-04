@@ -26,6 +26,7 @@ class Database:
         "warnings_json",
         "started_at",
         "completed_at",
+        "islice_base_url",
     }
     WINDOW_FIELDS = {
         "requested_start",
@@ -36,7 +37,14 @@ class Database:
         "handoff_start",
         "error_message",
     }
-    ATTEMPT_FIELDS = {"status", "raw_response_path", "error_message", "finished_at"}
+    ATTEMPT_FIELDS = {
+        "status",
+        "service_status",
+        "progress",
+        "raw_response_path",
+        "error_message",
+        "finished_at",
+    }
 
     def __init__(self, path: Path):
         self.path = path
@@ -69,10 +77,16 @@ class Database:
                     source_size INTEGER NOT NULL,
                     source_mtime_ns INTEGER NOT NULL,
                     source_duration REAL NOT NULL,
+                    islice_base_url TEXT NOT NULL DEFAULT '',
                     template_id TEXT NOT NULL,
                     language TEXT NOT NULL,
                     channel_name TEXT NOT NULL DEFAULT '',
                     program_start_time TEXT,
+                    time_reference_source TEXT NOT NULL DEFAULT '',
+                    time_reference_text TEXT NOT NULL DEFAULT '',
+                    time_reference_confidence REAL,
+                    time_reference_frame_path TEXT NOT NULL DEFAULT '',
+                    time_reference_error TEXT NOT NULL DEFAULT '',
                     cut_mode TEXT NOT NULL,
                     status TEXT NOT NULL,
                     progress REAL NOT NULL DEFAULT 0,
@@ -114,6 +128,8 @@ class Database:
                     attempt_no INTEGER NOT NULL,
                     task_id TEXT NOT NULL UNIQUE,
                     status TEXT NOT NULL,
+                    service_status TEXT NOT NULL DEFAULT '',
+                    progress REAL NOT NULL DEFAULT 0,
                     raw_response_path TEXT NOT NULL DEFAULT '',
                     error_message TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
@@ -151,40 +167,215 @@ class Database:
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(1, ?)",
                 (utc_now(),),
             )
+            job_columns = {
+                row["name"]
+                for row in await (await db.execute("PRAGMA table_info(jobs)")).fetchall()
+            }
+            migrations = {
+                "time_reference_source": "TEXT NOT NULL DEFAULT ''",
+                "time_reference_text": "TEXT NOT NULL DEFAULT ''",
+                "time_reference_confidence": "REAL",
+                "time_reference_frame_path": "TEXT NOT NULL DEFAULT ''",
+                "time_reference_error": "TEXT NOT NULL DEFAULT ''",
+                "islice_base_url": "TEXT NOT NULL DEFAULT ''",
+            }
+            for column, declaration in migrations.items():
+                if column not in job_columns:
+                    await db.execute(f"ALTER TABLE jobs ADD COLUMN {column} {declaration}")
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(2, ?)",
+                (utc_now(),),
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(3, ?)",
+                (utc_now(),),
+            )
+            version_4 = await (
+                await db.execute("SELECT 1 FROM schema_version WHERE version=4")
+            ).fetchone()
+            if version_4 is None:
+                await db.execute(
+                    "UPDATE jobs SET status='pending_schedule' WHERE status='queued'"
+                )
+                await db.execute(
+                    "INSERT INTO schema_version(version, applied_at) VALUES(4, ?)",
+                    (utc_now(),),
+                )
+            attempt_columns = {
+                row["name"]
+                for row in await (await db.execute("PRAGMA table_info(attempts)")).fetchall()
+            }
+            attempt_migrations = {
+                "service_status": "TEXT NOT NULL DEFAULT ''",
+                "progress": "REAL NOT NULL DEFAULT 0",
+            }
+            for column, declaration in attempt_migrations.items():
+                if column not in attempt_columns:
+                    await db.execute(f"ALTER TABLE attempts ADD COLUMN {column} {declaration}")
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(5, ?)",
+                (utc_now(),),
+            )
             await db.commit()
 
     @staticmethod
     def _row(row: aiosqlite.Row | None) -> dict[str, Any] | None:
         return dict(row) if row is not None else None
 
-    async def create_job(self, record: dict[str, Any]) -> None:
+    async def create_job(self, record: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
         values = {
             **record,
-            "status": record.get("status", "queued"),
+            "status": record.get("status", "pending_schedule"),
             "progress": 0.0,
             "current_window": 0,
             "next_window_start": 0.0,
             "pause_requested": 0,
             "stop_requested": 0,
             "error_message": "",
-            "warnings_json": "[]",
+            "warnings_json": record.get("warnings_json", "[]"),
             "created_at": now,
             "updated_at": now,
         }
         columns = ", ".join(values)
         placeholders = ", ".join("?" for _ in values)
         async with self.connect() as db:
-            await db.execute(
-                f"INSERT INTO jobs ({columns}) VALUES ({placeholders})",
-                tuple(values.values()),
-            )
+            row = await (
+                await db.execute(
+                    f"INSERT INTO jobs ({columns}) VALUES ({placeholders}) RETURNING *",
+                    tuple(values.values()),
+                )
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Failed to create job")
             await db.commit()
+        return dict(row)
 
     async def get_job(self, job_id: str) -> dict[str, Any] | None:
         async with self.connect() as db:
             row = await (await db.execute("SELECT * FROM jobs WHERE id=?", (job_id,))).fetchone()
         return self._row(row)
+
+    async def assign_legacy_jobs_with_attempts(self, base_url: str) -> None:
+        async with self.connect() as db:
+            await db.execute(
+                """
+                UPDATE jobs SET islice_base_url=?, updated_at=?
+                WHERE islice_base_url=''
+                  AND EXISTS (
+                      SELECT 1 FROM windows w
+                      JOIN attempts a ON a.window_id=w.id
+                      WHERE w.job_id=jobs.id
+                  )
+                """,
+                (base_url.rstrip("/"), utc_now()),
+            )
+            await db.commit()
+
+    async def claim_schedulable_jobs(
+        self,
+        urls: tuple[str, ...],
+        limit: int,
+        progress_threshold: float = 71.0,
+    ) -> list[dict[str, Any]]:
+        if not urls:
+            raise ValueError("At least one iSlice URL must be configured")
+        if limit < 1:
+            return []
+        normalized_urls = tuple(dict.fromkeys(url.rstrip("/") for url in urls))
+        active_statuses = (
+            "queued",
+            "probing",
+            "running",
+            "pause_requested",
+            "stop_requested",
+        )
+        active_placeholders = ", ".join("?" for _ in active_statuses)
+        now = utc_now()
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            active_rows = await (
+                await db.execute(
+                    f"""
+                    SELECT
+                        j.islice_base_url,
+                        COALESCE((
+                            SELECT CASE
+                                WHEN a.status='completed' THEN 100.0
+                                WHEN a.status='polling' THEN a.progress
+                                ELSE 0.0
+                            END
+                            FROM windows w
+                            JOIN attempts a ON a.window_id=w.id
+                            WHERE w.job_id=j.id
+                              AND w.window_index=j.current_window
+                            ORDER BY a.attempt_no DESC
+                            LIMIT 1
+                        ), 0.0) AS current_progress
+                    FROM jobs j
+                    WHERE j.status IN ({active_placeholders})
+                      AND j.islice_base_url<>''
+                    """,
+                    active_statuses,
+                )
+            ).fetchall()
+            candidates = await (
+                await db.execute(
+                    "SELECT * FROM jobs WHERE status='pending_schedule' ORDER BY created_at, id"
+                )
+            ).fetchall()
+
+            blocked_urls = {
+                row["islice_base_url"]
+                for row in active_rows
+                if float(row["current_progress"]) < progress_threshold
+            }
+            claimed: list[dict[str, Any]] = []
+            for candidate_row in candidates:
+                candidate = dict(candidate_row)
+                assigned_url = str(candidate.get("islice_base_url") or "").rstrip("/")
+                if assigned_url:
+                    if assigned_url not in normalized_urls:
+                        await db.execute(
+                            "UPDATE jobs SET status='paused', error_message=?, updated_at=? WHERE id=?",
+                            (
+                                f"Job is assigned to unconfigured iSlice instance: {assigned_url}",
+                                now,
+                                candidate["id"],
+                            ),
+                        )
+                        continue
+                    if assigned_url in blocked_urls:
+                        continue
+                    selected_url = assigned_url
+                else:
+                    selected_url = next(
+                        (url for url in normalized_urls if url not in blocked_urls),
+                        None,
+                    )
+                    if selected_url is None:
+                        continue
+
+                await db.execute(
+                    """
+                    UPDATE jobs
+                    SET status='queued', islice_base_url=?, error_message='', updated_at=?
+                    WHERE id=? AND status='pending_schedule'
+                    """,
+                    (selected_url, now, candidate["id"]),
+                )
+                candidate["status"] = "queued"
+                candidate["islice_base_url"] = selected_url
+                candidate["error_message"] = ""
+                candidate["updated_at"] = now
+                claimed.append(candidate)
+                # A newly queued job has no current iSlice progress, so it closes
+                # this instance until its own current window reaches the threshold.
+                blocked_urls.add(selected_url)
+                if len(claimed) >= limit:
+                    break
+            await db.commit()
+        return claimed
 
     async def list_jobs(self, status: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
         query = """
@@ -225,7 +416,7 @@ class Database:
         async with self.connect() as db:
             await db.execute(
                 """
-                UPDATE jobs SET status='queued', updated_at=?
+                UPDATE jobs SET status='pending_schedule', updated_at=?
                 WHERE status IN ('probing', 'running')
                 """,
                 (now,),
@@ -245,16 +436,6 @@ class Database:
                 (now,),
             )
             await db.commit()
-
-    async def get_runnable_jobs(self, limit: int) -> list[dict[str, Any]]:
-        async with self.connect() as db:
-            rows = await (
-                await db.execute(
-                    "SELECT * FROM jobs WHERE status='queued' ORDER BY created_at LIMIT ?",
-                    (limit,),
-                )
-            ).fetchall()
-        return [dict(row) for row in rows]
 
     async def append_warning(self, job_id: str, warning: str) -> None:
         job = await self.get_job(job_id)

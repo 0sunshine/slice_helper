@@ -1,0 +1,16 @@
+[Unit]
+Description=Archive completed iSlice task media
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/islice-archiver/islice_archiver.py --config /etc/islice-archiver.ini run-once
+User=root
+Group=root
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

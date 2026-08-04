@@ -16,11 +16,21 @@ class ISliceConflictError(ISliceError):
     pass
 
 
+class ISliceConfigurationError(ISliceError):
+    pass
+
+
 class ISliceClient:
-    def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        transport: httpx.AsyncBaseTransport | None = None,
+        base_url: str | None = None,
+    ):
         self.settings = settings
+        self.base_url = (base_url or settings.islice_base_url).rstrip("/")
         self.client = httpx.AsyncClient(
-            base_url=settings.islice_base_url,
+            base_url=self.base_url,
             timeout=httpx.Timeout(30.0, connect=10.0),
             follow_redirects=True,
             trust_env=False,
@@ -93,3 +103,35 @@ class ISliceClient:
             return False, f"HTTP {response.status_code}"
         except httpx.HTTPError as exc:
             return False, str(exc)
+
+
+class ISlicePool:
+    def __init__(self, settings: Settings):
+        self.clients = {
+            url: ISliceClient(settings, base_url=url)
+            for url in settings.configured_islice_urls
+        }
+
+    @property
+    def urls(self) -> tuple[str, ...]:
+        return tuple(self.clients)
+
+    def get_client(self, base_url: str) -> ISliceClient:
+        normalized = base_url.rstrip("/")
+        try:
+            return self.clients[normalized]
+        except KeyError as exc:
+            raise ISliceConfigurationError(
+                f"Job is assigned to unconfigured iSlice instance: {normalized}"
+            ) from exc
+
+    async def close(self) -> None:
+        await asyncio.gather(*(client.close() for client in self.clients.values()))
+
+    async def ping(self) -> tuple[bool, dict[str, str]]:
+        results = await asyncio.gather(*(client.ping() for client in self.clients.values()))
+        checks = {
+            url: message
+            for url, (_ok, message) in zip(self.clients, results, strict=True)
+        }
+        return all(ok for ok, _message in results), checks

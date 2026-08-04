@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
+import logging
 import os
 import re
 import shutil
@@ -9,6 +11,10 @@ from pathlib import Path
 
 from .config import Settings
 from .models import CutMode, MediaProbe
+from .time_ocr import TimeOcrError, TimeReference, recognize_time_reference
+
+
+logger = logging.getLogger(__name__)
 
 
 class MediaError(RuntimeError):
@@ -88,6 +94,129 @@ class MediaService:
         partial = target.with_name(f"{target.stem}.partial{target.suffix}")
         partial.unlink(missing_ok=True)
 
+        async def render(*, repair_audio: bool = False) -> MediaProbe:
+            partial.unlink(missing_ok=True)
+            command = [
+                self.settings.ffmpeg_path,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-fflags",
+                "+discardcorrupt",
+                "-err_detect",
+                "ignore_err",
+                "-ss",
+                f"{start:.3f}",
+                "-i",
+                str(source),
+                "-t",
+                f"{duration:.3f}",
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+            ]
+            if str(mode) == CutMode.TRANSCODE.value:
+                command.extend(
+                    [
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "veryfast",
+                        "-crf",
+                        "20",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "128k",
+                    ]
+                )
+            elif repair_audio:
+                command.extend(
+                    [
+                        "-c:v",
+                        "copy",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "128k",
+                    ]
+                )
+            else:
+                command.extend(["-c", "copy"])
+            command.extend(["-f", "mpegts", str(partial)])
+
+            await self._run(*command, timeout=self.settings.ffmpeg_timeout_seconds)
+            result = await self.probe(partial)
+            if abs(result.duration - duration) > 60.0:
+                raise MediaError(
+                    f"Cut duration differs by more than 60s: expected {duration:.2f}, got {result.duration:.2f}"
+                )
+            await self.validate_for_islice(partial, result)
+            return result
+
+        try:
+            try:
+                result = await render()
+            except MediaError as initial_error:
+                if str(mode) != CutMode.COPY.value:
+                    raise
+                logger.warning(
+                    "Copied chunk failed downstream validation; retrying with copied "
+                    "video and repaired AAC audio: %s",
+                    initial_error,
+                )
+                try:
+                    result = await render(repair_audio=True)
+                except MediaError as repair_error:
+                    raise MediaError(
+                        "Chunk failed validation after audio repair; video was not "
+                        f"re-encoded: {repair_error}"
+                    ) from repair_error
+            os.replace(partial, target)
+            return await self.probe(target)
+        except Exception:
+            partial.unlink(missing_ok=True)
+            raise
+
+    async def validate_for_islice(
+        self, path: Path, probe: MediaProbe | None = None
+    ) -> None:
+        media_probe = probe or await self.probe(path)
+        command = [
+            self.settings.ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-xerror",
+            "-i",
+            str(path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c",
+            "copy",
+        ]
+        # iSlice writes MP4 segments. Scanning every AAC packet through the same
+        # ADTS conversion catches malformed packets that metadata-only ffprobe misses.
+        if media_probe.audio_codec == "aac":
+            command.extend(["-bsf:a", "aac_adtstoasc"])
+        command.extend(["-f", "null", "-"])
+        try:
+            await self._run(*command, timeout=self.settings.ffmpeg_timeout_seconds)
+        except MediaError as exc:
+            raise MediaError(f"Chunk is not safe for iSlice segmentation: {exc}") from exc
+
+    async def detect_time_reference(
+        self, source: Path, frame_path: Path, *, frame_offset_seconds: float = 0.0
+    ) -> TimeReference:
+        if frame_offset_seconds < 0:
+            raise MediaError("OCR frame offset must not be negative")
+        frame_path.parent.mkdir(parents=True, exist_ok=True)
+        partial = frame_path.with_name(f"{frame_path.stem}.partial{frame_path.suffix}")
+        partial.unlink(missing_ok=True)
         command = [
             self.settings.ffmpeg_path,
             "-hide_banner",
@@ -95,47 +224,35 @@ class MediaService:
             "error",
             "-y",
             "-ss",
-            f"{start:.3f}",
+            f"{frame_offset_seconds:.3f}",
             "-i",
             str(source),
-            "-t",
-            f"{duration:.3f}",
             "-map",
             "0:v:0",
-            "-map",
-            "0:a:0?",
+            "-frames:v",
+            "1",
+            str(partial),
         ]
-        if str(mode) == CutMode.TRANSCODE.value:
-            command.extend(
-                [
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "20",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "128k",
-                ]
-            )
-        else:
-            command.extend(["-c", "copy"])
-        command.extend(["-f", "mpegts", str(partial)])
-
         try:
-            await self._run(*command, timeout=self.settings.ffmpeg_timeout_seconds)
-            result = await self.probe(partial)
-            if abs(result.duration - duration) > 60.0:
-                raise MediaError(
-                    f"Cut duration differs by more than 60s: expected {duration:.2f}, got {result.duration:.2f}"
-                )
-            os.replace(partial, target)
-            return await self.probe(target)
-        except Exception:
+            await self._run(*command, timeout=120.0)
+            if not partial.is_file() or partial.stat().st_size == 0:
+                raise MediaError("FFmpeg did not create the OCR reference frame")
+            os.replace(partial, frame_path)
+            return await asyncio.to_thread(
+                recognize_time_reference,
+                frame_path,
+                frame_offset_seconds=frame_offset_seconds,
+            )
+        except TimeOcrError as exc:
+            raise MediaError(str(exc)) from exc
+        finally:
             partial.unlink(missing_ok=True)
-            raise
+
+    @staticmethod
+    def ocr_ready() -> tuple[bool, str]:
+        if importlib.util.find_spec("rapidocr_onnxruntime") is None:
+            return False, "rapidocr-onnxruntime is not installed"
+        return True, "rapidocr-onnxruntime available"
 
     async def tools_ready(self) -> tuple[bool, str]:
         missing: list[str] = []

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TS 连续拆条</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}?v={{ version }}">
 </head>
 <body>
   <header class="topbar">
@@ -30,7 +30,8 @@
           状态
           <select id="statusFilter">
             <option value="">全部</option>
-            <option value="queued">排队中</option>
+            <option value="pending_schedule">待调度</option>
+            <option value="queued">已调度</option>
             <option value="probing">探测中</option>
             <option value="running">处理中</option>
             <option value="pause_requested">等待暂停</option>
@@ -72,34 +73,69 @@
       </div>
 
       <div class="summary-grid">
+        <div><span>iSlice 实例</span><strong id="summaryISlice" class="mono"></strong></div>
         <div><span>状态</span><strong id="summaryStatus"></strong></div>
         <div><span>源时长</span><strong id="summaryDuration"></strong></div>
         <div><span>当前窗口</span><strong id="summaryWindow"></strong></div>
         <div><span>切割方式</span><strong id="summaryCutMode"></strong></div>
+        <div><span>真实时间基准</span><strong id="summaryRealTime"></strong></div>
       </div>
       <div class="progress-track"><div id="detailProgress" class="progress-value"></div></div>
       <p id="detailError" class="error-banner" hidden></p>
       <div id="detailWarnings" class="warning-list"></div>
 
-      <div class="subsection-heading">
-        <h3>窗口时间线</h3>
-      </div>
-      <div class="table-scroll">
-        <table class="data-table compact">
-          <thead><tr><th>#</th><th>源起点</th><th>整点终点</th><th>状态</th><th>交接起点</th><th>错误</th></tr></thead>
-          <tbody id="windowsBody"></tbody>
-        </table>
-      </div>
+      <div class="media-workspace">
+        <section id="segmentPreview" class="segment-preview">
+          <div class="segment-preview-header">
+            <div>
+              <span class="preview-label">视频预览</span>
+              <p id="previewTitle" class="preview-title">未选择片段</p>
+            </div>
+            <button id="closePreviewButton" class="icon-button" type="button" aria-label="关闭预览" disabled>&times;</button>
+          </div>
+          <div class="segment-preview-media">
+            <video id="previewVideo" controls playsinline preload="metadata"></video>
+            <p id="previewStatus" class="preview-status" role="status">未选择片段</p>
+          </div>
+          <div class="segment-preview-details">
+            <p id="previewTime" class="preview-time"></p>
+            <div class="preview-actions">
+              <a id="openPreviewExternally" class="button secondary small external-link" target="_blank" rel="noreferrer" hidden>新窗口打开</a>
+            </div>
+          </div>
+        </section>
 
-      <div class="subsection-heading segments-heading">
-        <h3>拆条结果</h3>
-        <label><input id="acceptedOnly" type="checkbox" checked> 仅最终采用</label>
-      </div>
-      <div class="table-scroll">
-        <table class="data-table compact">
-          <thead><tr><th>时间</th><th>标题</th><th>主题</th><th>关键词</th><th>来源窗口</th><th>状态</th><th>视频</th></tr></thead>
-          <tbody id="segmentsBody"></tbody>
-        </table>
+        <section class="segment-results-panel">
+          <div class="subsection-heading segments-heading">
+            <h3>拆条结果</h3>
+            <div class="segments-controls">
+              <label><input id="acceptedOnly" type="checkbox" checked> 仅最终采用</label>
+              <div class="segment-pagination" aria-label="拆条结果分页">
+                <span id="segmentPageInfo">1 / 1</span>
+                <button id="previousSegmentPage" class="icon-button pagination-button" type="button" aria-label="上一页" title="上一页">&lsaquo;</button>
+                <button id="nextSegmentPage" class="icon-button pagination-button" type="button" aria-label="下一页" title="下一页">&rsaquo;</button>
+              </div>
+            </div>
+          </div>
+          <div class="table-scroll segments-table-scroll">
+            <table class="data-table compact segments-table">
+              <thead><tr><th>源偏移</th><th>真实时间</th><th>标题</th><th>主题</th><th>关键词</th><th>来源窗口</th><th>状态</th></tr></thead>
+              <tbody id="segmentsBody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="window-timeline-panel">
+          <div class="window-timeline-heading">
+            <h3>窗口时间线</h3>
+          </div>
+          <div class="table-scroll window-table-scroll">
+            <table class="data-table compact window-table">
+              <thead><tr><th>#</th><th>源起点</th><th>整点终点</th><th>状态</th><th>小任务进度</th><th>交接起点</th><th>错误</th></tr></thead>
+              <tbody id="windowsBody"></tbody>
+            </table>
+          </div>
+        </section>
       </div>
     </section>
   </main>
@@ -116,7 +152,7 @@
         <label>语言<select name="language"><option value="zh">中文</option><option value="en">英文</option></select></label>
         <label>切割方式<select name="cutMode"><option value="copy">流复制</option><option value="transcode">重编码</option></select></label>
         <label>频道<input name="channelName" placeholder="可选"></label>
-        <label class="full">节目开始时间<input name="programStartTime" type="datetime-local"></label>
+        <label class="full">时间识别失败回退值<input name="programStartTime" type="datetime-local"></label>
       </div>
       <p id="createError" class="form-error" hidden></p>
       <div class="dialog-actions">
@@ -127,6 +163,6 @@
   </dialog>
 
   <div id="toast" class="toast" hidden></div>
-  <script src="{{ url_for('static', path='/app.js') }}" defer></script>
+  <script src="{{ url_for('static', path='/app.js') }}?v={{ version }}" defer></script>
 </body>
 </html>

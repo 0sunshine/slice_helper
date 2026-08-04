@@ -38,8 +38,15 @@ class Settings:
     window_seconds: float = 3600.0
     window_boundary_tolerance_seconds: float = 1.0
     handoff_max_seconds: float = 3000.0
+    pipeline_progress_threshold: float = 71.0
     # One initial submission plus three retries using the 5/15/45s backoff.
     max_service_attempts: int = 4
+    islice_base_urls: tuple[str, ...] = ()
+
+    @property
+    def configured_islice_urls(self) -> tuple[str, ...]:
+        urls = self.islice_base_urls or (self.islice_base_url,)
+        return tuple(dict.fromkeys(url.rstrip("/") for url in urls))
 
     @property
     def database_path(self) -> Path:
@@ -55,15 +62,28 @@ class Settings:
                 value = root / value
             return value.resolve()
 
-        islice_url = os.getenv("ISLICE_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+        legacy_islice_url = os.getenv(
+            "ISLICE_BASE_URL", "http://127.0.0.1:8000"
+        ).rstrip("/")
+        raw_islice_urls = os.getenv("ISLICE_BASE_URLS", "")
+        islice_urls = tuple(
+            dict.fromkeys(
+                value.strip().rstrip("/")
+                for value in raw_islice_urls.split(",")
+                if value.strip()
+            )
+        ) or (legacy_islice_url,)
         public_url = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8090").rstrip("/")
-        if not islice_url.startswith(("http://", "https://")):
-            raise ValueError("ISLICE_BASE_URL must use http:// or https://")
+        invalid_islice_urls = [
+            url for url in islice_urls if not url.startswith(("http://", "https://"))
+        ]
+        if invalid_islice_urls:
+            raise ValueError("Every ISLICE_BASE_URLS entry must use http:// or https://")
         if not public_url.startswith(("http://", "https://")):
             raise ValueError("PUBLIC_BASE_URL must use http:// or https://")
 
         return cls(
-            islice_base_url=islice_url,
+            islice_base_url=islice_urls[0],
             public_base_url=public_url,
             host=os.getenv("HOST", "0.0.0.0"),
             port=_env_int("PORT", 8090),
@@ -71,8 +91,12 @@ class Settings:
             temp_dir=resolve_dir("TEMP_DIR", "temp"),
             ffmpeg_path=os.getenv("FFMPEG_PATH", "ffmpeg"),
             ffprobe_path=os.getenv("FFPROBE_PATH", "ffprobe"),
-            max_active_jobs=_env_int("MAX_ACTIVE_JOBS", 1),
+            max_active_jobs=_env_int("MAX_ACTIVE_JOBS", 15),
             poll_interval_seconds=_env_float("POLL_INTERVAL_SECONDS", 15.0),
             window_timeout_seconds=_env_float("WINDOW_TIMEOUT_SECONDS", 21600.0),
             ffmpeg_timeout_seconds=_env_float("FFMPEG_TIMEOUT_SECONDS", 7200.0),
+            pipeline_progress_threshold=_env_float(
+                "PIPELINE_PROGRESS_THRESHOLD", 71.0, minimum=1.0
+            ),
+            islice_base_urls=islice_urls,
         )

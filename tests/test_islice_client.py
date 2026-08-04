@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
 import pytest
 
 from slice_helper.config import Settings
-from slice_helper.islice import ISliceClient, ISliceConflictError
+from slice_helper.islice import (
+    ISliceClient,
+    ISliceConfigurationError,
+    ISliceConflictError,
+    ISlicePool,
+)
 
 
 def settings(tmp_path: Path) -> Settings:
@@ -23,6 +29,19 @@ def settings(tmp_path: Path) -> Settings:
         poll_interval_seconds=0.01,
         window_timeout_seconds=1,
         ffmpeg_timeout_seconds=10,
+    )
+
+
+def test_settings_parse_multiple_islice_urls(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv(
+        "ISLICE_BASE_URLS",
+        "http://islice-a.test/, http://islice-b.test,http://islice-a.test",
+    )
+    configured = Settings.from_env(tmp_path)
+    assert configured.islice_base_url == "http://islice-a.test"
+    assert configured.configured_islice_urls == (
+        "http://islice-a.test",
+        "http://islice-b.test",
     )
 
 
@@ -58,3 +77,18 @@ async def test_ensure_task_rejects_conflicting_existing_task(tmp_path: Path) -> 
             "task1", {"taskId": "task1", "videoPath": "http://helper/chunk.ts"}
         )
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_pool_resolves_only_configured_instances(tmp_path: Path) -> None:
+    configured = settings(tmp_path)
+    configured = replace(
+        configured,
+        islice_base_urls=("http://islice-a.test/", "http://islice-b.test"),
+    )
+    pool = ISlicePool(configured)
+    assert pool.urls == ("http://islice-a.test", "http://islice-b.test")
+    assert pool.get_client("http://islice-b.test/").base_url == "http://islice-b.test"
+    with pytest.raises(ISliceConfigurationError):
+        pool.get_client("http://removed-islice.test")
+    await pool.close()

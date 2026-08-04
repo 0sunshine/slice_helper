@@ -13,7 +13,7 @@ from typing import Any
 
 from .config import Settings
 from .database import Database, utc_now
-from .islice import ISliceClient, ISliceError
+from .islice import ISliceClient, ISliceError, ISlicePool
 from .media import MediaError, MediaService
 from .models import CutMode, JobStatus, WindowStatus
 from .processing import (
@@ -38,7 +38,7 @@ class Orchestrator:
         settings: Settings,
         database: Database,
         media: MediaService,
-        islice: ISliceClient,
+        islice: ISliceClient | ISlicePool,
     ):
         self.settings = settings
         self.database = database
@@ -74,24 +74,35 @@ class Orchestrator:
         while not self._stopping:
             capacity = self.settings.max_active_jobs - len(self._active)
             if capacity > 0:
-                for job in await self.database.get_runnable_jobs(capacity):
+                for job in await self.database.claim_schedulable_jobs(
+                    self.settings.configured_islice_urls,
+                    capacity,
+                    self.settings.pipeline_progress_threshold,
+                ):
                     job_id = job["id"]
                     if job_id in self._active:
                         continue
                     task = asyncio.create_task(self._process_job(job_id), name=f"job-{job_id}")
                     self._active[job_id] = task
-                    task.add_done_callback(lambda _task, key=job_id: self._active.pop(key, None))
+                    task.add_done_callback(
+                        lambda _task, key=job_id: self._job_finished(key)
+                    )
             self._wake.clear()
             try:
                 await asyncio.wait_for(self._wake.wait(), timeout=1.0)
             except TimeoutError:
                 pass
 
+    def _job_finished(self, job_id: str) -> None:
+        self._active.pop(job_id, None)
+        self.notify()
+
     async def _process_job(self, job_id: str) -> None:
         try:
             job = await self.database.get_job(job_id)
             if not job or job["status"] != JobStatus.QUEUED.value:
                 return
+            islice_client = self._islice_client(job)
             fields: dict[str, Any] = {"status": JobStatus.RUNNING.value, "error_message": ""}
             if not job.get("started_at"):
                 fields["started_at"] = utc_now()
@@ -138,7 +149,7 @@ class Orchestrator:
                     await self._remove_chunk(job_id, window)
                     continue
 
-                completed = await self._process_window(job, window)
+                completed = await self._process_window(job, window, islice_client)
                 if not completed:
                     return
         except asyncio.CancelledError:
@@ -168,7 +179,17 @@ class Orchestrator:
             return False
         return stat.st_size == job["source_size"] and stat.st_mtime_ns == job["source_mtime_ns"]
 
-    async def _process_window(self, job: dict[str, Any], window: dict[str, Any]) -> bool:
+    def _islice_client(self, job: dict[str, Any]) -> ISliceClient:
+        if isinstance(self.islice, ISlicePool):
+            return self.islice.get_client(str(job.get("islice_base_url") or ""))
+        return self.islice
+
+    async def _process_window(
+        self,
+        job: dict[str, Any],
+        window: dict[str, Any],
+        islice_client: ISliceClient,
+    ) -> bool:
         job_id = job["id"]
         index = int(window["window_index"])
         start = float(window["requested_start"])
@@ -181,13 +202,23 @@ class Orchestrator:
 
         if not chunk_path.is_file():
             await self.database.update_window(window["id"], status=WindowStatus.CUTTING.value)
-            await self.media.cut(
-                Path(job["source_path"]),
-                chunk_path,
-                start,
-                end,
-                CutMode(job["cut_mode"]),
-            )
+            try:
+                await self.media.cut(
+                    Path(job["source_path"]),
+                    chunk_path,
+                    start,
+                    end,
+                    CutMode(job["cut_mode"]),
+                )
+            except MediaError as exc:
+                message = f"Window {index + 1} media preparation failed: {exc}"
+                await self.database.update_window(
+                    window["id"],
+                    status=WindowStatus.FAILED.value,
+                    error_message=str(exc),
+                )
+                await self._pause_job(job_id, message)
+                return False
         await self.database.update_window(
             window["id"],
             status=WindowStatus.READY.value,
@@ -217,7 +248,11 @@ class Orchestrator:
 
         if terminal_payload is None:
             reusable = next(
-                (attempt for attempt in attempt_items if attempt["status"] != "failed"),
+                (
+                    attempt
+                    for attempt in attempt_items
+                    if attempt["status"] not in {"failed", "discarded"}
+                ),
                 None,
             )
             first_attempt_no = (
@@ -246,11 +281,14 @@ class Orchestrator:
                     job, attempt["task_id"], chunk_url, start
                 )
                 try:
-                    existing = await self.islice.ensure_task(attempt["task_id"], request)
+                    existing = await islice_client.ensure_task(attempt["task_id"], request)
                     await self._raise_if_control_requested(job_id)
+                    service_status, service_progress = self._task_progress(existing)
                     await self.database.update_attempt(
                         attempt["id"],
                         status="polling",
+                        service_status=service_status,
+                        progress=service_progress,
                         error_message="",
                     )
                     await self.database.update_window(
@@ -259,7 +297,12 @@ class Orchestrator:
                     payload = (
                         existing
                         if self._is_terminal(existing)
-                        else await self._poll(job_id, attempt["task_id"])
+                        else await self._poll(
+                            job_id,
+                            attempt["id"],
+                            attempt["task_id"],
+                            islice_client,
+                        )
                     )
                     raw_path = await self._write_raw(job_id, index, attempt_no, payload)
                     status = str(payload["taskInfo"].get("status") or "")
@@ -267,6 +310,8 @@ class Orchestrator:
                         await self.database.update_attempt(
                             attempt["id"],
                             status="completed",
+                            service_status=status,
+                            progress=self._task_progress(payload)[1],
                             raw_response_path=str(raw_path),
                             finished_at=utc_now(),
                         )
@@ -280,6 +325,8 @@ class Orchestrator:
                     await self.database.update_attempt(
                         attempt["id"],
                         status="failed",
+                        service_status=status,
+                        progress=self._task_progress(payload)[1],
                         raw_response_path=str(raw_path),
                         error_message=error,
                         finished_at=utc_now(),
@@ -378,13 +425,19 @@ class Orchestrator:
             request["programStartTime"] = (base + timedelta(seconds=window_start)).isoformat()
         return request
 
-    async def _poll(self, job_id: str, task_id: str) -> dict[str, Any]:
+    async def _poll(
+        self,
+        job_id: str,
+        attempt_id: int,
+        task_id: str,
+        islice_client: ISliceClient,
+    ) -> dict[str, Any]:
         deadline = time.monotonic() + self.settings.window_timeout_seconds
         consecutive_errors = 0
         while time.monotonic() < deadline:
             await self._raise_if_control_requested(job_id)
             try:
-                payload = await self.islice.get_task_info(task_id)
+                payload = await islice_client.get_task_info(task_id)
                 if payload is None:
                     raise ISliceError("Task disappeared from iSlice")
                 consecutive_errors = 0
@@ -396,11 +449,30 @@ class Orchestrator:
                     job_id, self.RETRY_DELAYS[consecutive_errors - 1]
                 )
                 continue
+            service_status, service_progress = self._task_progress(payload)
+            await self.database.update_attempt(
+                attempt_id,
+                service_status=service_status,
+                progress=service_progress,
+            )
             await self._raise_if_control_requested(job_id)
             if self._is_terminal(payload):
                 return payload
             await self._sleep_with_control(job_id, self.settings.poll_interval_seconds)
         raise TimeoutError(f"Task {task_id} exceeded the window timeout")
+
+    @staticmethod
+    def _task_progress(payload: dict[str, Any] | None) -> tuple[str, float]:
+        task_info = payload.get("taskInfo", {}) if payload else {}
+        status = str(task_info.get("status") or "")
+        raw_progress = task_info.get("progress")
+        if raw_progress is None and status == "completed":
+            return status, 100.0
+        try:
+            progress = float(raw_progress or 0)
+        except (TypeError, ValueError):
+            progress = 0.0
+        return status, min(100.0, max(0.0, progress))
 
     async def _control_requested(self, job_id: str) -> bool:
         job = await self.database.get_job(job_id)
@@ -489,7 +561,7 @@ class Orchestrator:
             segment["keywords"] = json.loads(segment.pop("keywords_json"))
             segment["raw"] = json.loads(segment.pop("raw_json"))
         manifest = {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "generatedAt": utc_now(),
             "externalMediaMayExpire": True,
             "job": {

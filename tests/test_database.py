@@ -28,9 +28,113 @@ async def test_database_persists_and_recovers_jobs(tmp_path: Path) -> None:
     )
     await database.update_job("job1", status="running")
     await database.recover_jobs()
-    assert (await database.get_job("job1"))["status"] == "queued"
+    recovered = await database.get_job("job1")
+    assert recovered["status"] == "pending_schedule"
+    assert recovered["time_reference_source"] == ""
+    assert recovered["time_reference_confidence"] is None
+
+    async with database.connect() as db:
+        versions = await (await db.execute("SELECT version FROM schema_version ORDER BY version")).fetchall()
+    assert [row["version"] for row in versions] == [1, 2, 3, 4, 5]
+    assert recovered["islice_base_url"] == ""
 
     window = await database.upsert_window("job1", 0, 0, 3600)
     same_window = await database.upsert_window("job1", 0, 99, 999)
     assert window["id"] == same_window["id"]
     assert same_window["requested_start"] == 0
+    attempt = await database.create_attempt(window["id"], 1, "legacy-task")
+    assert attempt["service_status"] == ""
+    assert attempt["progress"] == 0
+    await database.assign_legacy_jobs_with_attempts("http://islice-a.test/")
+    assert (await database.get_job("job1"))["islice_base_url"] == "http://islice-a.test"
+
+
+@pytest.mark.asyncio
+async def test_database_reopens_islice_scheduling_at_progress_threshold(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "state.db")
+    await database.initialize()
+    urls = ("http://islice-a.test",)
+
+    for job_id in ("job-a", "job-b", "job-c"):
+        await database.create_job(
+            {
+                "id": job_id,
+                "source_path": str(tmp_path / f"{job_id}.ts"),
+                "source_size": 10,
+                "source_mtime_ns": 20,
+                "source_duration": 60.0,
+                "template_id": "general",
+                "language": "zh",
+                "channel_name": "",
+                "program_start_time": None,
+                "cut_mode": "copy",
+                "total_windows": 1,
+            }
+        )
+
+    claimed = await database.claim_schedulable_jobs(urls, 3, 71)
+    assert [(job["id"], job["islice_base_url"]) for job in claimed] == [
+        ("job-a", urls[0]),
+    ]
+    await database.update_job("job-a", status="running")
+    window_a = await database.upsert_window("job-a", 0, 0, 60)
+    attempt_a = await database.create_attempt(window_a["id"], 1, "job-a-w0-a1")
+    await database.update_attempt(attempt_a["id"], status="polling", progress=70)
+
+    assert not await database.claim_schedulable_jobs(urls, 3, 71)
+    assert (await database.get_job("job-c"))["status"] == "pending_schedule"
+    assert (await database.get_job("job-c"))["islice_base_url"] == ""
+
+    await database.update_attempt(attempt_a["id"], progress=71)
+    claimed = await database.claim_schedulable_jobs(urls, 3, 71)
+    assert [(job["id"], job["islice_base_url"]) for job in claimed] == [
+        ("job-b", urls[0])
+    ]
+
+    # The newly queued job closes admission until its own current task reaches 71%.
+    assert not await database.claim_schedulable_jobs(urls, 3, 71)
+    await database.update_job("job-b", status="running")
+    window_b = await database.upsert_window("job-b", 0, 0, 60)
+    attempt_b = await database.create_attempt(window_b["id"], 1, "job-b-w0-a1")
+    await database.update_attempt(attempt_b["id"], status="polling", progress=71)
+    claimed = await database.claim_schedulable_jobs(urls, 3, 71)
+    assert [(job["id"], job["islice_base_url"]) for job in claimed] == [
+        ("job-c", urls[0])
+    ]
+
+
+@pytest.mark.asyncio
+async def test_paused_job_keeps_assignment_without_reserving_islice(tmp_path: Path) -> None:
+    database = Database(tmp_path / "state.db")
+    await database.initialize()
+    common = {
+        "source_path": str(tmp_path / "source.ts"),
+        "source_size": 10,
+        "source_mtime_ns": 20,
+        "source_duration": 60.0,
+        "template_id": "general",
+        "language": "zh",
+        "channel_name": "",
+        "program_start_time": None,
+        "cut_mode": "copy",
+        "total_windows": 1,
+    }
+    await database.create_job(
+        {
+            **common,
+            "id": "bound-job",
+            "status": "paused",
+            "islice_base_url": "http://islice-a.test",
+        }
+    )
+    await database.create_job({**common, "id": "new-job"})
+
+    claimed = await database.claim_schedulable_jobs(("http://islice-a.test",), 1)
+    assert [(job["id"], job["islice_base_url"]) for job in claimed] == [
+        ("new-job", "http://islice-a.test")
+    ]
+    assert (await database.get_job("bound-job"))["islice_base_url"] == (
+        "http://islice-a.test"
+    )

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from slice_helper.config import Settings
 from slice_helper.database import Database
-from slice_helper.islice import ISliceError
+from slice_helper.islice import ISliceError, ISlicePool
+from slice_helper.media import MediaError
 from slice_helper.models import MediaProbe
 from slice_helper.orchestrator import Orchestrator
 
@@ -17,6 +19,11 @@ class FakeMedia:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(b"fake-ts")
         return MediaProbe(duration=3600, format_name="mpegts", video_codec="h264")
+
+
+class InvalidMedia:
+    async def cut(self, _source, _target, _start, _end, _mode):
+        raise MediaError("chunk failed validation after audio repair")
 
 
 class FakeISlice:
@@ -57,9 +64,10 @@ class PausingISlice:
             )
             return {
                 "taskInfo": {
-                    "taskId": task_id,
-                    "status": "processing",
-                    "videoPath": "unused",
+                "taskId": task_id,
+                "status": "processing",
+                "progress": 37,
+                "videoPath": "unused",
                 },
                 "segments": [],
             }
@@ -67,6 +75,7 @@ class PausingISlice:
             "taskInfo": {
                 "taskId": task_id,
                 "status": "completed",
+                "progress": 100,
                 "videoPath": "unused",
             },
             "segments": [{"startTime": 0, "endTime": 3600, "title": "done"}],
@@ -124,6 +133,7 @@ async def create_job(database: Database, source: Path, *, duration: float) -> No
     await database.create_job(
         {
             "id": "abc123",
+            "status": "queued",
             "source_path": str(source),
             "source_size": stat.st_size,
             "source_mtime_ns": stat.st_mtime_ns,
@@ -162,6 +172,7 @@ async def test_two_window_job_hands_tail_to_next_window(tmp_path: Path) -> None:
     await database.create_job(
         {
             "id": "abc123",
+            "status": "queued",
             "source_path": str(source),
             "source_size": stat.st_size,
             "source_mtime_ns": stat.st_mtime_ns,
@@ -213,13 +224,18 @@ async def test_pause_is_honored_after_poll_and_resume_reuses_attempt(tmp_path: P
     attempts = await database.get_attempts(window["id"])
     assert len(attempts) == 1
     assert attempts[0]["status"] == "polling"
+    assert attempts[0]["service_status"] == "processing"
+    assert attempts[0]["progress"] == 37
 
     islice.resume = True
     await database.update_job("abc123", status="queued", pause_requested=0)
     await orchestrator._process_job("abc123")
 
     assert (await database.get_job("abc123"))["status"] == "completed"
-    assert len(await database.get_attempts(window["id"])) == 1
+    attempts = await database.get_attempts(window["id"])
+    assert len(attempts) == 1
+    assert attempts[0]["service_status"] == "completed"
+    assert attempts[0]["progress"] == 100
 
 
 @pytest.mark.asyncio
@@ -253,6 +269,29 @@ async def test_initial_attempt_plus_three_retries_then_pause(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_invalid_chunk_pauses_before_islice_submission(tmp_path: Path) -> None:
+    source = tmp_path / "source.ts"
+    source.write_bytes(b"source")
+    configured = make_settings(tmp_path)
+    database = Database(configured.database_path)
+    await database.initialize()
+    await create_job(database, source, duration=3600)
+    islice = FailingISlice()
+    orchestrator = Orchestrator(configured, database, InvalidMedia(), islice)
+
+    await orchestrator._process_job("abc123")
+
+    job = await database.get_job("abc123")
+    window = (await database.get_windows("abc123"))[0]
+    assert job["status"] == "paused"
+    assert "media preparation failed" in job["error_message"]
+    assert window["status"] == "failed"
+    assert "audio repair" in window["error_message"]
+    assert islice.calls == 0
+    assert not await database.get_attempts(window["id"])
+
+
+@pytest.mark.asyncio
 async def test_cross_window_overlap_pauses_without_committing_new_segments(
     tmp_path: Path,
 ) -> None:
@@ -273,3 +312,59 @@ async def test_cross_window_overlap_pauses_without_committing_new_segments(
     assert windows[0]["status"] == "completed"
     assert windows[1]["status"] == "failed"
     assert len(await database.get_segments("abc123")) == 1
+
+
+@pytest.mark.asyncio
+async def test_all_windows_stay_on_the_job_assigned_islice(tmp_path: Path) -> None:
+    source = tmp_path / "source.ts"
+    source.write_bytes(b"source")
+    configured = make_settings(tmp_path)
+    configured = replace(
+        configured,
+        islice_base_urls=("http://islice-a.test", "http://islice-b.test"),
+    )
+    database = Database(configured.database_path)
+    await database.initialize()
+    await create_job(database, source, duration=7200)
+    await database.update_job("abc123", islice_base_url="http://islice-b.test")
+
+    selected = FakeISlice()
+
+    class UnexpectedISlice:
+        async def ensure_task(self, _task_id, _request):
+            raise AssertionError("job was dispatched to the wrong iSlice")
+
+    pool = ISlicePool(configured)
+    await pool.close()
+    pool.clients = {
+        "http://islice-a.test": UnexpectedISlice(),
+        "http://islice-b.test": selected,
+    }
+    orchestrator = Orchestrator(configured, database, FakeMedia(), pool)
+    await orchestrator._process_job("abc123")
+
+    job = await database.get_job("abc123")
+    assert job["status"] == "completed"
+    assert job["islice_base_url"] == "http://islice-b.test"
+    attempts = await database.get_attempts_for_job("abc123")
+    assert [attempt["window_index"] for attempt in attempts] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_job_pauses_instead_of_moving_from_removed_islice(tmp_path: Path) -> None:
+    source = tmp_path / "source.ts"
+    source.write_bytes(b"source")
+    configured = make_settings(tmp_path)
+    database = Database(configured.database_path)
+    await database.initialize()
+    await create_job(database, source, duration=3600)
+    await database.update_job("abc123", islice_base_url="http://removed-islice.test")
+    await database.update_job("abc123", status="pending_schedule")
+    assert not await database.claim_schedulable_jobs(
+        configured.configured_islice_urls, 1
+    )
+
+    job = await database.get_job("abc123")
+    assert job["status"] == "paused"
+    assert "unconfigured iSlice instance" in job["error_message"]
+    assert not await database.get_windows("abc123")

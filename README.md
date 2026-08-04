@@ -1,6 +1,6 @@
 # TS 连续拆条辅助服务
 
-该服务把服务器本地的长时 MPEG-TS 文件按固定小时终点切成临时 TS，通过 HTTP 提交给 iSlice，并把每个窗口的拆条结果归一到源文件全局时间轴。
+该服务把服务器本地的长时 MPEG-TS 文件按固定小时终点切成临时 TS，通过 HTTP 提交给 iSlice，并把每个窗口的拆条结果归一到源文件全局时间轴。创建作业时会从源文件开头抽取一帧，通过本地 OCR 识别画面时间，后续片段据此计算真实时间。
 
 ## 环境要求
 
@@ -31,7 +31,8 @@ cp .env.example .env
 
 必须设置：
 
-- `ISLICE_BASE_URL`：iSlice S1 服务地址，例如 `http://192.168.104.128:8000`
+- `ISLICE_BASE_URL`：单 iSlice S1 服务地址，例如 `http://192.168.104.128:8000`
+- `ISLICE_BASE_URLS`：多 iSlice 地址，使用英文逗号分隔。新作业先进入“待调度”状态；绑定后，同一作业的全部窗口、重试和恢复都使用该实例。若已绑定实例从配置中移除，作业会暂停，不会自动改派。
 - `PUBLIC_BASE_URL`：iSlice 能访问到的本服务地址，例如 `http://192.168.104.239:8090`
 
 常用可选项：
@@ -39,9 +40,12 @@ cp .env.example .env
 - `DATA_DIR`：SQLite、原始响应和结果 JSON，默认 `./data`
 - `TEMP_DIR`：临时小时 TS，默认 `./temp`
 - `FFMPEG_PATH`、`FFPROBE_PATH`：可执行文件名或绝对路径
-- `MAX_ACTIVE_JOBS`：不同源文件并发数，默认 `1`
+- `MAX_ACTIVE_JOBS`：不同源文件的全局并发数，默认 `15`
 - `POLL_INTERVAL_SECONDS`：iSlice 轮询间隔，默认 `15`
+- `PIPELINE_PROGRESS_THRESHOLD`：一个作业的当前 iSlice 子任务达到该进度后，允许把另一个长文件作业调度到同一 iSlice，默认 `71`。单个作业内部始终严格串行，必须等当前窗口拆条完成并确定交接点后才会提交下一窗口。
 - 每个窗口首次提交失败后最多重试 3 次，退避时间固定为 5/15/45 秒
+
+helper 不限制每台 iSlice 已绑定的长文件作业总数；实际执行并发和排队由 iSlice 控制。只要该实例上有任一作业的当前子任务尚未达到上述进度阈值，就不会继续派入新作业。`MAX_ACTIVE_JOBS` 仍是所有实例合计的全局作业并发上限，需要同时运行多个作业时应配置为大于 `1`。
 
 ## 启动
 
@@ -82,6 +86,10 @@ Content-Type: application/json
 }
 ```
 
+`programStartTime` 是可选的 OCR 失败回退值。每个作业只执行一次首帧 OCR；识别成功时以画面时间为准，并在 `data/jobs/{jobId}/time-reference.png` 保留基准帧。作业和结果 JSON 会记录 OCR 原文、置信度、基准来源与失败原因。片段的 `absolute_start`、`absolute_end` 即页面中的真实开始、结束时间。
+
+作业详情的拆条结果每页显示 10 条；点击有视频 URL 的结果行会立即播放，并自动定位到播放器。桌面端使用大尺寸播放器，拆条结果排列在播放器右侧，窗口时间线位于下方通栏；窄屏自动改为上下排列。结果行使用紧凑单行时间范围，页面顶部栏随页面滚动离开视口。加载失败时可从新窗口打开原始 URL。媒体不经过辅助服务代理，浏览器需要能够访问 iSlice 地址。MP4/H.264/AAC 可直接播放，iSlice 支持 HTTP Range 时可正常按需加载和拖动。
+
 主要接口：
 
 - `GET /api/jobs`
@@ -106,6 +114,7 @@ Content-Type: application/json
 - `data/slice_helper.db`：作业、窗口、尝试和片段状态
 - `data/jobs/{jobId}/raw/`：每次 iSlice 终态响应
 - `data/jobs/{jobId}/result.json`：当前完整清单
+- `data/jobs/{jobId}/time-reference.png`：源文件首帧时间 OCR 依据
 - `temp/{jobId}/`：正在处理或暂停窗口的临时 TS
 
 成功窗口的临时 TS 自动删除，原始 TS 永不修改。服务只记录 iSlice 返回的视频和封面 URL，不复制媒体；这些 URL 可能随 iSlice 的过期清理策略失效。

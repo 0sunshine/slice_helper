@@ -12,9 +12,10 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from . import __version__
 from .config import Settings
 from .database import Database
-from .islice import ISliceClient
+from .islice import ISlicePool
 from .media import MediaError, MediaService
 from .models import JobCreate, JobStatus
 from .orchestrator import Orchestrator
@@ -49,7 +50,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database = Database(configured.database_path)
         await database.initialize()
         media = MediaService(configured)
-        islice = ISliceClient(configured)
+        await database.assign_legacy_jobs_with_attempts(configured.islice_base_url)
+        islice = ISlicePool(configured)
         orchestrator = Orchestrator(configured, database, media, islice)
         app.state.settings = configured
         app.state.database = database
@@ -65,7 +67,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     application = FastAPI(
         title="TS Continuous Slice Helper",
-        version="0.1.0",
+        version=__version__,
         lifespan=lifespan,
     )
     templates = Jinja2Templates(directory=str(PACKAGE_DIR / "templates"))
@@ -95,31 +97,76 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail=f"The file content is not MPEG-TS: {probe.format_name}",
             )
         job_id = uuid.uuid4().hex
+        warnings: list[str] = []
+        frame_path = configured.data_dir / "jobs" / job_id / "time-reference.png"
+        time_reference = None
+        time_reference_error = ""
+        try:
+            time_reference = await request.app.state.media.detect_time_reference(
+                source, frame_path
+            )
+        except MediaError as exc:
+            time_reference_error = str(exc)
+
+        if time_reference is not None:
+            resolved_start_time = time_reference.source_start_time
+            time_reference_source = "ocr"
+            if body.program_start_time is not None:
+                try:
+                    difference = abs(
+                        (body.program_start_time - resolved_start_time).total_seconds()
+                    )
+                except TypeError:
+                    difference = None
+                if difference is None or difference > 1.0:
+                    warnings.append(
+                        "OCR time overrides the supplied programStartTime fallback: "
+                        f"{resolved_start_time.isoformat()}"
+                    )
+        elif body.program_start_time is not None:
+            resolved_start_time = body.program_start_time
+            time_reference_source = "manual_fallback"
+            warnings.append(f"Time OCR failed; programStartTime fallback used: {time_reference_error}")
+        else:
+            resolved_start_time = None
+            time_reference_source = "unavailable"
+            warnings.append(f"Time OCR failed; real times are unavailable: {time_reference_error}")
+
         total_windows = calculate_total_windows(
             probe.duration,
             configured.window_seconds,
             configured.window_boundary_tolerance_seconds,
         )
-        await request.app.state.database.create_job(
+        created_job = await request.app.state.database.create_job(
             {
                 "id": job_id,
                 "source_path": str(source),
                 "source_size": stat.st_size,
                 "source_mtime_ns": stat.st_mtime_ns,
                 "source_duration": probe.duration,
+                "islice_base_url": "",
                 "template_id": body.template_id,
                 "language": body.language,
                 "channel_name": body.channel_name or "",
                 "program_start_time": (
-                    body.program_start_time.isoformat() if body.program_start_time else None
+                    resolved_start_time.isoformat() if resolved_start_time else None
                 ),
+                "time_reference_source": time_reference_source,
+                "time_reference_text": (
+                    time_reference.matched_text if time_reference is not None else ""
+                ),
+                "time_reference_confidence": (
+                    time_reference.confidence if time_reference is not None else None
+                ),
+                "time_reference_frame_path": str(frame_path) if frame_path.is_file() else "",
+                "time_reference_error": time_reference_error,
                 "cut_mode": body.cut_mode.value,
                 "total_windows": total_windows,
+                "warnings_json": json.dumps(warnings, ensure_ascii=False),
             }
         )
         request.app.state.orchestrator.notify()
-        job = await request.app.state.database.get_job(job_id)
-        return _public_job(job or {"id": job_id, "status": JobStatus.QUEUED.value})
+        return _public_job(created_job)
 
     @application.get("/api/jobs")
     async def list_jobs(
@@ -173,7 +220,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.post("/api/jobs/{job_id}/pause")
     async def pause_job(request: Request, job_id: str):
         job = await _require_job(request, job_id)
-        if job["status"] == JobStatus.QUEUED.value:
+        if job["status"] in {
+            JobStatus.PENDING_SCHEDULE.value,
+            JobStatus.QUEUED.value,
+        }:
             await request.app.state.database.update_job(
                 job_id, status=JobStatus.PAUSED.value, pause_requested=0
             )
@@ -192,7 +242,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail="Only paused or failed jobs can be resumed")
         await request.app.state.database.update_job(
             job_id,
-            status=JobStatus.QUEUED.value,
+            status=JobStatus.PENDING_SCHEDULE.value,
             pause_requested=0,
             stop_requested=0,
             error_message="",
@@ -208,7 +258,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             JobStatus.STOPPED.value,
         }:
             raise HTTPException(status_code=409, detail="Job is already terminal")
-        if job["status"] in {JobStatus.QUEUED.value, JobStatus.PAUSED.value, JobStatus.FAILED.value}:
+        if job["status"] in {
+            JobStatus.PENDING_SCHEDULE.value,
+            JobStatus.QUEUED.value,
+            JobStatus.PAUSED.value,
+            JobStatus.FAILED.value,
+        }:
             await request.app.state.database.update_job(
                 job_id, status=JobStatus.STOPPED.value, stop_requested=0
             )
@@ -238,14 +293,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.get("/health/ready")
     async def ready(request: Request):
-        checks: dict[str, str] = {}
+        checks: dict[str, Any] = {}
         database_ok = await request.app.state.database.ping()
         checks["database"] = "ok" if database_ok else "unavailable"
         media_ok, media_message = await request.app.state.media.tools_ready()
         checks["mediaTools"] = media_message
-        islice_ok, islice_message = await request.app.state.islice.ping()
-        checks["iSlice"] = islice_message
-        ready_status = database_ok and media_ok and islice_ok
+        ocr_ok, ocr_message = request.app.state.media.ocr_ready()
+        checks["timeOcr"] = ocr_message
+        islice_ok, islice_messages = await request.app.state.islice.ping()
+        checks["iSlice"] = islice_messages
+        ready_status = database_ok and media_ok and ocr_ok and islice_ok
         payload = {"status": "ok" if ready_status else "not_ready", "checks": checks}
         return JSONResponse(payload, status_code=200 if ready_status else 503)
 

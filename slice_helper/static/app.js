@@ -1,7 +1,11 @@
-const state = { jobs: [], selectedJobId: null, detail: null, segments: [] };
+const state = {
+  jobs: [], selectedJobId: null, detail: null, segments: [],
+  segmentPage: 1, previewUrl: null
+};
+const SEGMENTS_PER_PAGE = 10;
 
 const statusNames = {
-  queued: "排队中", probing: "探测中", running: "处理中",
+  pending_schedule: "待调度", queued: "已调度", probing: "探测中", running: "处理中",
   pause_requested: "等待暂停", paused: "已暂停", completed: "已完成",
   failed: "失败", stop_requested: "等待停止", stopped: "已停止"
 };
@@ -13,7 +17,7 @@ const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (character
 
 function statusClass(status) {
   if (status === "completed") return "ok";
-  if (["paused", "pause_requested", "queued"].includes(status)) return "warn";
+  if (["paused", "pause_requested", "pending_schedule", "queued"].includes(status)) return "warn";
   if (["failed", "stopped", "stop_requested"].includes(status)) return "bad";
   return "neutral";
 }
@@ -30,6 +34,12 @@ function formatDate(value) {
   if (!value) return "-";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function formatRealTime(value) {
+  if (!value) return "-";
+  const match = String(value).match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})/);
+  return match ? `${match[1]} ${match[2]}` : formatDate(value);
 }
 
 async function api(path, options = {}) {
@@ -90,6 +100,10 @@ function renderJobs() {
 }
 
 async function loadDetail(jobId, scroll) {
+  if (state.selectedJobId && state.selectedJobId !== jobId) {
+    resetPreview();
+    state.segmentPage = 1;
+  }
   state.selectedJobId = jobId;
   const [detail, segments] = await Promise.all([
     api(`/api/jobs/${jobId}`),
@@ -97,51 +111,157 @@ async function loadDetail(jobId, scroll) {
   ]);
   state.detail = detail;
   state.segments = segments;
+  if (state.previewUrl && !segments.some((segment) => segment.segment_url === state.previewUrl)) {
+    resetPreview();
+  }
   renderDetail();
   if (scroll) $("detailBand").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 function renderDetail() {
-  const { job, windows } = state.detail;
+  const { job, windows, attempts = [] } = state.detail;
   $("detailBand").hidden = false;
   $("detailId").textContent = job.id;
   $("detailTitle").textContent = job.source_path.split(/[\\/]/).pop();
   $("detailPath").textContent = job.source_path;
+  $("summaryISlice").textContent = job.islice_base_url || "-";
+  $("summaryISlice").title = job.islice_base_url || "";
   $("summaryStatus").innerHTML = `<span class="status-pill ${statusClass(job.status)}">${escapeHtml(statusNames[job.status] || job.status)}</span>`;
   $("summaryDuration").textContent = formatSeconds(job.source_duration);
   $("summaryWindow").textContent = `${job.current_window} / ${job.total_windows}`;
   $("summaryCutMode").textContent = job.cut_mode === "copy" ? "流复制" : "重编码";
+  const referenceNames = { ocr: "OCR", manual_fallback: "手工回退" };
+  $("summaryRealTime").textContent = job.program_start_time
+    ? `${formatRealTime(job.program_start_time)} (${referenceNames[job.time_reference_source] || "已有数据"})`
+    : "未识别";
   $("detailProgress").style.width = `${Math.max(0, Math.min(100, job.progress || 0))}%`;
   $("detailError").hidden = !job.error_message;
   $("detailError").textContent = job.error_message || "";
   $("detailWarnings").innerHTML = (job.warnings || []).map((warning) => `<p>${escapeHtml(warning)}</p>`).join("");
   renderActions(job);
 
+  const latestAttempts = new Map();
+  attempts.forEach((attempt) => latestAttempts.set(attempt.window_index, attempt));
   $("windowsBody").innerHTML = windows.map((windowItem) => `
     <tr>
       <td>${windowItem.window_index + 1}</td>
       <td>${formatSeconds(windowItem.requested_start)}</td>
       <td>${formatSeconds(windowItem.nominal_end)}</td>
       <td><span class="status-pill ${windowItem.status === "completed" ? "ok" : windowItem.status === "failed" ? "bad" : "neutral"}">${escapeHtml(windowItem.status)}</span></td>
+      <td>${renderTaskProgress(latestAttempts.get(windowItem.window_index))}</td>
       <td>${windowItem.handoff_start == null ? "-" : formatSeconds(windowItem.handoff_start)}</td>
       <td>${escapeHtml(windowItem.error_message || "-")}</td>
     </tr>`).join("");
 
-  $("segmentsBody").innerHTML = state.segments.map((segment) => `
-    <tr>
-      <td class="mono">${formatSeconds(segment.global_start)}<br><span class="muted">${formatSeconds(segment.global_end)}</span></td>
-      <td>${escapeHtml(segment.title)}</td>
-      <td>${escapeHtml(segment.topic || "-")}</td>
-      <td>${escapeHtml((segment.keywords || []).join(", ") || "-")}</td>
+  renderSegments();
+}
+
+function renderTaskProgress(attempt) {
+  if (!attempt) return '<span class="muted">尚未提交</span>';
+  const progress = Math.max(0, Math.min(100, Number(attempt.progress || 0)));
+  const serviceStatus = attempt.service_status || attempt.status || "pending";
+  return `
+    <div class="task-progress-cell">
+      <span class="mono window-task-id" title="${escapeHtml(attempt.task_id)}">${escapeHtml(attempt.task_id)}</span>
+      <span class="task-progress-meta">
+        <span class="mini-progress"><span style="width:${progress}%"></span></span>
+        <strong>${progress.toFixed(0)}%</strong>
+        <span class="muted">${escapeHtml(serviceStatus)}</span>
+      </span>
+    </div>`;
+}
+
+function renderSegments() {
+  const pageCount = Math.max(1, Math.ceil(state.segments.length / SEGMENTS_PER_PAGE));
+  state.segmentPage = Math.max(1, Math.min(pageCount, state.segmentPage));
+  const startIndex = (state.segmentPage - 1) * SEGMENTS_PER_PAGE;
+  const pageSegments = state.segments.slice(startIndex, startIndex + SEGMENTS_PER_PAGE);
+  $("segmentPageInfo").textContent = `${state.segmentPage} / ${pageCount}`;
+  $("previousSegmentPage").disabled = state.segmentPage <= 1;
+  $("nextSegmentPage").disabled = state.segmentPage >= pageCount;
+
+  $("segmentsBody").innerHTML = pageSegments.map((segment, pageIndex) => {
+    const segmentIndex = startIndex + pageIndex;
+    const previewable = Boolean(segment.segment_url);
+    const active = previewable && segment.segment_url === state.previewUrl;
+    const title = segment.title || `片段 ${segmentIndex + 1}`;
+    const keywords = (segment.keywords || []).join(", ") || "-";
+    return `
+    <tr class="segment-row${previewable ? " is-previewable" : ""}${active ? " is-active" : ""}"
+        ${previewable ? `data-segment-index="${segmentIndex}" tabindex="0" aria-label="播放 ${escapeHtml(title)}"` : ""}
+        ${active ? 'aria-current="true"' : ""}>
+      <td class="mono"><span class="segment-time-stack"><span>${formatSeconds(segment.global_start)}</span><span>${formatSeconds(segment.global_end)}</span></span></td>
+      <td class="mono"><span class="segment-time-stack"><span>${formatRealTime(segment.absolute_start)}</span><span>${formatRealTime(segment.absolute_end)}</span></span></td>
+      <td><span class="segment-title" title="${escapeHtml(title)}">${escapeHtml(title)}</span></td>
+      <td class="segment-topic">${escapeHtml(segment.topic || "-")}</td>
+      <td><span class="segment-keywords" title="${escapeHtml(keywords)}">${escapeHtml(keywords)}</span></td>
       <td>${segment.window_index + 1}</td>
       <td><span class="status-pill ${segment.accepted ? "ok" : "warn"}">${segment.accepted ? "采用" : escapeHtml(segment.reason || "舍弃")}</span></td>
-      <td>${segment.segment_url ? `<a class="external-link" href="${escapeHtml(segment.segment_url)}" target="_blank" rel="noreferrer">打开</a>` : "-"}</td>
-    </tr>`).join("");
+    </tr>`;
+  }).join("") || '<tr><td class="empty-table-row" colspan="7">暂无拆条结果</td></tr>';
+}
+
+function previewSegment(segmentIndex) {
+  const segment = state.segments[segmentIndex];
+  if (!segment?.segment_url) return;
+
+  const video = $("previewVideo");
+  const sourceChanged = video.getAttribute("src") !== segment.segment_url;
+  if (sourceChanged) video.pause();
+  state.previewUrl = segment.segment_url;
+  $("previewTitle").textContent = segment.title || `片段 ${segmentIndex + 1}`;
+  $("previewTime").textContent = `${formatRealTime(segment.absolute_start)} - ${formatRealTime(segment.absolute_end)} | ${formatSeconds(segment.global_start)} - ${formatSeconds(segment.global_end)}`;
+  $("previewStatus").textContent = "正在加载媒体信息...";
+  $("previewStatus").className = "preview-status";
+  $("openPreviewExternally").href = segment.segment_url;
+  $("openPreviewExternally").hidden = false;
+  $("closePreviewButton").disabled = false;
+  if (segment.cover_img_url) video.poster = segment.cover_img_url;
+  else video.removeAttribute("poster");
+  if (sourceChanged) {
+    video.src = segment.segment_url;
+    video.load();
+  }
+  document.querySelectorAll(".segment-row").forEach((row) => {
+    const active = Number(row.dataset.segmentIndex) === segmentIndex;
+    row.classList.toggle("is-active", active);
+    if (active) row.setAttribute("aria-current", "true");
+    else row.removeAttribute("aria-current");
+  });
+  video.play().catch(() => {
+    if (video.getAttribute("src")) {
+      $("previewStatus").textContent = "媒体已就绪";
+      $("previewStatus").className = "preview-status ready";
+    }
+  });
+  document.querySelector(".media-workspace").scrollIntoView({
+    behavior: "smooth", block: "start"
+  });
+}
+
+function resetPreview() {
+  const video = $("previewVideo");
+  state.previewUrl = null;
+  video.pause();
+  video.removeAttribute("src");
+  video.removeAttribute("poster");
+  video.load();
+  $("openPreviewExternally").removeAttribute("href");
+  $("openPreviewExternally").hidden = true;
+  $("closePreviewButton").disabled = true;
+  $("previewTitle").textContent = "未选择片段";
+  $("previewTime").textContent = "";
+  $("previewStatus").textContent = "未选择片段";
+  $("previewStatus").className = "preview-status";
+  document.querySelectorAll(".segment-row.is-active").forEach((row) => {
+    row.classList.remove("is-active");
+    row.removeAttribute("aria-current");
+  });
 }
 
 function renderActions(job) {
   const actions = [];
-  if (["queued", "running"].includes(job.status)) actions.push(`<button class="button warning small" data-action="pause" type="button">暂停</button>`);
+  if (["pending_schedule", "queued", "running"].includes(job.status)) actions.push(`<button class="button warning small" data-action="pause" type="button">暂停</button>`);
   if (["paused", "failed"].includes(job.status)) actions.push(`<button class="button primary small" data-action="resume" type="button">继续</button>`);
   if (!["completed", "stopped"].includes(job.status)) actions.push(`<button class="button danger small" data-action="stop" type="button">停止</button>`);
   actions.push(`<a class="button secondary small external-link" href="/api/jobs/${escapeHtml(job.id)}/result?download=true">下载 JSON</a>`);
@@ -186,10 +306,59 @@ async function submitCreate(event) {
 $("openCreateButton").addEventListener("click", openCreate);
 $("closeCreateButton").addEventListener("click", () => $("createDialog").close());
 $("cancelCreateButton").addEventListener("click", () => $("createDialog").close());
+$("closePreviewButton").addEventListener("click", resetPreview);
+$("segmentsBody").addEventListener("click", (event) => {
+  const row = event.target.closest(".segment-row.is-previewable");
+  if (row) previewSegment(Number(row.dataset.segmentIndex));
+});
+$("segmentsBody").addEventListener("keydown", (event) => {
+  const row = event.target.closest(".segment-row.is-previewable");
+  if (row && (event.key === "Enter" || event.key === " ")) {
+    event.preventDefault();
+    previewSegment(Number(row.dataset.segmentIndex));
+  }
+});
+$("previewVideo").addEventListener("loadedmetadata", () => {
+  if ($('previewVideo').paused) {
+    $("previewStatus").textContent = "媒体已就绪";
+    $("previewStatus").className = "preview-status ready";
+  }
+});
+$("previewVideo").addEventListener("playing", () => {
+  $("previewStatus").textContent = "正在播放";
+  $("previewStatus").className = "preview-status ready";
+});
+$("previewVideo").addEventListener("pause", () => {
+  const video = $("previewVideo");
+  if (video.getAttribute("src") && !video.ended) {
+    $("previewStatus").textContent = "已暂停";
+    $("previewStatus").className = "preview-status";
+  }
+});
+$("previewVideo").addEventListener("ended", () => {
+  $("previewStatus").textContent = "播放结束";
+  $("previewStatus").className = "preview-status";
+});
+$("previewVideo").addEventListener("error", () => {
+  if (!$("previewVideo").getAttribute("src")) return;
+  $("previewStatus").textContent = "浏览器无法加载该片段，请使用新窗口打开。";
+  $("previewStatus").className = "preview-status error";
+});
 $("createForm").addEventListener("submit", submitCreate);
 $("refreshButton").addEventListener("click", () => loadJobs().catch((error) => showToast(error.message)));
 $("statusFilter").addEventListener("change", () => loadJobs().catch((error) => showToast(error.message)));
-$("acceptedOnly").addEventListener("change", () => state.selectedJobId && loadDetail(state.selectedJobId, false));
+$("acceptedOnly").addEventListener("change", () => {
+  state.segmentPage = 1;
+  if (state.selectedJobId) loadDetail(state.selectedJobId, false);
+});
+$("previousSegmentPage").addEventListener("click", () => {
+  state.segmentPage -= 1;
+  renderSegments();
+});
+$("nextSegmentPage").addEventListener("click", () => {
+  state.segmentPage += 1;
+  renderSegments();
+});
 
 Promise.all([loadHealth(), loadJobs()]).catch((error) => showToast(error.message));
 window.setInterval(() => loadJobs().catch(() => {}), 5000);

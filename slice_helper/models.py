@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class JobStatus(StrEnum):
+    PENDING_SCHEDULE = "pending_schedule"
     QUEUED = "queued"
     PROBING = "probing"
     RUNNING = "running"
