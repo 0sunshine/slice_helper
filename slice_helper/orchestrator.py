@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,62 @@ class JobControlRequested(Exception):
     """The current job reached a safe point for a pause or stop request."""
 
 
+class _ISliceSubmissionGate:
+    """Progress-priority admission gate for pre-LLM work on each iSlice."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._holders: dict[str, str] = {}
+        self._waiters: dict[
+            str, list[tuple[str, float, int, asyncio.Future[None]]]
+        ] = defaultdict(list)
+        self._sequence = 0
+
+    async def acquire(self, base_url: str, ticket: str, priority: float) -> None:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[None] = loop.create_future()
+        async with self._lock:
+            if self._holders.get(base_url) == ticket:
+                return
+            self._sequence += 1
+            self._waiters[base_url].append(
+                (ticket, priority, self._sequence, future)
+            )
+            self._grant_next(base_url)
+        try:
+            await future
+        except asyncio.CancelledError:
+            async with self._lock:
+                if self._holders.get(base_url) == ticket:
+                    self._holders.pop(base_url, None)
+                self._grant_next(base_url)
+            raise
+
+    async def release(self, base_url: str, ticket: str) -> bool:
+        async with self._lock:
+            if self._holders.get(base_url) != ticket:
+                return False
+            self._holders.pop(base_url, None)
+            self._grant_next(base_url)
+            return True
+
+    def _grant_next(self, base_url: str) -> None:
+        if base_url in self._holders:
+            return
+        queue = self._waiters[base_url]
+        queue[:] = [item for item in queue if not item[3].cancelled()]
+        if queue:
+            best_index = max(
+                range(len(queue)),
+                key=lambda index: (queue[index][1], -queue[index][2]),
+            )
+            ticket, _priority, _sequence, future = queue.pop(best_index)
+            self._holders[base_url] = ticket
+            future.set_result(None)
+            return
+        self._waiters.pop(base_url, None)
+
+
 class Orchestrator:
     RETRY_DELAYS = (5.0, 15.0, 45.0)
 
@@ -46,6 +103,8 @@ class Orchestrator:
         self.islice = islice
         self._scheduler_task: asyncio.Task[None] | None = None
         self._active: dict[str, asyncio.Task[None]] = {}
+        self._submission_gate = _ISliceSubmissionGate()
+        self._gate_monitors: dict[str, asyncio.Task[None]] = {}
         self._wake = asyncio.Event()
         self._stopping = False
 
@@ -66,6 +125,11 @@ class Orchestrator:
         if self._active:
             await asyncio.gather(*self._active.values(), return_exceptions=True)
         self._active.clear()
+        for task in self._gate_monitors.values():
+            task.cancel()
+        if self._gate_monitors:
+            await asyncio.gather(*self._gate_monitors.values(), return_exceptions=True)
+        self._gate_monitors.clear()
 
     def notify(self) -> None:
         self._wake.set()
@@ -77,7 +141,6 @@ class Orchestrator:
                 for job in await self.database.claim_schedulable_jobs(
                     self.settings.configured_islice_urls,
                     capacity,
-                    self.settings.pipeline_progress_threshold,
                 ):
                     job_id = job["id"]
                     if job_id in self._active:
@@ -102,8 +165,13 @@ class Orchestrator:
             job = await self.database.get_job(job_id)
             if not job or job["status"] != JobStatus.QUEUED.value:
                 return
+            await self._cancel_job_gate_monitors(job_id)
             islice_client = self._islice_client(job)
-            fields: dict[str, Any] = {"status": JobStatus.RUNNING.value, "error_message": ""}
+            fields: dict[str, Any] = {
+                "status": JobStatus.RUNNING.value,
+                "pause_requested": 0,
+                "error_message": "",
+            }
             if not job.get("started_at"):
                 fields["started_at"] = utc_now()
             await self.database.update_job(job_id, **fields)
@@ -280,7 +348,19 @@ class Orchestrator:
                 request = self._create_task_request(
                     job, attempt["task_id"], chunk_url, start
                 )
+                gate_url = str(job.get("islice_base_url") or self.settings.islice_base_url)
+                gate_ticket = str(attempt["task_id"])
+                gate_released = float(attempt.get("progress") or 0) >= (
+                    self.settings.pipeline_progress_threshold
+                )
                 try:
+                    if not gate_released:
+                        await self._await_submission_turn(
+                            job_id,
+                            gate_url,
+                            gate_ticket,
+                            float(job.get("progress") or 0),
+                        )
                     existing = await islice_client.ensure_task(attempt["task_id"], request)
                     await self._raise_if_control_requested(job_id)
                     service_status, service_progress = self._task_progress(existing)
@@ -294,6 +374,10 @@ class Orchestrator:
                     await self.database.update_window(
                         window["id"], status=WindowStatus.POLLING.value
                     )
+                    if self._pipeline_ready(service_status, service_progress):
+                        gate_released = await self._release_submission_turn(
+                            gate_url, gate_ticket
+                        ) or gate_released
                     payload = (
                         existing
                         if self._is_terminal(existing)
@@ -302,8 +386,13 @@ class Orchestrator:
                             attempt["id"],
                             attempt["task_id"],
                             islice_client,
+                            gate_url,
+                            gate_ticket,
                         )
                     )
+                    gate_released = await self._release_submission_turn(
+                        gate_url, gate_ticket
+                    ) or gate_released
                     raw_path = await self._write_raw(job_id, index, attempt_no, payload)
                     status = str(payload["taskInfo"].get("status") or "")
                     if status == "completed":
@@ -332,8 +421,15 @@ class Orchestrator:
                         finished_at=utc_now(),
                     )
                 except JobControlRequested:
+                    if not gate_released:
+                        self._start_gate_monitor(
+                            gate_url, gate_ticket, islice_client
+                        )
                     return False
                 except (ISliceError, TimeoutError) as exc:
+                    gate_released = await self._release_submission_turn(
+                        gate_url, gate_ticket
+                    ) or gate_released
                     await self.database.update_attempt(
                         attempt["id"],
                         status="failed",
@@ -431,6 +527,8 @@ class Orchestrator:
         attempt_id: int,
         task_id: str,
         islice_client: ISliceClient,
+        gate_url: str,
+        gate_ticket: str,
     ) -> dict[str, Any]:
         deadline = time.monotonic() + self.settings.window_timeout_seconds
         consecutive_errors = 0
@@ -455,6 +553,8 @@ class Orchestrator:
                 service_status=service_status,
                 progress=service_progress,
             )
+            if self._pipeline_ready(service_status, service_progress):
+                await self._release_submission_turn(gate_url, gate_ticket)
             await self._raise_if_control_requested(job_id)
             if self._is_terminal(payload):
                 return payload
@@ -473,6 +573,96 @@ class Orchestrator:
         except (TypeError, ValueError):
             progress = 0.0
         return status, min(100.0, max(0.0, progress))
+
+    def _pipeline_ready(self, status: str, progress: float) -> bool:
+        return status in {"completed", "failed"} or (
+            progress >= self.settings.pipeline_progress_threshold
+        )
+
+    async def _await_submission_turn(
+        self,
+        job_id: str,
+        base_url: str,
+        ticket: str,
+        priority: float,
+    ) -> None:
+        waiter = asyncio.create_task(
+            self._submission_gate.acquire(base_url, ticket, priority),
+            name=f"islice-gate-{ticket}",
+        )
+        try:
+            while not waiter.done():
+                done, _pending = await asyncio.wait({waiter}, timeout=1.0)
+                if done:
+                    break
+                await self._raise_if_control_requested(job_id)
+            await waiter
+        except BaseException:
+            waiter.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await waiter
+            raise
+
+    async def _release_submission_turn(self, base_url: str, ticket: str) -> bool:
+        released = await self._submission_gate.release(base_url, ticket)
+        if released:
+            self.notify()
+        return released
+
+    def _start_gate_monitor(
+        self,
+        base_url: str,
+        ticket: str,
+        islice_client: ISliceClient,
+    ) -> None:
+        existing = self._gate_monitors.get(ticket)
+        if existing and not existing.done():
+            return
+        task = asyncio.create_task(
+            self._monitor_gate_release(base_url, ticket, islice_client),
+            name=f"islice-gate-monitor-{ticket}",
+        )
+        self._gate_monitors[ticket] = task
+        task.add_done_callback(
+            lambda done, key=ticket: self._remove_gate_monitor(key, done)
+        )
+
+    def _remove_gate_monitor(self, ticket: str, task: asyncio.Task[None]) -> None:
+        if self._gate_monitors.get(ticket) is task:
+            self._gate_monitors.pop(ticket, None)
+
+    async def _cancel_job_gate_monitors(self, job_id: str) -> None:
+        prefix = f"sh-{job_id[:16]}-"
+        tasks = [
+            task
+            for ticket, task in self._gate_monitors.items()
+            if ticket.startswith(prefix)
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _monitor_gate_release(
+        self,
+        base_url: str,
+        ticket: str,
+        islice_client: ISliceClient,
+    ) -> None:
+        try:
+            while not self._stopping:
+                try:
+                    payload = await islice_client.get_task_info(ticket)
+                except ISliceError:
+                    await asyncio.sleep(self.settings.poll_interval_seconds)
+                    continue
+                status, progress = self._task_progress(payload)
+                if payload is None or self._pipeline_ready(status, progress):
+                    await self._release_submission_turn(base_url, ticket)
+                    return
+                await asyncio.sleep(self.settings.poll_interval_seconds)
+        except asyncio.CancelledError:
+            raise
 
     async def _control_requested(self, job_id: str) -> bool:
         job = await self.database.get_job(job_id)

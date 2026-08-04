@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -11,7 +12,7 @@ from slice_helper.database import Database
 from slice_helper.islice import ISliceError, ISlicePool
 from slice_helper.media import MediaError
 from slice_helper.models import MediaProbe
-from slice_helper.orchestrator import Orchestrator
+from slice_helper.orchestrator import Orchestrator, _ISliceSubmissionGate
 
 
 class FakeMedia:
@@ -111,6 +112,115 @@ class OverlappingISlice:
         }
 
 
+class ControlledISlice:
+    def __init__(self) -> None:
+        self.created: asyncio.Queue[str] = asyncio.Queue()
+        self.states: dict[str, tuple[str, float]] = {}
+
+    async def ensure_task(self, task_id, request):
+        if task_id not in self.states:
+            self.states[task_id] = ("processing", 0.0)
+            self.created.put_nowait(task_id)
+        return self._payload(task_id, request["videoPath"])
+
+    async def get_task_info(self, task_id):
+        return self._payload(task_id, "unused")
+
+    def set_state(self, task_id: str, status: str, progress: float) -> None:
+        self.states[task_id] = (status, progress)
+
+    def _payload(self, task_id: str, video_path: str) -> dict:
+        status, progress = self.states[task_id]
+        payload = {
+            "taskInfo": {
+                "taskId": task_id,
+                "status": status,
+                "progress": progress,
+                "videoPath": video_path,
+            },
+            "segments": [],
+        }
+        if status == "completed":
+            payload["segments"] = [
+                {"startTime": 0, "endTime": 3600, "title": task_id}
+            ]
+        return payload
+
+
+class CapacityISlice:
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self.created: asyncio.Queue[str] = asyncio.Queue()
+        self.states: dict[str, tuple[str, float]] = {}
+        self.video_paths: dict[str, str] = {}
+        self.creation_order: list[str] = []
+        self.max_processing = 0
+
+    async def close(self) -> None:
+        return None
+
+    async def ensure_task(self, task_id, request):
+        if task_id not in self.states:
+            status = (
+                "processing"
+                if self.processing_count < self.capacity
+                else "pending"
+            )
+            self.states[task_id] = (status, 0.0)
+            self.video_paths[task_id] = request["videoPath"]
+            self.creation_order.append(task_id)
+            self.created.put_nowait(task_id)
+            self._record_processing()
+        return self._payload(task_id)
+
+    async def get_task_info(self, task_id):
+        return self._payload(task_id)
+
+    @property
+    def processing_count(self) -> int:
+        return sum(status == "processing" for status, _progress in self.states.values())
+
+    def set_progress(self, task_id: str, progress: float) -> None:
+        status, _current = self.states[task_id]
+        if status != "processing":
+            raise AssertionError(f"Cannot advance non-processing task {task_id}: {status}")
+        self.states[task_id] = (status, progress)
+
+    def complete(self, task_id: str) -> None:
+        status, _progress = self.states[task_id]
+        if status != "processing":
+            raise AssertionError(f"Cannot complete non-processing task {task_id}: {status}")
+        self.states[task_id] = ("completed", 100.0)
+        for candidate in self.creation_order:
+            candidate_status, _candidate_progress = self.states[candidate]
+            if candidate_status == "pending":
+                self.states[candidate] = ("processing", 0.0)
+                break
+        self._record_processing()
+
+    def _record_processing(self) -> None:
+        self.max_processing = max(self.max_processing, self.processing_count)
+        if self.processing_count > self.capacity:
+            raise AssertionError("Simulated iSlice exceeded its concurrency capacity")
+
+    def _payload(self, task_id: str) -> dict:
+        status, progress = self.states[task_id]
+        payload = {
+            "taskInfo": {
+                "taskId": task_id,
+                "status": status,
+                "progress": progress,
+                "videoPath": self.video_paths[task_id],
+            },
+            "segments": [],
+        }
+        if status == "completed":
+            payload["segments"] = [
+                {"startTime": 0, "endTime": 3600, "title": task_id}
+            ]
+        return payload
+
+
 def make_settings(tmp_path: Path, duration_timeout: float = 2) -> Settings:
     return Settings(
         islice_base_url="http://islice.test",
@@ -146,6 +256,82 @@ async def create_job(database: Database, source: Path, *, duration: float) -> No
             "total_windows": int(duration / 3600),
         }
     )
+
+
+async def create_named_job(
+    database: Database,
+    source: Path,
+    job_id: str,
+    duration: float,
+) -> None:
+    stat = source.stat()
+    await database.create_job(
+        {
+            "id": job_id,
+            "status": "queued",
+            "islice_base_url": "http://islice.test",
+            "source_path": str(source),
+            "source_size": stat.st_size,
+            "source_mtime_ns": stat.st_mtime_ns,
+            "source_duration": duration,
+            "template_id": "general",
+            "language": "zh",
+            "channel_name": "",
+            "program_start_time": None,
+            "cut_mode": "copy",
+            "total_windows": int(duration / 3600),
+        }
+    )
+
+
+async def wait_for_current_window(
+    database: Database, job_id: str, expected: int
+) -> None:
+    for _ in range(500):
+        job = await database.get_job(job_id)
+        if job and int(job["current_window"]) == expected:
+            return
+        await asyncio.sleep(0.002)
+    raise AssertionError(f"{job_id} did not advance to window {expected}")
+
+
+async def wait_for_attempt(
+    database: Database, job_id: str, window_index: int
+) -> None:
+    for _ in range(500):
+        attempts = await database.get_attempts_for_job(job_id)
+        if any(int(item["window_index"]) == window_index for item in attempts):
+            await asyncio.sleep(0.01)
+            return
+        await asyncio.sleep(0.002)
+    raise AssertionError(f"{job_id} did not create attempt for window {window_index}")
+
+
+async def wait_for_jobs_running(database: Database, expected: int) -> None:
+    for _ in range(500):
+        jobs = await database.list_jobs(limit=100)
+        if sum(item["status"] == "running" for item in jobs) == expected:
+            return
+        await asyncio.sleep(0.002)
+    raise AssertionError(f"Expected {expected} running jobs")
+
+
+@pytest.mark.asyncio
+async def test_submission_gate_prefers_higher_job_completion() -> None:
+    gate = _ISliceSubmissionGate()
+    url = "http://islice.test"
+    await gate.acquire(url, "holder", 0)
+    low = asyncio.create_task(gate.acquire(url, "low", 25))
+    await asyncio.sleep(0)
+    high = asyncio.create_task(gate.acquire(url, "high", 50))
+    await asyncio.sleep(0)
+
+    await gate.release(url, "holder")
+    await asyncio.wait_for(high, timeout=1)
+    assert not low.done()
+    await gate.release(url, "high")
+    await asyncio.wait_for(low, timeout=1)
+    await gate.release(url, "low")
 
 
 @pytest.mark.asyncio
@@ -201,6 +387,179 @@ async def test_two_window_job_hands_tail_to_next_window(tmp_path: Path) -> None:
     assert manifest["job"]["status"] == "completed"
     assert len(manifest["segments"]) == 4
     assert not list(configured.temp_dir.rglob("*.ts"))
+
+
+@pytest.mark.asyncio
+async def test_jobs_take_turns_at_71_percent_with_highest_completion_first(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.ts"
+    source.write_bytes(b"source")
+    configured = replace(make_settings(tmp_path), max_active_jobs=3)
+    database = Database(configured.database_path)
+    await database.initialize()
+    await create_named_job(database, source, "job-a", 7200)
+    await create_named_job(database, source, "job-b", 14400)
+    await create_named_job(database, source, "job-c", 7200)
+    islice = ControlledISlice()
+    orchestrator = Orchestrator(configured, database, FakeMedia(), islice)
+
+    tasks: list[asyncio.Task[None]] = []
+    try:
+        tasks.append(asyncio.create_task(orchestrator._process_job("job-a")))
+        a0 = await asyncio.wait_for(islice.created.get(), timeout=1)
+        assert a0 == "sh-job-a-w000-a1"
+        islice.set_state(a0, "processing", 71)
+
+        tasks.append(asyncio.create_task(orchestrator._process_job("job-b")))
+        b0 = await asyncio.wait_for(islice.created.get(), timeout=1)
+        assert b0 == "sh-job-b-w000-a1"
+        islice.set_state(b0, "processing", 71)
+
+        tasks.append(asyncio.create_task(orchestrator._process_job("job-c")))
+        c0 = await asyncio.wait_for(islice.created.get(), timeout=1)
+        assert c0 == "sh-job-c-w000-a1"
+
+        # A and B finish, but C still owns the pre-71 submission turn.
+        islice.set_state(a0, "completed", 100)
+        islice.set_state(b0, "completed", 100)
+        await wait_for_current_window(database, "job-a", 1)
+        await wait_for_current_window(database, "job-b", 1)
+        await wait_for_attempt(database, "job-a", 1)
+        await wait_for_attempt(database, "job-b", 1)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(islice.created.get(), timeout=0.05)
+
+        # A is 50% complete and B is 25% complete, so A wins even if both wait.
+        islice.set_state(c0, "processing", 71)
+        a1 = await asyncio.wait_for(islice.created.get(), timeout=1)
+        assert a1 == "sh-job-a-w001-a1"
+
+        # B cannot create its next task until A's latest task reaches 71%.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(islice.created.get(), timeout=0.05)
+        islice.set_state(a1, "processing", 71)
+        b1 = await asyncio.wait_for(islice.created.get(), timeout=1)
+        assert b1 == "sh-job-b-w001-a1"
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_multiple_islices_enforce_capacity_and_priority_independently(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.ts"
+    source.write_bytes(b"source")
+    urls = (
+        "http://islice-a.test",
+        "http://islice-b.test",
+        "http://islice-c.test",
+    )
+    configured = replace(
+        make_settings(tmp_path, duration_timeout=60),
+        islice_base_urls=urls,
+        max_active_jobs=21,
+    )
+    database = Database(configured.database_path)
+    await database.initialize()
+    stat = source.stat()
+    job_ids = [f"multi-job-{index:02d}" for index in range(21)]
+    for job_id in job_ids:
+        await database.create_job(
+            {
+                "id": job_id,
+                "source_path": str(source),
+                "source_size": stat.st_size,
+                "source_mtime_ns": stat.st_mtime_ns,
+                "source_duration": 7200.0,
+                "template_id": "general",
+                "language": "zh",
+                "channel_name": "",
+                "program_start_time": None,
+                "cut_mode": "copy",
+                "total_windows": 2,
+            }
+        )
+
+    clients = {url: CapacityISlice(capacity=5) for url in urls}
+    pool = ISlicePool(configured)
+    await pool.close()
+    pool.clients = clients
+    orchestrator = Orchestrator(configured, database, FakeMedia(), pool)
+    await orchestrator.start()
+    try:
+        await wait_for_jobs_running(database, 21)
+        jobs = await database.list_jobs(limit=100)
+        assigned = {
+            url: {item["id"] for item in jobs if item["islice_base_url"] == url}
+            for url in urls
+        }
+        assert {url: len(ids) for url, ids in assigned.items()} == {
+            urls[0]: 7,
+            urls[1]: 7,
+            urls[2]: 7,
+        }
+
+        first_five: dict[str, list[str]] = {url: [] for url in urls}
+        for _round in range(5):
+            for url in urls:
+                task_id = await asyncio.wait_for(
+                    clients[url].created.get(), timeout=10
+                )
+                assert clients[url].states[task_id] == ("processing", 0.0)
+                first_five[url].append(task_id)
+            for url in urls:
+                clients[url].set_progress(first_five[url][-1], 71)
+
+        sixth: dict[str, str] = {}
+        for url in urls:
+            sixth[url] = await asyncio.wait_for(clients[url].created.get(), timeout=10)
+            assert clients[url].states[sixth[url]] == ("pending", 0.0)
+            assert clients[url].processing_count == 5
+            assert clients[url].max_processing == 5
+
+        # A pending sixth task owns the submission turn, so neither instance may
+        # create a seventh remote task yet.
+        for url in urls:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(clients[url].created.get(), timeout=0.05)
+
+        completed_job: dict[str, str] = {}
+        for url in urls:
+            first_task = first_five[url][0]
+            completed_job[url] = first_task[3:].rsplit("-w", 1)[0]
+            assert completed_job[url] in assigned[url]
+            clients[url].complete(first_task)
+            assert clients[url].states[sixth[url]] == ("processing", 0.0)
+        for url in urls:
+            await wait_for_attempt(database, completed_job[url], 1)
+
+        # Releasing one instance must not affect the other instance's gate.
+        clients[urls[0]].set_progress(sixth[urls[0]], 71)
+        left_next = await asyncio.wait_for(clients[urls[0]].created.get(), timeout=10)
+        assert left_next == f"sh-{completed_job[urls[0]]}-w001-a1"
+        assert clients[urls[0]].states[left_next] == ("pending", 0.0)
+        assert clients[urls[1]].created.empty()
+        assert clients[urls[2]].created.empty()
+
+        for url in urls[1:]:
+            clients[url].set_progress(sixth[url], 71)
+            next_task = await asyncio.wait_for(clients[url].created.get(), timeout=10)
+            assert next_task == f"sh-{completed_job[url]}-w001-a1"
+            assert clients[url].states[next_task] == ("pending", 0.0)
+
+        # The 50%-complete jobs won over each instance's untouched seventh job,
+        # and simulated processing never exceeded five tasks per iSlice.
+        for url in urls:
+            assert clients[url].max_processing == 5
+            assert clients[url].processing_count == 5
+            assert len(clients[url].creation_order) == 7
+    finally:
+        await orchestrator.stop()
+        await pool.close()
 
 
 @pytest.mark.asyncio

@@ -50,9 +50,7 @@ async def test_database_persists_and_recovers_jobs(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_database_reopens_islice_scheduling_at_progress_threshold(
-    tmp_path: Path,
-) -> None:
+async def test_database_assigns_multiple_jobs_to_the_same_islice(tmp_path: Path) -> None:
     database = Database(tmp_path / "state.db")
     await database.initialize()
     urls = ("http://islice-a.test",)
@@ -74,35 +72,14 @@ async def test_database_reopens_islice_scheduling_at_progress_threshold(
             }
         )
 
-    claimed = await database.claim_schedulable_jobs(urls, 3, 71)
+    claimed = await database.claim_schedulable_jobs(urls, 3)
     assert [(job["id"], job["islice_base_url"]) for job in claimed] == [
         ("job-a", urls[0]),
+        ("job-b", urls[0]),
+        ("job-c", urls[0]),
     ]
-    await database.update_job("job-a", status="running")
-    window_a = await database.upsert_window("job-a", 0, 0, 60)
-    attempt_a = await database.create_attempt(window_a["id"], 1, "job-a-w0-a1")
-    await database.update_attempt(attempt_a["id"], status="polling", progress=70)
-
-    assert not await database.claim_schedulable_jobs(urls, 3, 71)
-    assert (await database.get_job("job-c"))["status"] == "pending_schedule"
-    assert (await database.get_job("job-c"))["islice_base_url"] == ""
-
-    await database.update_attempt(attempt_a["id"], progress=71)
-    claimed = await database.claim_schedulable_jobs(urls, 3, 71)
-    assert [(job["id"], job["islice_base_url"]) for job in claimed] == [
-        ("job-b", urls[0])
-    ]
-
-    # The newly queued job closes admission until its own current task reaches 71%.
-    assert not await database.claim_schedulable_jobs(urls, 3, 71)
-    await database.update_job("job-b", status="running")
-    window_b = await database.upsert_window("job-b", 0, 0, 60)
-    attempt_b = await database.create_attempt(window_b["id"], 1, "job-b-w0-a1")
-    await database.update_attempt(attempt_b["id"], status="polling", progress=71)
-    claimed = await database.claim_schedulable_jobs(urls, 3, 71)
-    assert [(job["id"], job["islice_base_url"]) for job in claimed] == [
-        ("job-c", urls[0])
-    ]
+    for job_id in ("job-a", "job-b", "job-c"):
+        assert (await database.get_job(job_id))["status"] == "queued"
 
 
 @pytest.mark.asyncio

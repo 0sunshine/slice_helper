@@ -276,7 +276,6 @@ class Database:
         self,
         urls: tuple[str, ...],
         limit: int,
-        progress_threshold: float = 71.0,
     ) -> list[dict[str, Any]]:
         if not urls:
             raise ValueError("At least one iSlice URL must be configured")
@@ -297,24 +296,11 @@ class Database:
             active_rows = await (
                 await db.execute(
                     f"""
-                    SELECT
-                        j.islice_base_url,
-                        COALESCE((
-                            SELECT CASE
-                                WHEN a.status='completed' THEN 100.0
-                                WHEN a.status='polling' THEN a.progress
-                                ELSE 0.0
-                            END
-                            FROM windows w
-                            JOIN attempts a ON a.window_id=w.id
-                            WHERE w.job_id=j.id
-                              AND w.window_index=j.current_window
-                            ORDER BY a.attempt_no DESC
-                            LIMIT 1
-                        ), 0.0) AS current_progress
+                    SELECT j.islice_base_url, COUNT(*) AS job_count
                     FROM jobs j
                     WHERE j.status IN ({active_placeholders})
                       AND j.islice_base_url<>''
+                    GROUP BY j.islice_base_url
                     """,
                     active_statuses,
                 )
@@ -325,10 +311,9 @@ class Database:
                 )
             ).fetchall()
 
-            blocked_urls = {
-                row["islice_base_url"]
+            active_counts = {
+                row["islice_base_url"]: int(row["job_count"])
                 for row in active_rows
-                if float(row["current_progress"]) < progress_threshold
             }
             claimed: list[dict[str, Any]] = []
             for candidate_row in candidates:
@@ -345,16 +330,12 @@ class Database:
                             ),
                         )
                         continue
-                    if assigned_url in blocked_urls:
-                        continue
                     selected_url = assigned_url
                 else:
-                    selected_url = next(
-                        (url for url in normalized_urls if url not in blocked_urls),
-                        None,
+                    selected_url = min(
+                        normalized_urls,
+                        key=lambda url: active_counts.get(url, 0),
                     )
-                    if selected_url is None:
-                        continue
 
                 await db.execute(
                     """
@@ -369,9 +350,7 @@ class Database:
                 candidate["error_message"] = ""
                 candidate["updated_at"] = now
                 claimed.append(candidate)
-                # A newly queued job has no current iSlice progress, so it closes
-                # this instance until its own current window reaches the threshold.
-                blocked_urls.add(selected_url)
+                active_counts[selected_url] = active_counts.get(selected_url, 0) + 1
                 if len(claimed) >= limit:
                     break
             await db.commit()
