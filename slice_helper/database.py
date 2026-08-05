@@ -77,6 +77,7 @@ class Database:
                     source_size INTEGER NOT NULL,
                     source_mtime_ns INTEGER NOT NULL,
                     source_duration REAL NOT NULL,
+                    source_url TEXT NOT NULL DEFAULT '',
                     islice_base_url TEXT NOT NULL DEFAULT '',
                     template_id TEXT NOT NULL,
                     language TEXT NOT NULL,
@@ -178,6 +179,7 @@ class Database:
                 "time_reference_frame_path": "TEXT NOT NULL DEFAULT ''",
                 "time_reference_error": "TEXT NOT NULL DEFAULT ''",
                 "islice_base_url": "TEXT NOT NULL DEFAULT ''",
+                "source_url": "TEXT NOT NULL DEFAULT ''",
             }
             for column, declaration in migrations.items():
                 if column not in job_columns:
@@ -214,6 +216,10 @@ class Database:
                     await db.execute(f"ALTER TABLE attempts ADD COLUMN {column} {declaration}")
             await db.execute(
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(5, ?)",
+                (utc_now(),),
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(6, ?)",
                 (utc_now(),),
             )
             await db.commit()

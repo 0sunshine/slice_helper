@@ -42,6 +42,20 @@ function formatRealTime(value) {
   return match ? `${match[1]} ${match[2]}` : formatDate(value);
 }
 
+function sourceDisplay(job) {
+  return job.source_url || job.source_path;
+}
+
+function sourceName(job) {
+  const source = sourceDisplay(job);
+  try {
+    const url = new URL(source);
+    return decodeURIComponent(url.pathname.split("/").filter(Boolean).pop() || url.hostname);
+  } catch (_) {
+    return source.split(/[\\/]/).pop();
+  }
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
@@ -88,7 +102,7 @@ function renderJobs() {
   $("emptyJobs").hidden = state.jobs.length !== 0;
   body.innerHTML = state.jobs.map((job) => `
     <tr>
-      <td><span class="filename" title="${escapeHtml(job.source_path)}">${escapeHtml(job.source_path.split(/[\\/]/).pop())}</span><span class="muted mono">${escapeHtml(job.id.slice(0, 12))}</span></td>
+      <td><span class="filename" title="${escapeHtml(sourceDisplay(job))}">${escapeHtml(sourceName(job))}</span><span class="muted mono">${escapeHtml(job.id.slice(0, 12))}</span></td>
       <td><span class="status-pill ${statusClass(job.status)}">${escapeHtml(statusNames[job.status] || job.status)}</span></td>
       <td><span class="mini-progress"><span style="width:${Math.max(0, Math.min(100, job.progress || 0))}%"></span></span>${Number(job.progress || 0).toFixed(1)}%</td>
       <td>${job.current_window}/${job.total_windows}</td>
@@ -122,8 +136,8 @@ function renderDetail() {
   const { job, windows, attempts = [] } = state.detail;
   $("detailBand").hidden = false;
   $("detailId").textContent = job.id;
-  $("detailTitle").textContent = job.source_path.split(/[\\/]/).pop();
-  $("detailPath").textContent = job.source_path;
+  $("detailTitle").textContent = sourceName(job);
+  $("detailPath").textContent = sourceDisplay(job);
   $("summaryISlice").textContent = job.islice_base_url || "-";
   $("summaryISlice").title = job.islice_base_url || "";
   $("summaryStatus").innerHTML = `<span class="status-pill ${statusClass(job.status)}">${escapeHtml(statusNames[job.status] || job.status)}</span>`;
@@ -290,6 +304,7 @@ async function submitCreate(event) {
   if (!payload.programStartTime) delete payload.programStartTime;
   const submit = $("submitCreateButton");
   submit.disabled = true;
+  submit.textContent = /^https?:\/\//i.test(payload.sourcePath) ? "下载中" : "创建中";
   try {
     const job = await api("/api/jobs", { method: "POST", body: JSON.stringify(payload) });
     $("createDialog").close();
@@ -300,7 +315,10 @@ async function submitCreate(event) {
   } catch (error) {
     $("createError").textContent = error.message;
     $("createError").hidden = false;
-  } finally { submit.disabled = false; }
+  } finally {
+    submit.disabled = false;
+    submit.textContent = "创建作业";
+  }
 }
 
 $("openCreateButton").addEventListener("click", openCreate);

@@ -77,7 +77,7 @@ POST /api/jobs
 Content-Type: application/json
 
 {
-  "sourcePath": "/data/video/day.ts",
+  "sourcePath": "https://media.internal/day.ts",
   "templateId": "general",
   "language": "zh",
   "channelName": "CCTV-1",
@@ -85,6 +85,8 @@ Content-Type: application/json
   "cutMode": "copy"
 }
 ```
+
+`sourcePath` 支持服务器本地绝对路径以及 `http://`、`https://` 地址。HTTP 源以流式方式下载到 `data/jobs/{jobId}/source.ts`，完成长度校验和原子改名后才执行 FFprobe、OCR 并创建作业；创建接口会等待下载和校验完成。下载后的源 TS 作为作业输入长期保留。
 
 `programStartTime` 是可选的 OCR 失败回退值。每个作业只执行一次首帧 OCR；识别成功时以画面时间为准，并在 `data/jobs/{jobId}/time-reference.png` 保留基准帧。作业和结果 JSON 会记录 OCR 原文、置信度、基准来源与失败原因。片段的 `absolute_start`、`absolute_end` 即页面中的真实开始、结束时间。
 
@@ -115,6 +117,7 @@ Content-Type: application/json
 - `data/jobs/{jobId}/raw/`：每次 iSlice 终态响应
 - `data/jobs/{jobId}/result.json`：当前完整清单
 - `data/jobs/{jobId}/time-reference.png`：源文件首帧时间 OCR 依据
+- `data/jobs/{jobId}/source.ts`：通过 HTTP 下载的受管源文件
 - `temp/{jobId}/`：正在处理或暂停窗口的临时 TS
 
 成功窗口的临时 TS 自动删除，原始 TS 永不修改。服务只记录 iSlice 返回的视频和封面 URL，不复制媒体；这些 URL 可能随 iSlice 的过期清理策略失效。

@@ -35,8 +35,9 @@ async def test_database_persists_and_recovers_jobs(tmp_path: Path) -> None:
 
     async with database.connect() as db:
         versions = await (await db.execute("SELECT version FROM schema_version ORDER BY version")).fetchall()
-    assert [row["version"] for row in versions] == [1, 2, 3, 4, 5]
+    assert [row["version"] for row in versions] == [1, 2, 3, 4, 5, 6]
     assert recovered["islice_base_url"] == ""
+    assert recovered["source_url"] == ""
 
     window = await database.upsert_window("job1", 0, 0, 3600)
     same_window = await database.upsert_window("job1", 0, 99, 999)

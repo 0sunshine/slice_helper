@@ -12,6 +12,7 @@ from slice_helper.database import Database
 from slice_helper.media import MediaError
 from slice_helper.models import MediaProbe
 from slice_helper.orchestrator import Orchestrator
+from slice_helper.source_download import SourceDownloadError
 from slice_helper.time_ocr import OcrText, TimeReference
 
 
@@ -86,8 +87,9 @@ def test_job_api_control_and_database_backed_chunk_route(
         assert 'class="window-timeline-panel"' in home.text
         assert "小任务进度" in home.text
         assert 'id="summaryISlice"' in home.text
-        assert "/static/styles.css?v=0.3.2" in home.text
-        assert "/static/app.js?v=0.3.2" in home.text
+        assert "/static/styles.css?v=0.4.0" in home.text
+        assert "/static/app.js?v=0.4.0" in home.text
+        assert "TS 路径或 HTTP 地址" in home.text
 
         created = client.post(
             "/api/jobs",
@@ -152,6 +154,92 @@ def test_create_job_rejects_non_absolute_ts_path(tmp_path: Path) -> None:
             json={"sourcePath": "relative.ts", "templateId": "general", "language": "zh"},
         )
     assert response.status_code == 422
+
+
+def test_create_job_downloads_http_source_to_managed_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    downloaded: dict[str, object] = {}
+
+    async def fake_download(_self, url, target):
+        downloaded["url"] = url
+        downloaded["target"] = target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"downloaded-ts")
+        return len(b"downloaded-ts")
+
+    async def fake_probe(_self, path):
+        assert path == downloaded["target"]
+        return MediaProbe(
+            duration=7200.0,
+            format_name="mpegts",
+            video_codec="h264",
+            audio_codec="aac",
+        )
+
+    async def failed_time_reference(_self, _source, _frame_path, **_kwargs):
+        raise MediaError("timestamp not found")
+
+    async def no_start(_self):
+        return None
+
+    async def no_stop(_self):
+        return None
+
+    monkeypatch.setattr(
+        "slice_helper.source_download.HttpSourceDownloader.download", fake_download
+    )
+    monkeypatch.setattr("slice_helper.media.MediaService.probe", fake_probe)
+    monkeypatch.setattr(
+        "slice_helper.media.MediaService.detect_time_reference", failed_time_reference
+    )
+    monkeypatch.setattr(Orchestrator, "start", no_start)
+    monkeypatch.setattr(Orchestrator, "stop", no_stop)
+
+    configured = make_settings(tmp_path)
+    source_url = "https://media.test/archive/day.ts?token=internal"
+    with TestClient(create_app(configured)) as client:
+        response = client.post("/api/jobs", json={"sourcePath": source_url})
+
+    assert response.status_code == 201
+    job = response.json()
+    managed_source = configured.data_dir / "jobs" / job["id"] / "source.ts"
+    assert downloaded == {"url": source_url, "target": managed_source}
+    assert managed_source.read_bytes() == b"downloaded-ts"
+    assert job["source_url"] == source_url
+    assert job["source_path"] == str(managed_source)
+    assert job["source_size"] == len(b"downloaded-ts")
+    assert job["total_windows"] == 2
+
+
+def test_create_job_cleans_failed_http_download(tmp_path: Path, monkeypatch) -> None:
+    async def failed_download(_self, _url, target):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.with_name("source.partial.ts").write_bytes(b"partial")
+        raise SourceDownloadError("remote connection closed")
+
+    async def no_start(_self):
+        return None
+
+    async def no_stop(_self):
+        return None
+
+    monkeypatch.setattr(
+        "slice_helper.source_download.HttpSourceDownloader.download", failed_download
+    )
+    monkeypatch.setattr(Orchestrator, "start", no_start)
+    monkeypatch.setattr(Orchestrator, "stop", no_stop)
+    configured = make_settings(tmp_path)
+
+    with TestClient(create_app(configured)) as client:
+        response = client.post(
+            "/api/jobs", json={"sourcePath": "http://media.test/broken.ts"}
+        )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "remote connection closed"
+    jobs_dir = configured.data_dir / "jobs"
+    assert not jobs_dir.exists() or not list(jobs_dir.iterdir())
 
 
 def test_create_job_uses_manual_time_only_when_ocr_fails(

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -20,6 +22,7 @@ from .media import MediaError, MediaService
 from .models import JobCreate, JobStatus
 from .orchestrator import Orchestrator
 from .processing import calculate_total_windows
+from .source_download import HttpSourceDownloader, SourceDownloadError
 
 
 logging.basicConfig(
@@ -50,12 +53,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database = Database(configured.database_path)
         await database.initialize()
         media = MediaService(configured)
+        source_downloader = HttpSourceDownloader()
         await database.assign_legacy_jobs_with_attempts(configured.islice_base_url)
         islice = ISlicePool(configured)
         orchestrator = Orchestrator(configured, database, media, islice)
         app.state.settings = configured
         app.state.database = database
         app.state.media = media
+        app.state.source_downloader = source_downloader
         app.state.islice = islice
         app.state.orchestrator = orchestrator
         await orchestrator.start()
@@ -83,20 +88,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.post("/api/jobs", status_code=201)
     async def create_job(request: Request, body: JobCreate):
-        source = Path(body.source_path).expanduser().resolve()
-        if not source.is_file():
-            raise HTTPException(status_code=400, detail="sourcePath does not exist or is not a file")
+        job_id = uuid.uuid4().hex
+        source_url = ""
+        managed_source = urlsplit(body.source_path).scheme.lower() in {"http", "https"}
+        job_dir = configured.data_dir / "jobs" / job_id
+        if managed_source:
+            source_url = body.source_path
+            source = job_dir / "source.ts"
+            try:
+                await request.app.state.source_downloader.download(source_url, source)
+            except SourceDownloadError as exc:
+                shutil.rmtree(job_dir, ignore_errors=True)
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+        else:
+            source = Path(body.source_path).expanduser().resolve()
+            if not source.is_file():
+                raise HTTPException(
+                    status_code=400,
+                    detail="sourcePath does not exist or is not a file",
+                )
         try:
             stat = source.stat()
             probe = await request.app.state.media.probe(source)
         except (OSError, MediaError) as exc:
+            if managed_source:
+                shutil.rmtree(job_dir, ignore_errors=True)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if "mpegts" not in probe.format_name.lower():
+            if managed_source:
+                shutil.rmtree(job_dir, ignore_errors=True)
             raise HTTPException(
                 status_code=400,
                 detail=f"The file content is not MPEG-TS: {probe.format_name}",
             )
-        job_id = uuid.uuid4().hex
         warnings: list[str] = []
         frame_path = configured.data_dir / "jobs" / job_id / "time-reference.png"
         time_reference = None
@@ -144,6 +168,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "source_size": stat.st_size,
                 "source_mtime_ns": stat.st_mtime_ns,
                 "source_duration": probe.duration,
+                "source_url": source_url,
                 "islice_base_url": "",
                 "template_id": body.template_id,
                 "language": body.language,

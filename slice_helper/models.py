@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -48,9 +49,15 @@ class JobCreate(BaseModel):
     @field_validator("source_path")
     @classmethod
     def validate_source_path(cls, value: str) -> str:
-        path = Path(value).expanduser()
+        normalized = value.strip()
+        parsed = urlsplit(normalized)
+        if parsed.scheme.lower() in {"http", "https"}:
+            if not parsed.netloc:
+                raise ValueError("sourcePath HTTP URL must include a host")
+            return normalized
+        path = Path(normalized).expanduser()
         if not path.is_absolute():
-            raise ValueError("sourcePath must be an absolute server path")
+            raise ValueError("sourcePath must be an absolute server path or HTTP URL")
         if path.suffix.lower() != ".ts":
             raise ValueError("sourcePath must point to a .ts file")
         return str(path)
