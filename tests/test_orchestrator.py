@@ -54,15 +54,18 @@ class PausingISlice:
         self.database = database
         self.job_id = job_id
         self.resume = False
+        self.pause_triggered = False
 
     async def ensure_task(self, _task_id, _request):
         return None
 
     async def get_task_info(self, task_id):
-        if not self.resume:
+        if not self.resume and not self.pause_triggered:
+            self.pause_triggered = True
             await self.database.update_job(
                 self.job_id, status="pause_requested", pause_requested=1
             )
+        if not self.resume:
             return {
                 "taskInfo": {
                 "taskId": task_id,
