@@ -43,6 +43,12 @@ function formatRealTime(value) {
   return match ? `${match[1]} ${match[2]}` : formatDate(value);
 }
 
+function toDateTimeLocal(value) {
+  if (!value) return "";
+  const match = String(value).match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})/);
+  return match ? `${match[1]}T${match[2]}` : "";
+}
+
 function sourceDisplay(job) {
   return job.source_url || job.source_path;
 }
@@ -198,10 +204,20 @@ function renderDetail() {
   $("summaryDuration").textContent = formatSeconds(job.source_duration);
   $("summaryWindow").textContent = `${job.current_window} / ${job.total_windows}`;
   $("summaryCutMode").textContent = job.cut_mode === "copy" ? "流复制" : "重编码";
-  const referenceNames = { ocr: "OCR", manual_fallback: "手工回退" };
-  $("summaryRealTime").textContent = job.program_start_time
-    ? `${formatRealTime(job.program_start_time)} (${referenceNames[job.time_reference_source] || "已有数据"})`
-    : "未识别";
+  const referenceNames = {
+    ocr: "OCR",
+    manual_fallback: "手工回退",
+    manual_override: "手工修正",
+    unavailable: "未识别"
+  };
+  const timeInput = $("summaryRealTime");
+  if (document.activeElement !== timeInput) {
+    timeInput.value = toDateTimeLocal(job.program_start_time);
+  }
+  const referenceLabel = referenceNames[job.time_reference_source] || "已有数据";
+  $("timeReferenceMeta").textContent = job.time_reference_source === "ocr" && job.time_reference_frame_offset
+    ? `${referenceLabel}（取样 +${Number(job.time_reference_frame_offset).toFixed(0)} 秒，已反推首帧）`
+    : referenceLabel;
   $("detailProgress").style.width = `${Math.max(0, Math.min(100, job.progress || 0))}%`;
   $("detailError").hidden = !job.error_message;
   $("detailError").textContent = job.error_message || "";
@@ -246,6 +262,7 @@ function renderTaskProgress(attempt) {
   return `
     <div class="task-progress-cell">
       <span class="mono window-task-id" title="${escapeHtml(attempt.task_id)}">${escapeHtml(attempt.task_id)}</span>
+      <span class="muted mono">真实起点 ${escapeHtml(formatRealTime(attempt.program_start_time))}</span>
       <span class="task-progress-meta">
         <span class="mini-progress"><span style="width:${progress}%"></span></span>
         <strong>${progress.toFixed(0)}%</strong>
@@ -388,6 +405,32 @@ async function controlJob(jobId, action) {
     showToast("作业状态已更新");
     await loadJobs();
   } catch (error) { showToast(error.message); }
+}
+
+async function saveTimeReference() {
+  const jobId = state.selectedJobId;
+  const value = $("summaryRealTime").value;
+  if (!jobId || !value) {
+    showToast("请填写完整的真实时间基准");
+    return;
+  }
+  const button = $("saveTimeReferenceButton");
+  button.disabled = true;
+  button.textContent = "保存中";
+  try {
+    const result = await api(`/api/jobs/${jobId}/time-reference`, {
+      method: "PATCH",
+      body: JSON.stringify({ programStartTime: value })
+    });
+    showToast(`时间基准已修正，已同步 ${result.updatedSegmentCount} 个片段`);
+    await loadJobs();
+    await loadDetail(jobId, false);
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = "保存";
+  }
 }
 
 function openCreate() {
@@ -587,6 +630,13 @@ $("createForm").addEventListener("submit", submitCreate);
 $("channelCreateForm").addEventListener("submit", submitChannel);
 $("resplitForm").addEventListener("submit", submitResplit);
 $("refreshButton").addEventListener("click", () => loadJobs().catch((error) => showToast(error.message)));
+$("saveTimeReferenceButton").addEventListener("click", saveTimeReference);
+$("summaryRealTime").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    saveTimeReference();
+  }
+});
 [$("statusFilter"), $("channelFilter"), $("dateFilter")].forEach((control) => control.addEventListener("change", () => {
   state.jobPage = 1;
   $("exportChannelButton").disabled = !$("channelFilter").value;

@@ -5,7 +5,7 @@ import re
 import unicodedata
 import uuid
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -32,6 +32,14 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def absolute_time(program_start_time: str | None, offset_seconds: float) -> str | None:
+    if not program_start_time:
+        return None
+    return (
+        datetime.fromisoformat(program_start_time) + timedelta(seconds=offset_seconds)
+    ).isoformat()
+
+
 class Database:
     JOB_FIELDS = {
         "status",
@@ -46,6 +54,13 @@ class Database:
         "started_at",
         "completed_at",
         "islice_base_url",
+        "program_start_time",
+        "time_reference_source",
+        "time_reference_text",
+        "time_reference_confidence",
+        "time_reference_frame_path",
+        "time_reference_frame_offset",
+        "time_reference_error",
     }
     WINDOW_FIELDS = {
         "requested_start",
@@ -116,6 +131,7 @@ class Database:
                     time_reference_text TEXT NOT NULL DEFAULT '',
                     time_reference_confidence REAL,
                     time_reference_frame_path TEXT NOT NULL DEFAULT '',
+                    time_reference_frame_offset REAL NOT NULL DEFAULT 0,
                     time_reference_error TEXT NOT NULL DEFAULT '',
                     cut_mode TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -212,6 +228,7 @@ class Database:
                 "time_reference_text": "TEXT NOT NULL DEFAULT ''",
                 "time_reference_confidence": "REAL",
                 "time_reference_frame_path": "TEXT NOT NULL DEFAULT ''",
+                "time_reference_frame_offset": "REAL NOT NULL DEFAULT 0",
                 "time_reference_error": "TEXT NOT NULL DEFAULT ''",
                 "islice_base_url": "TEXT NOT NULL DEFAULT ''",
                 "source_url": "TEXT NOT NULL DEFAULT ''",
@@ -404,6 +421,10 @@ class Database:
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(11, ?)",
                 (utc_now(),),
             )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(12, ?)",
+                (utc_now(),),
+            )
             await db.commit()
 
     @staticmethod
@@ -510,7 +531,7 @@ class Database:
             "next_window_start": 0.0,
             "pause_requested": 0,
             "stop_requested": 0,
-            "error_message": "",
+            "error_message": record.get("error_message", ""),
             "warnings_json": record.get("warnings_json", "[]"),
             "created_at": now,
             "updated_at": now,
@@ -759,6 +780,74 @@ class Database:
             )
             await db.commit()
 
+    async def update_time_reference(
+        self, job_id: str, program_start_time: str
+    ) -> tuple[dict[str, Any] | None, int]:
+        """Update the base time and all derived segment timestamps atomically."""
+        now = utc_now()
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            job = await (
+                await db.execute("SELECT * FROM jobs WHERE id=?", (job_id,))
+            ).fetchone()
+            if job is None:
+                await db.rollback()
+                return None, 0
+
+            warnings = json.loads(job["warnings_json"] or "[]")
+            previous = job["program_start_time"] or "unavailable"
+            warnings.append(
+                f"Time reference manually changed from {previous} to {program_start_time}"
+            )
+            fields: dict[str, Any] = {
+                "program_start_time": program_start_time,
+                "time_reference_source": "manual_override",
+                "warnings_json": json.dumps(warnings, ensure_ascii=False),
+                "updated_at": now,
+            }
+            # A creation-time stop caused by a missing reference becomes
+            # resumable as soon as the operator supplies the missing value.
+            if (
+                job["status"] == "stopped"
+                and not job["program_start_time"]
+                and int(job["current_window"] or 0) == 0
+                and not job["started_at"]
+            ):
+                fields.update(
+                    status="paused",
+                    error_message="",
+                    stop_requested=0,
+                    completed_at=None,
+                )
+
+            assignments = ", ".join(f"{key}=?" for key in fields)
+            await db.execute(
+                f"UPDATE jobs SET {assignments} WHERE id=?",
+                (*fields.values(), job_id),
+            )
+            segments = await (
+                await db.execute(
+                    "SELECT id, global_start, global_end FROM segments WHERE job_id=?",
+                    (job_id,),
+                )
+            ).fetchall()
+            await db.executemany(
+                "UPDATE segments SET absolute_start=?, absolute_end=? WHERE id=?",
+                [
+                    (
+                        absolute_time(program_start_time, float(row["global_start"])),
+                        absolute_time(program_start_time, float(row["global_end"])),
+                        row["id"],
+                    )
+                    for row in segments
+                ],
+            )
+            updated = await (
+                await db.execute("SELECT * FROM jobs WHERE id=?", (job_id,))
+            ).fetchone()
+            await db.commit()
+        return self._row(updated), len(segments)
+
     async def recover_jobs(self) -> None:
         now = utc_now()
         async with self.connect() as db:
@@ -964,6 +1053,13 @@ class Database:
             "raw_json",
         )
         async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            job = await (
+                await db.execute(
+                    "SELECT program_start_time FROM jobs WHERE id=?", (job_id,)
+                )
+            ).fetchone()
+            program_start_time = job["program_start_time"] if job else None
             attempt = await (
                 await db.execute(
                     "SELECT id, task_id FROM attempts WHERE window_id=? "
@@ -978,6 +1074,12 @@ class Database:
                     **segment,
                     "job_id": job_id,
                     "window_id": window_id,
+                    "absolute_start": absolute_time(
+                        program_start_time, float(segment["global_start"])
+                    ),
+                    "absolute_end": absolute_time(
+                        program_start_time, float(segment["global_end"])
+                    ),
                     "attempt_id": attempt["id"] if attempt else None,
                     "task_id": attempt["task_id"] if attempt else "",
                 }
@@ -1008,14 +1110,24 @@ class Database:
             rows = await (
                 await db.execute(
                     """
-                    SELECT a.*, w.window_index
-                    FROM attempts a JOIN windows w ON w.id=a.window_id
+                    SELECT a.*, w.window_index, w.requested_start,
+                           j.program_start_time AS job_program_start_time
+                    FROM attempts a
+                    JOIN windows w ON w.id=a.window_id
+                    JOIN jobs j ON j.id=w.job_id
                     WHERE w.job_id=? ORDER BY w.window_index, a.attempt_no
                     """,
                     (job_id,),
                 )
             ).fetchall()
-        return [dict(row) for row in rows]
+        result = []
+        for stored in rows:
+            row = dict(stored)
+            row["program_start_time"] = absolute_time(
+                row.pop("job_program_start_time"), float(row["requested_start"])
+            )
+            result.append(row)
+        return result
 
     async def ping(self) -> bool:
         try:

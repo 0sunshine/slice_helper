@@ -118,6 +118,11 @@ input:focus, select:focus { outline: 2px solid #8cc4b3; outline-offset: 1px; }
 .summary-grid > div { min-height: 64px; padding: 11px 13px; background: #ffffff; display: flex; flex-direction: column; gap: 7px; }
 .summary-grid span { color: #727a74; font-size: 12px; }
 .summary-grid strong { min-width: 0; font-size: 14px; overflow-wrap: anywhere; }
+.time-reference-summary { grid-column: span 2; }
+.time-reference-editor { display: flex; align-items: center; gap: 7px; }
+.time-reference-editor input { min-width: 0; flex: 1; min-height: 30px; padding: 4px 7px; font-family: Consolas, "Courier New", monospace; font-size: 12px; }
+.time-reference-editor .button { flex: 0 0 auto; }
+.time-reference-summary small { line-height: 1.3; }
 .error-banner { margin-top: 12px; padding: 10px 12px; border-left: 3px solid #b53a2d; background: #fff1ef; color: #91271b; }
 .warning-list p { margin-top: 8px; padding: 8px 10px; background: #fff6df; color: #795000; border-left: 3px solid #d69a25; }
 .external-link { color: #176b57; font-weight: 600; text-decoration: none; }
@@ -198,6 +203,7 @@ dialog::backdrop { background: #1c252180; }
   .topbar, .topbar-actions { flex-wrap: wrap; }
   .band { padding: 16px 14px 20px; }
   .summary-grid { grid-template-columns: 1fr 1fr; }
+  .time-reference-summary { grid-column: 1 / -1; }
   .detail-header { flex-direction: column; }
   .detail-actions { justify-content: flex-start; }
   .form-grid { grid-template-columns: 1fr; }

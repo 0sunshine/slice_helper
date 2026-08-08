@@ -92,7 +92,14 @@
         <div><span>源时长</span><strong id="summaryDuration"></strong></div>
         <div><span>当前窗口</span><strong id="summaryWindow"></strong></div>
         <div><span>切割方式</span><strong id="summaryCutMode"></strong></div>
-        <div><span>真实时间基准</span><strong id="summaryRealTime"></strong></div>
+        <div class="time-reference-summary">
+          <span>真实时间基准（可直接修改）</span>
+          <div class="time-reference-editor">
+            <input id="summaryRealTime" type="datetime-local" step="1" aria-label="真实时间基准">
+            <button id="saveTimeReferenceButton" class="button secondary small" type="button">保存</button>
+          </div>
+          <small id="timeReferenceMeta" class="muted"></small>
+        </div>
       </div>
       <div class="progress-track"><div id="detailProgress" class="progress-value"></div></div>
       <p id="detailError" class="error-banner" hidden></p>

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -130,8 +130,8 @@ def test_job_api_control_and_database_backed_chunk_route(
         assert "<th>节目类型</th>" in home.text
         assert "<th>新闻事件</th>" in home.text
         assert 'id="summaryISlice"' in home.text
-        assert "/static/styles.css?v=0.6.0" in home.text
-        assert "/static/app.js?v=0.6.0" in home.text
+        assert "/static/styles.css?v=0.7.0" in home.text
+        assert "/static/app.js?v=0.7.0" in home.text
         assert "TS 路径或 HTTP 地址" in home.text
         assert 'id="manageChannelsButton"' in home.text
         assert 'id="jobPageInfo"' in home.text
@@ -335,6 +335,8 @@ def test_create_job_cleans_failed_http_download(tmp_path: Path, monkeypatch) -> 
 def test_create_job_uses_manual_time_only_when_ocr_fails(
     tmp_path: Path, monkeypatch
 ) -> None:
+    attempted_offsets: list[float] = []
+
     async def fake_probe(_self, _path):
         return MediaProbe(
             duration=120.0,
@@ -343,7 +345,8 @@ def test_create_job_uses_manual_time_only_when_ocr_fails(
             audio_codec="aac",
         )
 
-    async def failed_time_reference(_self, _source, _frame_path, **_kwargs):
+    async def failed_time_reference(_self, _source, _frame_path, **kwargs):
+        attempted_offsets.append(kwargs["frame_offset_seconds"])
         raise MediaError("timestamp not found")
 
     async def no_start(_self):
@@ -377,8 +380,179 @@ def test_create_job_uses_manual_time_only_when_ocr_fails(
     job = response.json()
     assert job["program_start_time"] == "2026-06-20T12:30:00+08:00"
     assert job["time_reference_source"] == "manual_fallback"
-    assert job["time_reference_error"] == "timestamp not found"
+    assert attempted_offsets == [0.0, 60.0, 120.0, 180.0, 240.0, 300.0]
+    assert job["time_reference_error"].startswith("0s: timestamp not found")
+    assert job["time_reference_error"].endswith("300s: timestamp not found")
     assert "fallback" in job["warnings"][0].lower()
+
+
+def test_create_job_retries_ocr_and_back_calculates_first_frame_time(
+    tmp_path: Path, monkeypatch
+) -> None:
+    attempted_offsets: list[float] = []
+
+    async def fake_probe(_self, _path):
+        return MediaProbe(
+            duration=600.0,
+            format_name="mpegts",
+            video_codec="h264",
+            audio_codec="aac",
+        )
+
+    async def retrying_time_reference(_self, _source, frame_path, **kwargs):
+        offset = kwargs["frame_offset_seconds"]
+        attempted_offsets.append(offset)
+        if offset < 120:
+            raise MediaError("timestamp not found")
+        frame_path.parent.mkdir(parents=True, exist_ok=True)
+        frame_path.write_bytes(b"png")
+        observed = datetime.fromisoformat("2026-06-20T12:32:00")
+        return TimeReference(
+            source_start_time=observed - timedelta(seconds=offset),
+            observed_time=observed,
+            frame_offset_seconds=offset,
+            matched_text="2026-06-20 12:32:00",
+            confidence=0.98,
+            ocr_texts=(OcrText("2026-06-20 12:32:00", 0.98),),
+        )
+
+    async def no_start(_self):
+        return None
+
+    async def no_stop(_self):
+        return None
+
+    monkeypatch.setattr("slice_helper.media.MediaService.probe", fake_probe)
+    monkeypatch.setattr(
+        "slice_helper.media.MediaService.detect_time_reference",
+        retrying_time_reference,
+    )
+    monkeypatch.setattr(Orchestrator, "start", no_start)
+    monkeypatch.setattr(Orchestrator, "stop", no_stop)
+
+    source = tmp_path / "source.ts"
+    source.write_bytes(b"source")
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        channel_id = create_channel(client)
+        response = client.post(
+            "/api/jobs",
+            json={
+                "sourcePath": str(source.resolve()),
+                "channelId": channel_id,
+                "broadcastDate": "2026-06-20",
+            },
+        )
+
+    assert response.status_code == 201
+    job = response.json()
+    assert attempted_offsets == [0.0, 60.0, 120.0]
+    assert job["program_start_time"] == "2026-06-20T12:30:00"
+    assert job["time_reference_frame_offset"] == 120.0
+    assert job["status"] == "pending_schedule"
+    assert "120s" in job["warnings"][0]
+
+
+def test_missing_time_stops_until_page_correction_and_resyncs_real_times(
+    tmp_path: Path, monkeypatch
+) -> None:
+    async def fake_probe(_self, _path):
+        return MediaProbe(
+            duration=120.0,
+            format_name="mpegts",
+            video_codec="h264",
+            audio_codec="aac",
+        )
+
+    async def failed_time_reference(_self, _source, _frame_path, **_kwargs):
+        raise MediaError("timestamp not found")
+
+    async def no_start(_self):
+        return None
+
+    async def no_stop(_self):
+        return None
+
+    monkeypatch.setattr("slice_helper.media.MediaService.probe", fake_probe)
+    monkeypatch.setattr(
+        "slice_helper.media.MediaService.detect_time_reference", failed_time_reference
+    )
+    monkeypatch.setattr(Orchestrator, "start", no_start)
+    monkeypatch.setattr(Orchestrator, "stop", no_stop)
+
+    source = tmp_path / "source.ts"
+    source.write_bytes(b"source")
+    configured = make_settings(tmp_path)
+    with TestClient(create_app(configured)) as client:
+        channel_id = create_channel(client)
+        created = client.post(
+            "/api/jobs",
+            json={
+                "sourcePath": str(source.resolve()),
+                "channelId": channel_id,
+                "broadcastDate": "2026-06-20",
+            },
+        )
+        assert created.status_code == 201
+        job = created.json()
+        job_id = job["id"]
+        assert job["status"] == "stopped"
+        assert job["program_start_time"] is None
+        assert "job stopped" in job["error_message"]
+
+        async def add_existing_result() -> None:
+            database = Database(configured.database_path)
+            window = await database.upsert_window(job_id, 0, 60.0, 120.0)
+            attempt = await database.create_attempt(window["id"], 1, "task-time-fix")
+            await database.update_attempt(attempt["id"], status="completed")
+            await database.replace_window_segments(
+                job_id,
+                window["id"],
+                [
+                    {
+                        "source_index": 0,
+                        "accepted": 1,
+                        "reason": "",
+                        "local_start": 10.0,
+                        "local_end": 20.0,
+                        "global_start": 70.0,
+                        "global_end": 80.0,
+                        "absolute_start": None,
+                        "absolute_end": None,
+                        "title": "测试片段",
+                        "content_type": "新闻",
+                        "news_event_type": "",
+                        "topic": "",
+                        "keywords_json": "[]",
+                        "summary": "",
+                        "segment_url": "",
+                        "cover_img_url": "",
+                        "raw_json": "{}",
+                    }
+                ],
+            )
+
+        asyncio.run(add_existing_result())
+        corrected = client.patch(
+            f"/api/jobs/{job_id}/time-reference",
+            json={"programStartTime": "2026-06-20T12:00:00+08:00"},
+        )
+        assert corrected.status_code == 200
+        payload = corrected.json()
+        assert payload["updatedSegmentCount"] == 1
+        assert payload["job"]["status"] == "paused"
+        assert payload["job"]["time_reference_source"] == "manual_override"
+
+        detail = client.get(f"/api/jobs/{job_id}").json()
+        assert detail["attempts"][0]["program_start_time"] == (
+            "2026-06-20T12:01:00+08:00"
+        )
+        segment = client.get(f"/api/jobs/{job_id}/segments").json()[0]
+        assert segment["absolute_start"] == "2026-06-20T12:01:10+08:00"
+        assert segment["absolute_end"] == "2026-06-20T12:01:20+08:00"
+
+        resumed = client.post(f"/api/jobs/{job_id}/resume")
+        assert resumed.status_code == 200
+        assert resumed.json()["status"] == "pending_schedule"
 
 
 def test_channel_date_overwrite_pagination_and_excel_export(

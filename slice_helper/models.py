@@ -97,6 +97,12 @@ class ChannelUpdate(ChannelCreate):
     pass
 
 
+class TimeReferenceUpdate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    program_start_time: datetime = Field(alias="programStartTime")
+
+
 class WindowResplitRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 

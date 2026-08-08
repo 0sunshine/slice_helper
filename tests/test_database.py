@@ -35,7 +35,7 @@ async def test_database_persists_and_recovers_jobs(tmp_path: Path) -> None:
 
     async with database.connect() as db:
         versions = await (await db.execute("SELECT version FROM schema_version ORDER BY version")).fetchall()
-    assert [row["version"] for row in versions] == list(range(1, 12))
+    assert [row["version"] for row in versions] == list(range(1, 13))
     async with database.connect() as db:
         segment_columns = {
             row["name"]
@@ -45,6 +45,12 @@ async def test_database_persists_and_recovers_jobs(tmp_path: Path) -> None:
     assert "news_event_type" in segment_columns
     assert "attempt_id" in segment_columns
     assert "task_id" in segment_columns
+    async with database.connect() as db:
+        job_columns = {
+            row["name"]
+            for row in await (await db.execute("PRAGMA table_info(jobs)")).fetchall()
+        }
+    assert "time_reference_frame_offset" in job_columns
     assert recovered["islice_base_url"] == ""
     assert recovered["source_url"] == ""
 

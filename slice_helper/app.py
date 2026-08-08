@@ -23,7 +23,14 @@ from .database import Database
 from .excel_export import build_channel_workbook, safe_export_filename
 from .islice import ISlicePool
 from .media import MediaError, MediaService
-from .models import ChannelCreate, ChannelUpdate, JobCreate, JobStatus, WindowResplitRequest
+from .models import (
+    ChannelCreate,
+    ChannelUpdate,
+    JobCreate,
+    JobStatus,
+    TimeReferenceUpdate,
+    WindowResplitRequest,
+)
 from .orchestrator import Orchestrator, ResplitConflictError, ResplitValidationError
 from .processing import calculate_total_windows
 from .source_download import HttpSourceDownloader, SourceDownloadError
@@ -35,6 +42,7 @@ logging.basicConfig(
 )
 
 PACKAGE_DIR = Path(__file__).resolve().parent
+OCR_FRAME_OFFSETS = tuple(float(minutes * 60) for minutes in range(6))
 
 
 def _public_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -213,17 +221,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         warnings: list[str] = []
         frame_path = configured.data_dir / "jobs" / job_id / "time-reference.png"
         time_reference = None
-        time_reference_error = ""
-        try:
-            time_reference = await request.app.state.media.detect_time_reference(
-                source, frame_path
-            )
-        except MediaError as exc:
-            time_reference_error = str(exc)
+        time_reference_errors: list[str] = []
+        for frame_offset in OCR_FRAME_OFFSETS:
+            try:
+                time_reference = await request.app.state.media.detect_time_reference(
+                    source,
+                    frame_path,
+                    frame_offset_seconds=frame_offset,
+                )
+                break
+            except MediaError as exc:
+                time_reference_errors.append(f"{int(frame_offset)}s: {exc}")
+        time_reference_error = "; ".join(time_reference_errors)
 
         if time_reference is not None:
             resolved_start_time = time_reference.source_start_time
             time_reference_source = "ocr"
+            time_reference_error = ""
+            if time_reference.frame_offset_seconds:
+                warnings.append(
+                    "Time OCR succeeded at source offset "
+                    f"{int(time_reference.frame_offset_seconds)}s after "
+                    f"{len(time_reference_errors) + 1} attempts"
+                )
             if body.program_start_time is not None:
                 try:
                     difference = abs(
@@ -243,7 +263,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         else:
             resolved_start_time = None
             time_reference_source = "unavailable"
-            warnings.append(f"Time OCR failed; real times are unavailable: {time_reference_error}")
+            warnings.append(f"Time OCR failed after 6 attempts: {time_reference_error}")
+
+        stopped_for_missing_time = resolved_start_time is None
+        missing_time_message = (
+            "Time OCR failed after 6 attempts and programStartTime was not supplied; "
+            "job stopped"
+        )
 
         total_windows = calculate_total_windows(
             probe.duration,
@@ -275,11 +301,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "time_reference_confidence": (
                     time_reference.confidence if time_reference is not None else None
                 ),
-                "time_reference_frame_path": str(frame_path) if frame_path.is_file() else "",
+                "time_reference_frame_path": (
+                    str(frame_path)
+                    if time_reference is not None and frame_path.is_file()
+                    else ""
+                ),
+                "time_reference_frame_offset": (
+                    time_reference.frame_offset_seconds if time_reference is not None else 0.0
+                ),
                 "time_reference_error": time_reference_error,
                 "cut_mode": body.cut_mode.value,
                 "total_windows": total_windows,
                 "warnings_json": json.dumps(warnings, ensure_ascii=False),
+                "status": (
+                    JobStatus.STOPPED.value
+                    if stopped_for_missing_time
+                    else JobStatus.PENDING_SCHEDULE.value
+                ),
+                "error_message": missing_time_message if stopped_for_missing_time else "",
                 },
                 supersede_job_id=existing["id"] if existing else None,
             )
@@ -360,6 +399,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             row["keywords"] = json.loads(row.pop("keywords_json"))
             row["raw"] = json.loads(row.pop("raw_json"))
         return rows
+
+    @application.patch("/api/jobs/{job_id}/time-reference")
+    async def update_job_time_reference(
+        request: Request, job_id: str, body: TimeReferenceUpdate
+    ):
+        updated, segment_count = await request.app.state.database.update_time_reference(
+            job_id, body.program_start_time.isoformat()
+        )
+        if updated is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        await request.app.state.orchestrator.write_manifest(job_id)
+        request.app.state.orchestrator.notify()
+        return {
+            "job": _public_job(updated),
+            "updatedSegmentCount": segment_count,
+        }
 
     @application.post(
         "/api/jobs/{job_id}/windows/{window_index}/resplit",

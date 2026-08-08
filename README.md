@@ -102,7 +102,9 @@ Content-Type: application/json
 
 `sourcePath` 支持服务器本地绝对路径以及 `http://`、`https://` 地址。HTTP 源以流式方式下载到 `data/jobs/{jobId}/source.ts`，完成长度校验和原子改名后才执行 FFprobe、OCR 并创建作业；创建接口会等待下载和校验完成。下载后的源 TS 作为作业输入长期保留。
 
-`programStartTime` 是可选的 OCR 失败回退值。每个作业只执行一次首帧 OCR；识别成功时以画面时间为准，并在 `data/jobs/{jobId}/time-reference.png` 保留基准帧。作业和结果 JSON 会记录 OCR 原文、置信度、基准来源与失败原因。片段的 `absolute_start`、`absolute_end` 即页面中的真实开始、结束时间。
+`programStartTime` 是可选的 OCR 失败回退值。系统依次在源文件的 0、1、2、3、4、5 分钟位置尝试 OCR，最多 6 次；在第 N 分钟识别成功时，以“画面时间减去 N 分钟”反推出源文件首帧时间，并在 `data/jobs/{jobId}/time-reference.png` 保留成功的基准帧。6 次均失败时使用 `programStartTime`；页面也未填写该值时，作业创建为“已停止”，不会提交 iSlice。
+
+作业详情页可以直接修改“真实时间基准”。该值始终代表源文件首帧时间；保存后，所有已有片段的 `absolute_start`、`absolute_end` 和每个窗口任务显示的真实起点会立即重算，后续提交给 iSlice 的窗口也使用新基准。因缺少时间而停止的作业，补填后转为“已暂停”，点击“继续”即可开始处理。作业和结果 JSON 会记录 OCR 原文、置信度、取样偏移、基准来源与失败原因。
 
 作业详情的拆条结果每页显示 10 条；点击有视频 URL 的结果行会立即播放，并自动定位到播放器。桌面端使用大尺寸播放器，拆条结果排列在播放器右侧，窗口时间线位于下方通栏；窄屏自动改为上下排列。结果行使用紧凑单行时间范围，页面顶部栏随页面滚动离开视口。加载失败时可从新窗口打开原始 URL。媒体不经过辅助服务代理，浏览器需要能够访问 iSlice 地址。MP4/H.264/AAC 可直接播放，iSlice 支持 HTTP Range 时可正常按需加载和拖动。
 
@@ -122,6 +124,7 @@ iSlice 片段的 `contentType` 原样保存为节目类型；`newsEventType` 原
 - `GET /api/jobs?page=1&pageSize=20&status=&channelId=&broadcastDate=`
 - `GET /api/jobs/{id}`
 - `GET /api/jobs/{id}/segments?acceptedOnly=true`
+- `PATCH /api/jobs/{id}/time-reference`，请求体为 `{"programStartTime":"2026-08-03T00:00:00+08:00"}`
 - `GET /api/jobs/{id}/result`
 - `POST /api/jobs/{id}/pause`
 - `POST /api/jobs/{id}/resume`
