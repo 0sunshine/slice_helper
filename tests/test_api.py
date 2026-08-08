@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -33,9 +35,18 @@ def make_settings(tmp_path: Path) -> Settings:
     )
 
 
+def create_channel(client: TestClient, name: str = "测试频道") -> str:
+    response = client.post("/api/channels", json={"name": name})
+    assert response.status_code == 201
+    return response.json()["id"]
+
+
 def test_job_api_control_and_database_backed_chunk_route(
     tmp_path: Path, monkeypatch
 ) -> None:
+    resplit_call: dict[str, object] = {}
+    overlap_call: dict[str, object] = {}
+
     async def fake_probe(_self, _path):
         return MediaProbe(
             duration=120.0,
@@ -63,12 +74,38 @@ def test_job_api_control_and_database_backed_chunk_route(
     async def no_stop(_self):
         return None
 
+    async def fake_resplit(_self, job_id, window_index, task_id):
+        resplit_call.update(
+            job_id=job_id, window_index=window_index, task_id=task_id
+        )
+        return {
+            "jobId": job_id,
+            "windowIndex": window_index,
+            "taskId": task_id,
+            "status": "resplit_queued",
+        }
+
+    async def fake_accept_overlap(_self, job_id, window_index, task_id):
+        overlap_call.update(
+            job_id=job_id, window_index=window_index, task_id=task_id
+        )
+        return {
+            "jobId": job_id,
+            "windowIndex": window_index,
+            "taskId": task_id,
+            "status": "overlap_accepted",
+        }
+
     monkeypatch.setattr("slice_helper.media.MediaService.probe", fake_probe)
     monkeypatch.setattr(
         "slice_helper.media.MediaService.detect_time_reference", fake_time_reference
     )
     monkeypatch.setattr(Orchestrator, "start", no_start)
     monkeypatch.setattr(Orchestrator, "stop", no_stop)
+    monkeypatch.setattr(Orchestrator, "schedule_resplit", fake_resplit)
+    monkeypatch.setattr(
+        Orchestrator, "accept_resplit_overlap", fake_accept_overlap
+    )
 
     source = tmp_path / "source.ts"
     source.write_bytes(b"source")
@@ -85,16 +122,28 @@ def test_job_api_control_and_database_backed_chunk_route(
         assert 'class="media-workspace"' in home.text
         assert 'class="segment-results-panel"' in home.text
         assert 'class="window-timeline-panel"' in home.text
+        assert 'id="resplitDialog"' in home.text
+        assert 'id="resplitForm"' in home.text
+        assert "确认重新拆分" in home.text
+        assert "<th>操作</th>" in home.text
         assert "小任务进度" in home.text
+        assert "<th>节目类型</th>" in home.text
+        assert "<th>新闻事件</th>" in home.text
         assert 'id="summaryISlice"' in home.text
-        assert "/static/styles.css?v=0.4.0" in home.text
-        assert "/static/app.js?v=0.4.0" in home.text
+        assert "/static/styles.css?v=0.6.0" in home.text
+        assert "/static/app.js?v=0.6.0" in home.text
         assert "TS 路径或 HTTP 地址" in home.text
+        assert 'id="manageChannelsButton"' in home.text
+        assert 'id="jobPageInfo"' in home.text
+
+        channel_id = create_channel(client)
 
         created = client.post(
             "/api/jobs",
             json={
                 "sourcePath": str(source.resolve()),
+                "channelId": channel_id,
+                "broadcastDate": "2026-06-20",
                 "templateId": "general",
                 "language": "zh",
                 "cutMode": "copy",
@@ -106,6 +155,8 @@ def test_job_api_control_and_database_backed_chunk_route(
         assert job["total_windows"] == 1
         assert job["status"] == "pending_schedule"
         assert job["islice_base_url"] == ""
+        assert job["channel_name"] == "测试频道"
+        assert job["broadcast_date"] == "2026-06-20"
         assert job["program_start_time"] == "2026-06-20T12:29:59"
         assert job["time_reference_source"] == "ocr"
         assert job["time_reference_text"] == "2026-06-20 12:29:59"
@@ -113,7 +164,8 @@ def test_job_api_control_and_database_backed_chunk_route(
         assert Path(job["time_reference_frame_path"]).is_file()
 
         listed = client.get("/api/jobs").json()
-        assert [item["id"] for item in listed] == [job_id]
+        assert listed["total"] == 1
+        assert [item["id"] for item in listed["items"]] == [job_id]
 
         paused = client.post(f"/api/jobs/{job_id}/pause")
         assert paused.status_code == 200
@@ -140,6 +192,30 @@ def test_job_api_control_and_database_backed_chunk_route(
         assert response.headers["content-type"].startswith("video/mp2t")
         assert response.headers["content-length"] == str(len(b"test-ts-body"))
         assert client.get("/internal/chunks/not-a-job/0.ts").status_code == 404
+
+        resplit = client.post(
+            f"/api/jobs/{job_id}/windows/0/resplit",
+            json={"taskId": "sh-test-w000-a1"},
+        )
+        assert resplit.status_code == 202
+        assert resplit.json()["taskId"] == "sh-test-w000-a1"
+        assert resplit_call == {
+            "job_id": job_id,
+            "window_index": 0,
+            "task_id": "sh-test-w000-a1",
+        }
+
+        overlap = client.post(
+            f"/api/jobs/{job_id}/windows/0/accept-overlap",
+            json={"taskId": "sh-test-w000-a1"},
+        )
+        assert overlap.status_code == 200
+        assert overlap.json()["status"] == "overlap_accepted"
+        assert overlap_call == {
+            "job_id": job_id,
+            "window_index": 0,
+            "task_id": "sh-test-w000-a1",
+        }
 
         stopped = client.post(f"/api/jobs/{job_id}/stop")
         assert stopped.status_code == 200
@@ -199,7 +275,15 @@ def test_create_job_downloads_http_source_to_managed_path(
     configured = make_settings(tmp_path)
     source_url = "https://media.test/archive/day.ts?token=internal"
     with TestClient(create_app(configured)) as client:
-        response = client.post("/api/jobs", json={"sourcePath": source_url})
+        channel_id = create_channel(client)
+        response = client.post(
+            "/api/jobs",
+            json={
+                "sourcePath": source_url,
+                "channelId": channel_id,
+                "broadcastDate": "2026-06-20",
+            },
+        )
 
     assert response.status_code == 201
     job = response.json()
@@ -232,8 +316,14 @@ def test_create_job_cleans_failed_http_download(tmp_path: Path, monkeypatch) -> 
     configured = make_settings(tmp_path)
 
     with TestClient(create_app(configured)) as client:
+        channel_id = create_channel(client)
         response = client.post(
-            "/api/jobs", json={"sourcePath": "http://media.test/broken.ts"}
+            "/api/jobs",
+            json={
+                "sourcePath": "http://media.test/broken.ts",
+                "channelId": channel_id,
+                "broadcastDate": "2026-06-20",
+            },
         )
 
     assert response.status_code == 502
@@ -272,10 +362,13 @@ def test_create_job_uses_manual_time_only_when_ocr_fails(
     source = tmp_path / "source.ts"
     source.write_bytes(b"source")
     with TestClient(create_app(make_settings(tmp_path))) as client:
+        channel_id = create_channel(client)
         response = client.post(
             "/api/jobs",
             json={
                 "sourcePath": str(source.resolve()),
+                "channelId": channel_id,
+                "broadcastDate": "2026-06-20",
                 "programStartTime": "2026-06-20T12:30:00+08:00",
             },
         )
@@ -286,3 +379,183 @@ def test_create_job_uses_manual_time_only_when_ocr_fails(
     assert job["time_reference_source"] == "manual_fallback"
     assert job["time_reference_error"] == "timestamp not found"
     assert "fallback" in job["warnings"][0].lower()
+
+
+def test_channel_date_overwrite_pagination_and_excel_export(
+    tmp_path: Path, monkeypatch
+) -> None:
+    async def fake_probe(_self, _path):
+        return MediaProbe(
+            duration=120.0,
+            format_name="mpegts",
+            video_codec="h264",
+            audio_codec="aac",
+        )
+
+    async def failed_time_reference(_self, _source, _frame_path, **_kwargs):
+        raise MediaError("timestamp not found")
+
+    async def no_start(_self):
+        return None
+
+    async def no_stop(_self):
+        return None
+
+    monkeypatch.setattr("slice_helper.media.MediaService.probe", fake_probe)
+    monkeypatch.setattr(
+        "slice_helper.media.MediaService.detect_time_reference", failed_time_reference
+    )
+    monkeypatch.setattr(Orchestrator, "start", no_start)
+    monkeypatch.setattr(Orchestrator, "stop", no_stop)
+
+    first_source = tmp_path / "first.ts"
+    second_source = tmp_path / "second.ts"
+    first_source.write_bytes(b"first")
+    second_source.write_bytes(b"second")
+    configured = make_settings(tmp_path)
+
+    with TestClient(create_app(configured)) as client:
+        channel_id = create_channel(client, "测试频道")
+        duplicate_channel = client.post(
+            "/api/channels", json={"name": "  测试频道  "}
+        )
+        assert duplicate_channel.status_code == 409
+        empty_channel_id = create_channel(client, "待删除频道")
+        assert client.delete(f"/api/channels/{empty_channel_id}").status_code == 204
+
+        common = {
+            "channelId": channel_id,
+            "broadcastDate": "2026-06-20",
+            "programStartTime": "2026-06-20T00:00:00+08:00",
+        }
+        first = client.post(
+            "/api/jobs", json={**common, "sourcePath": str(first_source.resolve())}
+        )
+        assert first.status_code == 201
+        first_id = first.json()["id"]
+
+        conflict = client.post(
+            "/api/jobs", json={**common, "sourcePath": str(second_source.resolve())}
+        )
+        assert conflict.status_code == 409
+        assert conflict.json()["detail"]["code"] == "channel_date_exists"
+
+        database = Database(configured.database_path)
+        asyncio.run(database.update_job(first_id, status="completed"))
+        replacement = client.post(
+            "/api/jobs",
+            json={
+                **common,
+                "sourcePath": str(second_source.resolve()),
+                "overwrite": True,
+            },
+        )
+        assert replacement.status_code == 201
+        replacement_id = replacement.json()["id"]
+        historical = asyncio.run(database.get_job(first_id))
+        assert historical["superseded_by_job_id"] == replacement_id
+        assert historical["superseded_at"]
+
+        active_conflict = client.post(
+            "/api/jobs",
+            json={
+                **common,
+                "sourcePath": str(first_source.resolve()),
+                "overwrite": True,
+            },
+        )
+        assert active_conflict.status_code == 409
+        assert active_conflict.json()["detail"]["code"] == "channel_date_active"
+
+        async def add_results() -> None:
+            await database.update_job(replacement_id, status="completed")
+            window = await database.upsert_window(replacement_id, 0, 0, 120)
+            attempt = await database.create_attempt(window["id"], 1, "task-export-1")
+            await database.update_attempt(
+                attempt["id"], status="completed", service_status="completed", progress=100
+            )
+            base = {
+                "reason": "",
+                "local_start": 0.0,
+                "local_end": 30.0,
+                "global_start": 0.0,
+                "global_end": 30.0,
+                "absolute_start": "2026-06-20T00:00:00+08:00",
+                "absolute_end": "2026-06-20T00:00:30+08:00",
+                "content_type": "新闻",
+                "news_event_type": "时政要闻",
+                "topic": "时政",
+                "keywords_json": '["关键词一", "关键词二"]',
+                "segment_url": "http://media.test/accepted.mp4",
+                "cover_img_url": "http://media.test/accepted.jpg",
+            }
+            await database.replace_window_segments(
+                replacement_id,
+                window["id"],
+                [
+                    {
+                        **base,
+                        "source_index": 0,
+                        "accepted": 1,
+                        "title": "最终采用标题",
+                        "summary": "界面未显示的完整摘要",
+                        "raw_json": "{}",
+                    },
+                    {
+                        **base,
+                        "source_index": 1,
+                        "accepted": 0,
+                        "reason": "handoff",
+                        "title": "不应导出的舍弃标题",
+                        "summary": "舍弃摘要",
+                        "raw_json": "{}",
+                    },
+                ],
+            )
+
+        asyncio.run(add_results())
+        second_date = client.post(
+            "/api/jobs",
+            json={
+                "sourcePath": str(first_source.resolve()),
+                "channelId": channel_id,
+                "broadcastDate": "2026-06-21",
+            },
+        )
+        assert second_date.status_code == 201
+
+        page_one = client.get("/api/jobs", params={"page": 1, "pageSize": 1}).json()
+        page_two = client.get("/api/jobs", params={"page": 2, "pageSize": 1}).json()
+        assert page_one["total"] == 2
+        assert page_one["totalPages"] == 2
+        assert page_one["items"][0]["id"] != page_two["items"][0]["id"]
+        filtered = client.get(
+            "/api/jobs",
+            params={"channelId": channel_id, "broadcastDate": "2026-06-20"},
+        ).json()
+        assert filtered["total"] == 1
+        assert filtered["items"][0]["id"] == replacement_id
+
+        exported = client.get(f"/api/channels/{channel_id}/export.xlsx")
+        assert exported.status_code == 200
+        assert exported.headers["content-type"].startswith(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+            workbook_xml = archive.read("xl/workbook.xml").decode("utf-8")
+            shared_strings = archive.read("xl/sharedStrings.xml").decode("utf-8")
+            first_sheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        assert "2026-06-20" in workbook_xml
+        assert "2026-06-21" in workbook_xml
+        assert "最终采用标题" in shared_strings
+        assert "界面未显示的完整摘要" in shared_strings
+        assert "task-export-1" in shared_strings
+        assert "不应导出的舍弃标题" not in shared_strings
+        assert "IF(AND(D2" in first_sheet
+
+        renamed = client.patch(
+            f"/api/channels/{channel_id}", json={"name": "测试频道（新）"}
+        )
+        assert renamed.status_code == 200
+        assert renamed.json()["name"] == "测试频道（新）"
+        assert client.delete(f"/api/channels/{channel_id}").status_code == 409

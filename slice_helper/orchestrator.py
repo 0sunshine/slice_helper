@@ -31,6 +31,14 @@ class JobControlRequested(Exception):
     """The current job reached a safe point for a pause or stop request."""
 
 
+class ResplitConflictError(RuntimeError):
+    pass
+
+
+class ResplitValidationError(RuntimeError):
+    pass
+
+
 class _ISliceSubmissionGate:
     """Progress-priority admission gate for pre-LLM work on each iSlice."""
 
@@ -105,10 +113,13 @@ class Orchestrator:
         self._active: dict[str, asyncio.Task[None]] = {}
         self._submission_gate = _ISliceSubmissionGate()
         self._gate_monitors: dict[str, asyncio.Task[None]] = {}
+        self._resplit_tasks: dict[tuple[str, int], asyncio.Task[None]] = {}
+        self._resplit_lock = asyncio.Lock()
         self._wake = asyncio.Event()
         self._stopping = False
 
     async def start(self) -> None:
+        await self.database.recover_interrupted_resplits()
         await self.database.recover_jobs()
         self._stopping = False
         self._scheduler_task = asyncio.create_task(self._scheduler_loop(), name="job-scheduler")
@@ -125,6 +136,11 @@ class Orchestrator:
         if self._active:
             await asyncio.gather(*self._active.values(), return_exceptions=True)
         self._active.clear()
+        for task in self._resplit_tasks.values():
+            task.cancel()
+        if self._resplit_tasks:
+            await asyncio.gather(*self._resplit_tasks.values(), return_exceptions=True)
+        self._resplit_tasks.clear()
         for task in self._gate_monitors.values():
             task.cancel()
         if self._gate_monitors:
@@ -133,6 +149,422 @@ class Orchestrator:
 
     def notify(self) -> None:
         self._wake.set()
+
+    async def schedule_resplit(
+        self, job_id: str, window_index: int, expected_task_id: str
+    ) -> dict[str, Any]:
+        key = (job_id, window_index)
+        async with self._resplit_lock:
+            if any(active_job_id == job_id for active_job_id, _index in self._resplit_tasks):
+                raise ResplitConflictError("This job already has a resplit in progress")
+            job = await self.database.get_job(job_id)
+            if not job:
+                raise ResplitValidationError("Job not found")
+            if job_id in self._active or job["status"] in {
+                JobStatus.PENDING_SCHEDULE.value,
+                JobStatus.QUEUED.value,
+                JobStatus.PROBING.value,
+                JobStatus.RUNNING.value,
+                JobStatus.PAUSE_REQUESTED.value,
+                JobStatus.STOP_REQUESTED.value,
+            }:
+                raise ResplitConflictError(
+                    "Pause or finish the job before manually resplitting a window"
+                )
+            window = await self.database.get_window(job_id, window_index)
+            if not window:
+                raise ResplitValidationError("Window not found")
+            attempts = await self.database.get_attempts(window["id"])
+            if not attempts:
+                raise ResplitValidationError("This window has not been submitted to iSlice")
+            attempt = attempts[-1]
+            if attempt["task_id"] != expected_task_id:
+                raise ResplitConflictError(
+                    "The window task changed; refresh the page before resplitting"
+                )
+            if attempt["status"] not in {"completed", "failed", "discarded"}:
+                raise ResplitConflictError("The iSlice task is still active")
+            if not job.get("islice_base_url"):
+                raise ResplitValidationError("The job has not been assigned to an iSlice instance")
+            if not self._source_unchanged(job):
+                raise ResplitValidationError("Source file size or modification time changed")
+
+            await self.database.update_attempt(
+                attempt["id"],
+                status="resplit_queued",
+                service_status="waiting",
+                progress=0.0,
+                error_message="",
+                finished_at=None,
+            )
+            task = asyncio.create_task(
+                self._run_resplit(job_id, window_index, int(attempt["id"])),
+                name=f"resplit-{expected_task_id}",
+            )
+            self._resplit_tasks[key] = task
+            task.add_done_callback(
+                lambda done, task_key=key: self._resplit_finished(task_key, done)
+            )
+            return {
+                "jobId": job_id,
+                "windowIndex": window_index,
+                "taskId": expected_task_id,
+                "status": "resplit_queued",
+            }
+
+    async def accept_resplit_overlap(
+        self, job_id: str, window_index: int, expected_task_id: str
+    ) -> dict[str, Any]:
+        """Commit a completed manual-resplit response despite cross-window overlap.
+
+        This never calls iSlice. It is an explicit recovery action for a manual
+        resplit whose response was persisted but rejected by the cross-window
+        boundary guard.
+        """
+        async with self._resplit_lock:
+            if any(active_job_id == job_id for active_job_id, _ in self._resplit_tasks):
+                raise ResplitConflictError("This job already has a resplit in progress")
+
+            job = await self.database.get_job(job_id)
+            if not job:
+                raise ResplitValidationError("Job not found")
+            window = await self.database.get_window(job_id, window_index)
+            if not window:
+                raise ResplitValidationError("Window not found")
+            attempts = await self.database.get_attempts(window["id"])
+            if not attempts:
+                raise ResplitValidationError("This window has no iSlice attempt")
+            attempt = attempts[-1]
+            if attempt["task_id"] != expected_task_id:
+                raise ResplitConflictError(
+                    "The window task changed; refresh the page before accepting overlap"
+                )
+            if window["status"] != WindowStatus.FAILED.value:
+                raise ResplitConflictError(
+                    "This window is not waiting for overlap acceptance"
+                )
+            if (
+                attempt["status"] != "completed"
+                or attempt.get("service_status") != "completed"
+                or not attempt.get("raw_response_path")
+            ):
+                raise ResplitValidationError(
+                    "No completed manual-resplit response is available"
+                )
+
+            boundary_error = str(window.get("error_message") or "")
+            allowed_errors = (
+                "accepted segments overlap the previous window",
+                "the resplit handoff changed from the next window's fixed source start",
+                "resplit segments overlap a following window",
+            )
+            if not any(marker in boundary_error for marker in allowed_errors):
+                raise ResplitValidationError(
+                    "The failed resplit is not a cross-window overlap conflict"
+                )
+
+            raw_path = Path(str(attempt["raw_response_path"]))
+            expected_raw_dir = (
+                self.settings.data_dir / "jobs" / job_id / "raw"
+            ).resolve()
+            try:
+                resolved_raw_path = raw_path.resolve(strict=True)
+                resolved_raw_path.relative_to(expected_raw_dir)
+                payload = json.loads(resolved_raw_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                raise ResplitValidationError(
+                    "The saved manual-resplit response is unavailable or invalid"
+                ) from exc
+
+            task_info = payload.get("taskInfo") or {}
+            if (
+                task_info.get("taskId") != expected_task_id
+                or str(task_info.get("status") or "").lower() != "completed"
+            ):
+                raise ResplitValidationError(
+                    "The saved response does not match the completed iSlice task"
+                )
+
+            await self._commit_resplit_payload(
+                job,
+                window,
+                payload,
+                allow_overlap=True,
+                overlap_reason=boundary_error,
+            )
+
+            windows = await self.database.get_windows(job_id)
+            all_completed = bool(windows) and all(
+                item["status"] == WindowStatus.COMPLETED.value for item in windows
+            )
+            if all_completed:
+                await self.database.update_job(
+                    job_id,
+                    status=JobStatus.COMPLETED.value,
+                    current_window=int(job["total_windows"]),
+                    progress=100.0,
+                    pause_requested=0,
+                    error_message="",
+                )
+                await self.write_manifest(job_id)
+
+            return {
+                "jobId": job_id,
+                "windowIndex": window_index,
+                "taskId": expected_task_id,
+                "status": "overlap_accepted",
+            }
+
+    def _resplit_finished(
+        self, key: tuple[str, int], task: asyncio.Task[None]
+    ) -> None:
+        if self._resplit_tasks.get(key) is task:
+            self._resplit_tasks.pop(key, None)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("Window resplit task failed unexpectedly: %s", task.exception())
+
+    async def _run_resplit(
+        self, job_id: str, window_index: int, attempt_id: int
+    ) -> None:
+        window = await self.database.get_window(job_id, window_index)
+        attempt = None
+        if window:
+            attempt = next(
+                (
+                    item
+                    for item in await self.database.get_attempts(window["id"])
+                    if int(item["id"]) == attempt_id
+                ),
+                None,
+            )
+        if not window or not attempt:
+            return
+        try:
+            await self._execute_resplit(job_id, window, attempt)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            message = str(exc) or exc.__class__.__name__
+            logger.exception(
+                "Job %s window %s resplit failed", job_id, window_index + 1
+            )
+            latest_attempt = next(
+                (
+                    item
+                    for item in await self.database.get_attempts(window["id"])
+                    if int(item["id"]) == attempt_id
+                ),
+                attempt,
+            )
+            attempt_fields: dict[str, Any] = {
+                "error_message": message,
+                "finished_at": utc_now(),
+            }
+            if latest_attempt.get("service_status") != "completed":
+                attempt_fields["status"] = "failed"
+            await self.database.update_attempt(attempt_id, **attempt_fields)
+            await self.database.update_window(
+                window["id"],
+                status=WindowStatus.FAILED.value,
+                error_message=message,
+            )
+            await self._pause_job(
+                job_id, f"Window {window_index + 1} manual resplit failed: {message}"
+            )
+            await self.write_manifest(job_id)
+
+    async def _execute_resplit(
+        self,
+        job_id: str,
+        window: dict[str, Any],
+        attempt: dict[str, Any],
+    ) -> None:
+        job = await self.database.get_job(job_id)
+        if not job:
+            raise ResplitValidationError("Job not found")
+        if not self._source_unchanged(job):
+            raise ResplitValidationError("Source file size or modification time changed")
+
+        index = int(window["window_index"])
+        start = float(window["requested_start"])
+        end = float(window["nominal_end"])
+        chunk_path = self.settings.temp_dir / job_id / f"window-{index:03d}.ts"
+        chunk_url = f"{self.settings.public_base_url}/internal/chunks/{job_id}/{index}.ts"
+        if not chunk_path.is_file():
+            await self.database.update_window(
+                window["id"], status=WindowStatus.CUTTING.value, error_message=""
+            )
+            await self.media.cut(
+                Path(job["source_path"]),
+                chunk_path,
+                start,
+                end,
+                CutMode(job["cut_mode"]),
+            )
+        await self.database.update_window(
+            window["id"],
+            status=WindowStatus.READY.value,
+            chunk_path=str(chunk_path),
+            chunk_url=chunk_url,
+            error_message="",
+        )
+
+        islice_client = self._islice_client(job)
+        task_id = str(attempt["task_id"])
+        request = self._create_task_request(job, task_id, chunk_url, start)
+        gate_url = str(job["islice_base_url"])
+        gate_released = False
+        await self._await_submission_turn(
+            job_id, gate_url, task_id, float(job.get("progress") or 0)
+        )
+        try:
+            await self.database.update_attempt(
+                attempt["id"],
+                status="resplitting",
+                service_status="deleting",
+                progress=0.0,
+                raw_response_path="",
+                error_message="",
+                finished_at=None,
+            )
+            await islice_client.delete_task(task_id)
+            existing = await islice_client.ensure_task(task_id, request)
+            service_status, service_progress = self._task_progress(existing)
+            await self.database.update_attempt(
+                attempt["id"],
+                status="resplitting",
+                service_status=service_status,
+                progress=service_progress,
+            )
+            await self.database.update_window(
+                window["id"], status=WindowStatus.POLLING.value
+            )
+            if self._pipeline_ready(service_status, service_progress):
+                gate_released = await self._release_submission_turn(
+                    gate_url, task_id
+                )
+            payload = (
+                existing
+                if self._is_terminal(existing)
+                else await self._poll(
+                    job_id,
+                    int(attempt["id"]),
+                    task_id,
+                    islice_client,
+                    gate_url,
+                    task_id,
+                )
+            )
+            gate_released = await self._release_submission_turn(
+                gate_url, task_id
+            ) or gate_released
+        finally:
+            if not gate_released:
+                await self._release_submission_turn(gate_url, task_id)
+
+        raw_path = await self._write_raw(
+            job_id, index, int(attempt["attempt_no"]), payload
+        )
+        status, progress = self._task_progress(payload)
+        if status != "completed":
+            error = str(
+                payload.get("taskInfo", {}).get("errorMessage")
+                or "iSlice task failed"
+            )
+            await self.database.update_attempt(
+                attempt["id"],
+                status="failed",
+                service_status=status,
+                progress=progress,
+                raw_response_path=str(raw_path),
+                error_message=error,
+                finished_at=utc_now(),
+            )
+            raise ISliceError(error)
+
+        await self.database.update_attempt(
+            attempt["id"],
+            status="completed",
+            service_status=status,
+            progress=progress,
+            raw_response_path=str(raw_path),
+            error_message="",
+            finished_at=utc_now(),
+        )
+        await self._commit_resplit_payload(job, window, payload)
+
+    async def _commit_resplit_payload(
+        self,
+        job: dict[str, Any],
+        window: dict[str, Any],
+        payload: dict[str, Any],
+        *,
+        allow_overlap: bool = False,
+        overlap_reason: str = "",
+    ) -> None:
+        job_id = str(job["id"])
+        index = int(window["window_index"])
+        start = float(window["requested_start"])
+        end = float(window["nominal_end"])
+        base_time = (
+            datetime.fromisoformat(job["program_start_time"])
+            if job["program_start_time"]
+            else None
+        )
+        processed = process_segments(
+            payload.get("segments"),
+            window_start=start,
+            chunk_duration=end - start,
+            is_final_window=index == int(job["total_windows"]) - 1,
+            handoff_max_seconds=self.settings.handoff_max_seconds,
+            program_start_time=base_time,
+        )
+        next_start = (
+            processed.next_window_start
+            if processed.next_window_start is not None
+            else end
+        )
+        if not allow_overlap:
+            await self._validate_previous_boundary(job_id, index, processed.segments)
+            await self._validate_resplit_next_boundary(
+                job_id, index, float(next_start), processed.segments
+            )
+
+        await self.database.replace_window_segments(
+            job_id, window["id"], processed.segments
+        )
+        if processed.warning:
+            await self.database.append_warning(
+                job_id, f"Window {index + 1}: {processed.warning}"
+            )
+        if allow_overlap:
+            await self.database.append_warning(
+                job_id,
+                f"Window {index + 1}: manual resplit accepted with cross-window "
+                f"time overlap; following windows were not rebuilt ({overlap_reason})",
+            )
+        await self.database.update_window(
+            window["id"],
+            status=WindowStatus.COMPLETED.value,
+            handoff_start=processed.handoff_start,
+            error_message="",
+        )
+        current = await self.database.get_job(job_id)
+        if current:
+            fields: dict[str, Any] = {"error_message": ""}
+            if int(current["current_window"]) <= index:
+                completed = index + 1
+                fields.update(
+                    current_window=completed,
+                    next_window_start=float(next_start),
+                    progress=min(
+                        100.0, completed / int(current["total_windows"]) * 100.0
+                    ),
+                )
+            await self.database.update_job(job_id, **fields)
+        await self.write_manifest(job_id)
+        chunk_path = self.settings.temp_dir / job_id / f"window-{index:03d}.ts"
+        await self._remove_chunk(job_id, {**window, "chunk_path": str(chunk_path)})
 
     async def _scheduler_loop(self) -> None:
         while not self._stopping:
@@ -328,86 +760,80 @@ class Orchestrator:
                 if reusable
                 else max(attempts, default=0) + 1
             )
-            run_attempt_numbers = range(
-                first_attempt_no,
-                first_attempt_no + self.settings.max_service_attempts,
-            )
-            for run_index, attempt_no in enumerate(run_attempt_numbers):
-                if await self._control_requested(job_id):
-                    return False
-                attempt = attempts.get(attempt_no)
-                if not attempt:
-                    task_id = f"sh-{job_id[:16]}-w{index:03d}-a{attempt_no}"
-                    attempt = await self.database.create_attempt(
-                        window["id"], attempt_no, task_id
-                    )
-                    attempts[attempt_no] = attempt
-                if attempt["status"] == "failed":
-                    continue
+            attempt_no = first_attempt_no
+            if await self._control_requested(job_id):
+                return False
+            attempt = attempts.get(attempt_no)
+            if not attempt:
+                task_id = f"sh-{job_id[:16]}-w{index:03d}-a{attempt_no}"
+                attempt = await self.database.create_attempt(
+                    window["id"], attempt_no, task_id
+                )
 
-                request = self._create_task_request(
-                    job, attempt["task_id"], chunk_url, start
+            request = self._create_task_request(
+                job, attempt["task_id"], chunk_url, start
+            )
+            gate_url = str(job.get("islice_base_url") or self.settings.islice_base_url)
+            gate_ticket = str(attempt["task_id"])
+            gate_released = float(attempt.get("progress") or 0) >= (
+                self.settings.pipeline_progress_threshold
+            )
+            failure_message = ""
+            try:
+                if not gate_released:
+                    await self._await_submission_turn(
+                        job_id,
+                        gate_url,
+                        gate_ticket,
+                        float(job.get("progress") or 0),
+                    )
+                existing = await islice_client.ensure_task(attempt["task_id"], request)
+                await self._raise_if_control_requested(job_id)
+                service_status, service_progress = self._task_progress(existing)
+                await self.database.update_attempt(
+                    attempt["id"],
+                    status="polling",
+                    service_status=service_status,
+                    progress=service_progress,
+                    error_message="",
                 )
-                gate_url = str(job.get("islice_base_url") or self.settings.islice_base_url)
-                gate_ticket = str(attempt["task_id"])
-                gate_released = float(attempt.get("progress") or 0) >= (
-                    self.settings.pipeline_progress_threshold
+                await self.database.update_window(
+                    window["id"], status=WindowStatus.POLLING.value
                 )
-                try:
-                    if not gate_released:
-                        await self._await_submission_turn(
-                            job_id,
-                            gate_url,
-                            gate_ticket,
-                            float(job.get("progress") or 0),
-                        )
-                    existing = await islice_client.ensure_task(attempt["task_id"], request)
-                    await self._raise_if_control_requested(job_id)
-                    service_status, service_progress = self._task_progress(existing)
-                    await self.database.update_attempt(
-                        attempt["id"],
-                        status="polling",
-                        service_status=service_status,
-                        progress=service_progress,
-                        error_message="",
-                    )
-                    await self.database.update_window(
-                        window["id"], status=WindowStatus.POLLING.value
-                    )
-                    if self._pipeline_ready(service_status, service_progress):
-                        gate_released = await self._release_submission_turn(
-                            gate_url, gate_ticket
-                        ) or gate_released
-                    payload = (
-                        existing
-                        if self._is_terminal(existing)
-                        else await self._poll(
-                            job_id,
-                            attempt["id"],
-                            attempt["task_id"],
-                            islice_client,
-                            gate_url,
-                            gate_ticket,
-                        )
-                    )
+                if self._pipeline_ready(service_status, service_progress):
                     gate_released = await self._release_submission_turn(
                         gate_url, gate_ticket
                     ) or gate_released
-                    raw_path = await self._write_raw(job_id, index, attempt_no, payload)
-                    status = str(payload["taskInfo"].get("status") or "")
-                    if status == "completed":
-                        await self.database.update_attempt(
-                            attempt["id"],
-                            status="completed",
-                            service_status=status,
-                            progress=self._task_progress(payload)[1],
-                            raw_response_path=str(raw_path),
-                            finished_at=utc_now(),
-                        )
-                        terminal_payload = payload
-                        terminal_attempt = attempt
-                        break
-                    error = str(
+                payload = (
+                    existing
+                    if self._is_terminal(existing)
+                    else await self._poll(
+                        job_id,
+                        attempt["id"],
+                        attempt["task_id"],
+                        islice_client,
+                        gate_url,
+                        gate_ticket,
+                    )
+                )
+                gate_released = await self._release_submission_turn(
+                    gate_url, gate_ticket
+                ) or gate_released
+                raw_path = await self._write_raw(job_id, index, attempt_no, payload)
+                status = str(payload["taskInfo"].get("status") or "")
+                if status == "completed":
+                    await self.database.update_attempt(
+                        attempt["id"],
+                        status="completed",
+                        service_status=status,
+                        progress=self._task_progress(payload)[1],
+                        raw_response_path=str(raw_path),
+                        finished_at=utc_now(),
+                    )
+                    terminal_payload = payload
+                    terminal_attempt = attempt
+                else:
+                    failure_message = str(
                         payload["taskInfo"].get("errorMessage")
                         or "iSlice task failed"
                     )
@@ -417,42 +843,47 @@ class Orchestrator:
                         service_status=status,
                         progress=self._task_progress(payload)[1],
                         raw_response_path=str(raw_path),
-                        error_message=error,
+                        error_message=failure_message,
                         finished_at=utc_now(),
                     )
-                except JobControlRequested:
-                    if not gate_released:
-                        self._start_gate_monitor(
-                            gate_url, gate_ticket, islice_client
-                        )
-                    return False
-                except (ISliceError, TimeoutError) as exc:
-                    gate_released = await self._release_submission_turn(
-                        gate_url, gate_ticket
-                    ) or gate_released
-                    await self.database.update_attempt(
-                        attempt["id"],
-                        status="failed",
-                        error_message=str(exc),
-                        finished_at=utc_now(),
+            except JobControlRequested:
+                if not gate_released:
+                    self._start_gate_monitor(
+                        gate_url, gate_ticket, islice_client
                     )
-                if run_index < self.settings.max_service_attempts - 1:
-                    try:
-                        await self._sleep_with_control(
-                            job_id, self.RETRY_DELAYS[run_index]
-                        )
-                    except JobControlRequested:
-                        return False
+                return False
+            except (ISliceError, TimeoutError) as exc:
+                failure_message = str(exc)
+                gate_released = await self._release_submission_turn(
+                    gate_url, gate_ticket
+                ) or gate_released
+                await self.database.update_attempt(
+                    attempt["id"],
+                    status="failed",
+                    error_message=failure_message,
+                    finished_at=utc_now(),
+                )
+
+            if terminal_payload is None:
+                failure_message = failure_message or "iSlice task failed"
+                await self.database.update_window(
+                    window["id"],
+                    status=WindowStatus.FAILED.value,
+                    error_message=failure_message,
+                )
+                await self._pause_job(
+                    job_id, f"Window {index + 1} iSlice task failed: {failure_message}"
+                )
+                return False
 
         if terminal_payload is None or terminal_attempt is None:
-            attempt_count = self.settings.max_service_attempts
             await self.database.update_window(
                 window["id"],
                 status=WindowStatus.FAILED.value,
-                error_message=f"iSlice failed after {attempt_count} attempts",
+                error_message="iSlice task result is unavailable",
             )
             await self._pause_job(
-                job_id, f"Window {index + 1} failed after {attempt_count} attempts"
+                job_id, f"Window {index + 1} iSlice task result is unavailable"
             )
             return False
 
@@ -701,6 +1132,51 @@ class Orchestrator:
                 f"previous end {previous_end:.3f}, current start {current_start:.3f}"
             )
 
+    async def _validate_resplit_next_boundary(
+        self,
+        job_id: str,
+        window_index: int,
+        next_window_start: float,
+        segments: list[dict[str, Any]],
+    ) -> None:
+        windows = await self.database.get_windows(job_id)
+        next_window = next(
+            (
+                item
+                for item in windows
+                if int(item["window_index"]) == window_index + 1
+            ),
+            None,
+        )
+        if not next_window:
+            return
+        existing_start = float(next_window["requested_start"])
+        tolerance = self.settings.window_boundary_tolerance_seconds
+        if abs(next_window_start - existing_start) > tolerance:
+            raise SegmentValidationError(
+                "the resplit handoff changed from the next window's fixed source start: "
+                f"new {next_window_start:.3f}, existing {existing_start:.3f}"
+            )
+
+        accepted = [segment for segment in segments if segment["accepted"]]
+        if not accepted:
+            return
+        existing = await self.database.get_segments(job_id, accepted_only=True)
+        following = [
+            segment
+            for segment in existing
+            if int(segment["window_index"]) > window_index
+        ]
+        if not following:
+            return
+        current_end = max(float(segment["global_end"]) for segment in accepted)
+        following_start = min(float(segment["global_start"]) for segment in following)
+        if current_end > following_start + tolerance:
+            raise SegmentValidationError(
+                "resplit segments overlap a following window: "
+                f"current end {current_end:.3f}, following start {following_start:.3f}"
+            )
+
     async def _cleanup_completed_chunks(self, job_id: str) -> None:
         for window in await self.database.get_windows(job_id):
             if window["status"] == WindowStatus.COMPLETED.value:
@@ -751,7 +1227,7 @@ class Orchestrator:
             segment["keywords"] = json.loads(segment.pop("keywords_json"))
             segment["raw"] = json.loads(segment.pop("raw_json"))
         manifest = {
-            "schemaVersion": 2,
+            "schemaVersion": 4,
             "generatedAt": utc_now(),
             "externalMediaMayExpire": True,
             "job": {

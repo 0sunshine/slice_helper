@@ -1,26 +1,30 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import shutil
+import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from datetime import date
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from . import __version__
 from .config import Settings
 from .database import Database
+from .excel_export import build_channel_workbook, safe_export_filename
 from .islice import ISlicePool
 from .media import MediaError, MediaService
-from .models import JobCreate, JobStatus
-from .orchestrator import Orchestrator
+from .models import ChannelCreate, ChannelUpdate, JobCreate, JobStatus, WindowResplitRequest
+from .orchestrator import Orchestrator, ResplitConflictError, ResplitValidationError
 from .processing import calculate_total_windows
 from .source_download import HttpSourceDownloader, SourceDownloadError
 
@@ -40,6 +44,14 @@ def _public_job(job: dict[str, Any]) -> dict[str, Any]:
     result["warnings"] = json.loads(result.pop("warnings_json", "[]") or "[]")
     result["accepted_segment_count"] = int(result.get("accepted_segment_count") or 0)
     result["window_count"] = int(result.get("window_count") or 0)
+    return result
+
+
+def _public_channel(channel: dict[str, Any]) -> dict[str, Any]:
+    result = dict(channel)
+    if "job_count" in result:
+        result["job_count"] = int(result["job_count"] or 0)
+    result.pop("normalized_name", None)
     return result
 
 
@@ -86,8 +98,85 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             context={"version": application.version},
         )
 
+    @application.get("/api/channels")
+    async def list_channels(request: Request):
+        channels = await request.app.state.database.list_channels()
+        return [_public_channel(channel) for channel in channels]
+
+    @application.post("/api/channels", status_code=201)
+    async def create_channel(request: Request, body: ChannelCreate):
+        try:
+            channel = await request.app.state.database.create_channel(body.name)
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="频道名已存在") from exc
+        return _public_channel(channel)
+
+    @application.patch("/api/channels/{channel_id}")
+    async def update_channel(request: Request, channel_id: str, body: ChannelUpdate):
+        try:
+            channel = await request.app.state.database.update_channel(channel_id, body.name)
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="频道名已存在") from exc
+        if channel is None:
+            raise HTTPException(status_code=404, detail="频道不存在")
+        return _public_channel(channel)
+
+    @application.delete("/api/channels/{channel_id}", status_code=204)
+    async def delete_channel(request: Request, channel_id: str):
+        try:
+            deleted = await request.app.state.database.delete_channel(channel_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail="该频道已有作业，不能删除") from exc
+        if not deleted:
+            raise HTTPException(status_code=404, detail="频道不存在")
+        return Response(status_code=204)
+
+    @application.get("/api/channels/{channel_id}/export.xlsx")
+    async def export_channel(request: Request, channel_id: str):
+        export = await request.app.state.database.get_channel_export(channel_id)
+        if export is None:
+            raise HTTPException(status_code=404, detail="频道不存在")
+        content = await asyncio.to_thread(build_channel_workbook, export)
+        filename = safe_export_filename(str(export["channel"]["name"]))
+        return Response(
+            content=content,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"
+            },
+        )
+
     @application.post("/api/jobs", status_code=201)
     async def create_job(request: Request, body: JobCreate):
+        channel = await request.app.state.database.get_channel(body.channel_id)
+        if channel is None:
+            raise HTTPException(status_code=400, detail="请选择有效频道")
+        broadcast_date = body.broadcast_date.isoformat()
+        existing = await request.app.state.database.get_current_job_for_channel_date(
+            body.channel_id, broadcast_date
+        )
+        if existing and not body.overwrite:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "channel_date_exists",
+                    "message": "该频道在此日期已有作业，是否覆盖？",
+                    "jobId": existing["id"],
+                },
+            )
+        if existing and existing["status"] not in {
+            JobStatus.COMPLETED.value,
+            JobStatus.FAILED.value,
+            JobStatus.STOPPED.value,
+        }:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "channel_date_active",
+                    "message": "该日期的现有作业尚未结束，请先停止后再覆盖",
+                    "jobId": existing["id"],
+                },
+            )
         job_id = uuid.uuid4().hex
         source_url = ""
         managed_source = urlsplit(body.source_path).scheme.lower() in {"http", "https"}
@@ -161,8 +250,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             configured.window_seconds,
             configured.window_boundary_tolerance_seconds,
         )
-        created_job = await request.app.state.database.create_job(
-            {
+        try:
+            created_job = await request.app.state.database.create_job(
+                {
                 "id": job_id,
                 "source_path": str(source),
                 "source_size": stat.st_size,
@@ -172,7 +262,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "islice_base_url": "",
                 "template_id": body.template_id,
                 "language": body.language,
-                "channel_name": body.channel_name or "",
+                "channel_id": channel["id"],
+                "channel_name": channel["name"],
+                "broadcast_date": broadcast_date,
                 "program_start_time": (
                     resolved_start_time.isoformat() if resolved_start_time else None
                 ),
@@ -188,8 +280,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "cut_mode": body.cut_mode.value,
                 "total_windows": total_windows,
                 "warnings_json": json.dumps(warnings, ensure_ascii=False),
-            }
-        )
+                },
+                supersede_job_id=existing["id"] if existing else None,
+            )
+        except sqlite3.IntegrityError as exc:
+            if managed_source:
+                shutil.rmtree(job_dir, ignore_errors=True)
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "channel_date_exists",
+                    "message": "该频道在此日期已有作业，请刷新后重试",
+                },
+            ) from exc
         request.app.state.orchestrator.notify()
         return _public_job(created_job)
 
@@ -197,12 +300,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def list_jobs(
         request: Request,
         status: str | None = Query(default=None),
-        limit: int = Query(default=200, ge=1, le=500),
+        channel_id: str | None = Query(default=None, alias="channelId"),
+        broadcast_date: str | None = Query(default=None, alias="broadcastDate"),
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=20, alias="pageSize", ge=1, le=100),
     ):
         if status and status not in {item.value for item in JobStatus}:
             raise HTTPException(status_code=400, detail="Unknown job status")
-        jobs = await request.app.state.database.list_jobs(status=status, limit=limit)
-        return [_public_job(job) for job in jobs]
+        if broadcast_date:
+            try:
+                date.fromisoformat(broadcast_date)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="业务日期格式应为 YYYY-MM-DD") from exc
+        jobs, total = await request.app.state.database.paginate_jobs(
+            page=page,
+            page_size=page_size,
+            status=status,
+            channel_id=channel_id,
+            broadcast_date=broadcast_date,
+        )
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        if page > total_pages:
+            page = total_pages
+            jobs, _ = await request.app.state.database.paginate_jobs(
+                page=page,
+                page_size=page_size,
+                status=status,
+                channel_id=channel_id,
+                broadcast_date=broadcast_date,
+            )
+        return {
+            "items": [_public_job(job) for job in jobs],
+            "page": page,
+            "pageSize": page_size,
+            "total": total,
+            "totalPages": total_pages,
+        }
 
     @application.get("/api/jobs/{job_id}")
     async def get_job(request: Request, job_id: str):
@@ -227,6 +360,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             row["keywords"] = json.loads(row.pop("keywords_json"))
             row["raw"] = json.loads(row.pop("raw_json"))
         return rows
+
+    @application.post(
+        "/api/jobs/{job_id}/windows/{window_index}/resplit",
+        status_code=202,
+    )
+    async def resplit_window(
+        request: Request,
+        job_id: str,
+        window_index: int,
+        body: WindowResplitRequest,
+    ):
+        try:
+            return await request.app.state.orchestrator.schedule_resplit(
+                job_id, window_index, body.task_id
+            )
+        except ResplitConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ResplitValidationError as exc:
+            status_code = 404 if str(exc) in {"Job not found", "Window not found"} else 400
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+    @application.post(
+        "/api/jobs/{job_id}/windows/{window_index}/accept-overlap",
+    )
+    async def accept_resplit_overlap(
+        request: Request,
+        job_id: str,
+        window_index: int,
+        body: WindowResplitRequest,
+    ):
+        try:
+            return await request.app.state.orchestrator.accept_resplit_overlap(
+                job_id, window_index, body.task_id
+            )
+        except ResplitConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ResplitValidationError as exc:
+            status_code = 404 if str(exc) in {"Job not found", "Window not found"} else 400
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
     @application.get("/api/jobs/{job_id}/result")
     async def get_result(request: Request, job_id: str, download: bool = Query(default=False)):

@@ -80,6 +80,22 @@ async def test_ensure_task_rejects_conflicting_existing_task(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_delete_task_is_idempotent_for_missing_task(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        assert request.method == "POST"
+        assert request.url.path == "/DeleteTask"
+        return httpx.Response(404)
+
+    client = ISliceClient(settings(tmp_path), transport=httpx.MockTransport(handler))
+    assert await client.delete_task("task1") is False
+    assert calls == ["/DeleteTask"]
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_pool_resolves_only_configured_instances(tmp_path: Path) -> None:
     configured = settings(tmp_path)
     configured = replace(

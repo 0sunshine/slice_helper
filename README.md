@@ -43,7 +43,7 @@ cp .env.example .env
 - `MAX_ACTIVE_JOBS`：不同源文件的全局并发数，默认 `15`
 - `POLL_INTERVAL_SECONDS`：iSlice 轮询间隔，默认 `15`
 - `PIPELINE_PROGRESS_THRESHOLD`：同一 iSlice 的当前子任务达到该进度后，把下一次子任务提交机会交给等待队列中的另一个长文件作业，默认 `71`。单个作业内部始终严格串行，必须等当前窗口拆条完成并确定交接点后，才能排队提交下一窗口。
-- 每个窗口首次提交失败后最多重试 3 次，退避时间固定为 5/15/45 秒
+- 每个窗口每次调度只提交一个 iSlice 子任务；子任务失败、提交异常或等待超时后立即暂停作业，不自动创建新的 attempt。手动恢复作业时才会创建下一次 attempt
 
 helper 不限制每台 iSlice 已绑定的长文件作业总数；新作业优先分配给当前活动作业较少的实例。同一实例上一个子任务达到 71% 或终态后，等待创建子任务的作业中总体完成度最高者优先；完成度相同则按进入等待队列的先后顺序。实际执行并发仍由 iSlice 控制。`MAX_ACTIVE_JOBS` 是所有实例合计的全局作业并发上限。
 
@@ -72,19 +72,33 @@ chmod +x run.sh
 
 ## 创建作业
 
+先在页面的“频道管理”中创建频道，或调用：
+
+```http
+POST /api/channels
+Content-Type: application/json
+
+{"name":"CCTV-1"}
+```
+
+频道名唯一。创建作业时频道和业务日期必填；同一频道同一业务日期只能有一个当前作业。
+
 ```http
 POST /api/jobs
 Content-Type: application/json
 
 {
   "sourcePath": "https://media.internal/day.ts",
+  "channelId": "频道 ID",
+  "broadcastDate": "2026-08-03",
   "templateId": "general",
   "language": "zh",
-  "channelName": "CCTV-1",
   "programStartTime": "2026-08-03T00:00:00+08:00",
   "cutMode": "copy"
 }
 ```
+
+`broadcastDate` 是人工确认的业务日期，不从 OCR 时间推导。已有同频道同日期作业时接口返回 HTTP 409；用户确认覆盖后以 `"overwrite": true` 重新提交。旧作业保留为历史记录，但不再进入默认作业列表、调度和 Excel 导出。运行中或未结束的作业必须先停止才能覆盖。
 
 `sourcePath` 支持服务器本地绝对路径以及 `http://`、`https://` 地址。HTTP 源以流式方式下载到 `data/jobs/{jobId}/source.ts`，完成长度校验和原子改名后才执行 FFprobe、OCR 并创建作业；创建接口会等待下载和校验完成。下载后的源 TS 作为作业输入长期保留。
 
@@ -92,15 +106,28 @@ Content-Type: application/json
 
 作业详情的拆条结果每页显示 10 条；点击有视频 URL 的结果行会立即播放，并自动定位到播放器。桌面端使用大尺寸播放器，拆条结果排列在播放器右侧，窗口时间线位于下方通栏；窄屏自动改为上下排列。结果行使用紧凑单行时间范围，页面顶部栏随页面滚动离开视口。加载失败时可从新窗口打开原始 URL。媒体不经过辅助服务代理，浏览器需要能够访问 iSlice 地址。MP4/H.264/AAC 可直接播放，iSlice 支持 HTTP Range 时可正常按需加载和拖动。
 
+iSlice 片段的 `contentType` 原样保存为节目类型；`newsEventType` 原样保存为新闻事件类别，不对两者的组合关系做校验。结果 JSON、片段 API 和数据库均保留该字段；未知的未来字段仍会保存在每条片段的 `raw` 中。
+
+窗口时间线中的“重新拆分”会先要求二次确认。helper 会在后台重建已清理的窗口 TS，调用 iSlice `DeleteTask`，再以完全相同的 task ID 和参数调用 `CreateTask`。操作不会新增 attempt；新结果通过时间边界校验后才替换数据库和结果 JSON。iSlice 失败或新交接点与已切出的下一窗口不一致时，作业立即暂停并保留临时 TS，不自动重试。对于已经保存成功响应的跨窗口边界冲突，页面会显示“允许时间重叠”；确认后直接接纳本次重拆结果并保留后续窗口原结果，不再次调用 iSlice，同时在作业告警中记录该重叠。
+
+频道 Excel 导出只包含当前作业中最终采用的片段。一个频道生成一个工作簿，每个业务日期生成一个 `YYYY-MM-DD` 工作表；摘要、视频/封面链接、源文件、作业 ID、窗口、iSlice 任务 ID 和各类时间偏移一并导出。
+
 主要接口：
 
-- `GET /api/jobs`
+- `GET /api/channels`
+- `POST /api/channels`
+- `PATCH /api/channels/{id}`
+- `DELETE /api/channels/{id}`
+- `GET /api/channels/{id}/export.xlsx`
+- `GET /api/jobs?page=1&pageSize=20&status=&channelId=&broadcastDate=`
 - `GET /api/jobs/{id}`
 - `GET /api/jobs/{id}/segments?acceptedOnly=true`
 - `GET /api/jobs/{id}/result`
 - `POST /api/jobs/{id}/pause`
 - `POST /api/jobs/{id}/resume`
 - `POST /api/jobs/{id}/stop`
+- `POST /api/jobs/{id}/windows/{windowIndex}/resplit`，请求体为 `{"taskId":"现有任务 ID"}`
+- `POST /api/jobs/{id}/windows/{windowIndex}/accept-overlap`，请求体为 `{"taskId":"现有任务 ID"}`
 - `GET /health/live`
 - `GET /health/ready`
 

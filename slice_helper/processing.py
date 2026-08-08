@@ -104,6 +104,8 @@ def process_segments(
                 "absolute_start": _absolute(program_start_time, global_start),
                 "absolute_end": _absolute(program_start_time, global_end),
                 "title": str(raw.get("title") or ""),
+                "content_type": str(raw.get("contentType") or ""),
+                "news_event_type": str(raw.get("newsEventType") or ""),
                 "topic": str(raw.get("topic") or ""),
                 "keywords_json": json.dumps(_keywords(raw.get("keywords")), ensure_ascii=False),
                 "summary": str(raw.get("summary") or ""),

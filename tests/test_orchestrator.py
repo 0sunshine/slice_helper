@@ -12,7 +12,11 @@ from slice_helper.database import Database
 from slice_helper.islice import ISliceError, ISlicePool
 from slice_helper.media import MediaError
 from slice_helper.models import MediaProbe
-from slice_helper.orchestrator import Orchestrator, _ISliceSubmissionGate
+from slice_helper.orchestrator import (
+    Orchestrator,
+    ResplitConflictError,
+    _ISliceSubmissionGate,
+)
 
 
 class FakeMedia:
@@ -34,13 +38,13 @@ class FakeISlice:
     async def get_task_info(self, task_id):
         if "w000" in task_id:
             segments = [
-                {"startTime": 0, "endTime": 3500, "title": "first"},
-                {"startTime": 3500, "endTime": 3600, "title": "handoff"},
+                {"startTime": 0, "endTime": 3500, "title": "first", "contentType": "新闻"},
+                {"startTime": 3500, "endTime": 3600, "title": "handoff", "contentType": "广告"},
             ]
         else:
             segments = [
-                {"startTime": 0, "endTime": 100, "title": "handoff-redone"},
-                {"startTime": 100, "endTime": 3700, "title": "last"},
+                {"startTime": 0, "endTime": 100, "title": "handoff-redone", "contentType": "广告"},
+                {"startTime": 100, "endTime": 3700, "title": "last", "contentType": "电视剧"},
             ]
         return {
             "taskInfo": {"taskId": task_id, "status": "completed", "videoPath": "unused"},
@@ -93,6 +97,78 @@ class FailingISlice:
     async def ensure_task(self, _task_id, _request):
         self.calls += 1
         raise ISliceError("service unavailable")
+
+
+class TerminalFailingISlice:
+    def __init__(self):
+        self.calls = 0
+
+    async def ensure_task(self, _task_id, _request):
+        self.calls += 1
+        return None
+
+    async def get_task_info(self, task_id):
+        return {
+            "taskInfo": {
+                "taskId": task_id,
+                "status": "failed",
+                "progress": 100,
+                "videoPath": "unused",
+                "errorMessage": "internal retries exhausted",
+            },
+            "segments": [],
+        }
+
+
+class ResplitISlice:
+    def __init__(self, *, terminal_status: str = "completed") -> None:
+        self.terminal_status = terminal_status
+        self.deleted: list[str] = []
+        self.created: list[tuple[str, dict]] = []
+
+    async def delete_task(self, task_id):
+        self.deleted.append(task_id)
+        return True
+
+    async def ensure_task(self, task_id, request):
+        self.created.append((task_id, request))
+        return None
+
+    async def get_task_info(self, task_id):
+        payload = {
+            "taskInfo": {
+                "taskId": task_id,
+                "status": self.terminal_status,
+                "progress": 100,
+                "videoPath": "unused",
+            },
+            "segments": [],
+        }
+        if self.terminal_status == "completed":
+            payload["segments"] = [
+                {
+                    "startTime": 0,
+                    "endTime": 3600,
+                    "title": "replacement",
+                    "contentType": "新闻",
+                }
+            ]
+        else:
+            payload["taskInfo"]["errorMessage"] = "manual resplit failed"
+        return payload
+
+
+class BlockingResplitISlice(ResplitISlice):
+    def __init__(self) -> None:
+        super().__init__()
+        self.delete_started = asyncio.Event()
+        self.allow_delete = asyncio.Event()
+
+    async def delete_task(self, task_id):
+        self.deleted.append(task_id)
+        self.delete_started.set()
+        await self.allow_delete.wait()
+        return True
 
 
 class OverlappingISlice:
@@ -384,11 +460,14 @@ async def test_two_window_job_hands_tail_to_next_window(tmp_path: Path) -> None:
     segments = await database.get_segments("abc123")
     assert [item["accepted"] for item in segments] == [1, 0, 1, 1]
     assert segments[2]["global_start"] == 3500
+    assert [item["content_type"] for item in segments] == ["新闻", "广告", "广告", "电视剧"]
     manifest = json.loads(
         (configured.data_dir / "jobs" / "abc123" / "result.json").read_text(encoding="utf-8")
     )
+    assert manifest["schemaVersion"] == 4
     assert manifest["job"]["status"] == "completed"
     assert len(manifest["segments"]) == 4
+    assert manifest["segments"][0]["content_type"] == "新闻"
     assert not list(configured.temp_dir.rglob("*.ts"))
 
 
@@ -601,7 +680,168 @@ async def test_pause_is_honored_after_poll_and_resume_reuses_attempt(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_initial_attempt_plus_three_retries_then_pause(tmp_path: Path) -> None:
+async def test_manual_resplit_reuses_task_id_and_replaces_window_results(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.ts"
+    source.write_bytes(b"source")
+    configured = make_settings(tmp_path)
+    database = Database(configured.database_path)
+    await database.initialize()
+    await create_job(database, source, duration=3600)
+    orchestrator = Orchestrator(configured, database, FakeMedia(), FakeISlice())
+    await orchestrator._process_job("abc123")
+    await database.update_job("abc123", islice_base_url="http://islice.test")
+
+    window = (await database.get_windows("abc123"))[0]
+    attempts_before = await database.get_attempts(window["id"])
+    assert len(attempts_before) == 1
+    task_id = attempts_before[0]["task_id"]
+    assert not Path(window["chunk_path"]).exists()
+    assert {item["title"] for item in await database.get_segments("abc123")} == {
+        "first",
+        "handoff",
+    }
+
+    replacement = ResplitISlice()
+    orchestrator.islice = replacement
+    response = await orchestrator.schedule_resplit("abc123", 0, task_id)
+    task = orchestrator._resplit_tasks[("abc123", 0)]
+    await asyncio.wait_for(task, timeout=1)
+
+    assert response["taskId"] == task_id
+    assert replacement.deleted == [task_id]
+    assert [item[0] for item in replacement.created] == [task_id]
+    assert replacement.created[0][1]["taskId"] == task_id
+    attempts_after = await database.get_attempts(window["id"])
+    assert len(attempts_after) == 1
+    assert attempts_after[0]["task_id"] == task_id
+    assert attempts_after[0]["status"] == "completed"
+    segments = await database.get_segments("abc123")
+    assert [item["title"] for item in segments] == ["replacement"]
+    assert (await database.get_job("abc123"))["status"] == "completed"
+    assert not Path(window["chunk_path"]).exists()
+
+
+@pytest.mark.asyncio
+async def test_manual_resplit_overlap_can_be_explicitly_accepted_without_islice_call(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.ts"
+    source.write_bytes(b"source")
+    configured = make_settings(tmp_path)
+    database = Database(configured.database_path)
+    await database.initialize()
+    await create_job(database, source, duration=7200)
+    orchestrator = Orchestrator(configured, database, FakeMedia(), FakeISlice())
+    await orchestrator._process_job("abc123")
+    await database.update_job("abc123", islice_base_url="http://islice.test")
+
+    window = (await database.get_windows("abc123"))[0]
+    task_id = (await database.get_attempts(window["id"]))[0]["task_id"]
+    replacement = ResplitISlice()
+    orchestrator.islice = replacement
+    await orchestrator.schedule_resplit("abc123", 0, task_id)
+    await asyncio.wait_for(orchestrator._resplit_tasks[("abc123", 0)], timeout=1)
+
+    paused = await database.get_job("abc123")
+    failed_window = await database.get_window("abc123", 0)
+    attempt = (await database.get_attempts(window["id"]))[0]
+    assert paused["status"] == "paused"
+    assert failed_window["status"] == "failed"
+    assert "resplit handoff changed" in failed_window["error_message"]
+    assert attempt["status"] == "completed"
+    assert attempt["service_status"] == "completed"
+    assert Path(attempt["raw_response_path"]).is_file()
+    assert [item["title"] for item in await database.get_segments("abc123")][:2] == [
+        "first",
+        "handoff",
+    ]
+
+    response = await orchestrator.accept_resplit_overlap("abc123", 0, task_id)
+
+    assert response["status"] == "overlap_accepted"
+    assert replacement.deleted == [task_id]
+    assert len(replacement.created) == 1
+    job = await database.get_job("abc123")
+    windows = await database.get_windows("abc123")
+    segments = await database.get_segments("abc123")
+    assert job["status"] == "completed"
+    assert all(item["status"] == "completed" for item in windows)
+    assert [item["title"] for item in segments] == [
+        "replacement",
+        "handoff-redone",
+        "last",
+    ]
+    assert float(segments[0]["global_end"]) == 3600
+    assert float(segments[1]["global_start"]) == 3500
+    assert any(
+        "accepted with cross-window time overlap" in warning
+        for warning in json.loads(job["warnings_json"])
+    )
+    assert not Path(window["chunk_path"]).exists()
+
+
+@pytest.mark.asyncio
+async def test_manual_resplit_rejects_a_second_request_for_the_same_job(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.ts"
+    source.write_bytes(b"source")
+    configured = make_settings(tmp_path)
+    database = Database(configured.database_path)
+    await database.initialize()
+    await create_job(database, source, duration=3600)
+    orchestrator = Orchestrator(configured, database, FakeMedia(), FakeISlice())
+    await orchestrator._process_job("abc123")
+    await database.update_job("abc123", islice_base_url="http://islice.test")
+    window = (await database.get_windows("abc123"))[0]
+    task_id = (await database.get_attempts(window["id"]))[0]["task_id"]
+
+    replacement = BlockingResplitISlice()
+    orchestrator.islice = replacement
+    await orchestrator.schedule_resplit("abc123", 0, task_id)
+    task = orchestrator._resplit_tasks[("abc123", 0)]
+    await asyncio.wait_for(replacement.delete_started.wait(), timeout=1)
+    with pytest.raises(ResplitConflictError, match="already has a resplit"):
+        await orchestrator.schedule_resplit("abc123", 0, task_id)
+    replacement.allow_delete.set()
+    await asyncio.wait_for(task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_manual_resplit_failure_pauses_without_creating_an_attempt(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.ts"
+    source.write_bytes(b"source")
+    configured = make_settings(tmp_path)
+    database = Database(configured.database_path)
+    await database.initialize()
+    await create_job(database, source, duration=3600)
+    orchestrator = Orchestrator(configured, database, FakeMedia(), FakeISlice())
+    await orchestrator._process_job("abc123")
+    await database.update_job("abc123", islice_base_url="http://islice.test")
+    window = (await database.get_windows("abc123"))[0]
+    task_id = (await database.get_attempts(window["id"]))[0]["task_id"]
+
+    orchestrator.islice = ResplitISlice(terminal_status="failed")
+    await orchestrator.schedule_resplit("abc123", 0, task_id)
+    task = orchestrator._resplit_tasks[("abc123", 0)]
+    await asyncio.wait_for(task, timeout=1)
+
+    job = await database.get_job("abc123")
+    attempts = await database.get_attempts(window["id"])
+    assert job["status"] == "paused"
+    assert "manual resplit failed" in job["error_message"]
+    assert len(attempts) == 1
+    assert attempts[0]["task_id"] == task_id
+    assert attempts[0]["status"] == "failed"
+    assert Path(window["chunk_path"]).is_file()
+
+
+@pytest.mark.asyncio
+async def test_submission_failure_pauses_without_automatic_retry(tmp_path: Path) -> None:
     source = tmp_path / "source.ts"
     source.write_bytes(b"source")
     configured = make_settings(tmp_path)
@@ -610,24 +850,51 @@ async def test_initial_attempt_plus_three_retries_then_pause(tmp_path: Path) -> 
     await create_job(database, source, duration=3600)
     islice = FailingISlice()
     orchestrator = Orchestrator(configured, database, FakeMedia(), islice)
-    orchestrator.RETRY_DELAYS = (0.0, 0.0, 0.0)
 
     await orchestrator._process_job("abc123")
 
     job = await database.get_job("abc123")
     window = (await database.get_windows("abc123"))[0]
     assert job["status"] == "paused"
-    assert "4 attempts" in job["error_message"]
-    assert islice.calls == 4
-    assert len(await database.get_attempts(window["id"])) == 4
+    assert "service unavailable" in job["error_message"]
+    assert islice.calls == 1
+    assert len(await database.get_attempts(window["id"])) == 1
     assert Path(window["chunk_path"]).is_file()
 
     await database.update_job("abc123", status="queued", pause_requested=0)
     await orchestrator._process_job("abc123")
 
     assert (await database.get_job("abc123"))["status"] == "paused"
-    assert islice.calls == 8
-    assert len(await database.get_attempts(window["id"])) == 8
+    assert islice.calls == 2
+    assert len(await database.get_attempts(window["id"])) == 2
+
+
+@pytest.mark.asyncio
+async def test_terminal_islice_failure_pauses_without_automatic_retry(tmp_path: Path) -> None:
+    source = tmp_path / "source.ts"
+    source.write_bytes(b"source")
+    configured = make_settings(tmp_path)
+    database = Database(configured.database_path)
+    await database.initialize()
+    await create_job(database, source, duration=3600)
+    islice = TerminalFailingISlice()
+    orchestrator = Orchestrator(configured, database, FakeMedia(), islice)
+
+    await orchestrator._process_job("abc123")
+
+    job = await database.get_job("abc123")
+    window = (await database.get_windows("abc123"))[0]
+    attempts = await database.get_attempts(window["id"])
+    assert job["status"] == "paused"
+    assert "internal retries exhausted" in job["error_message"]
+    assert window["status"] == "failed"
+    assert window["error_message"] == "internal retries exhausted"
+    assert islice.calls == 1
+    assert len(attempts) == 1
+    assert attempts[0]["status"] == "failed"
+    assert attempts[0]["service_status"] == "failed"
+    assert attempts[0]["error_message"] == "internal retries exhausted"
+    assert attempts[0]["raw_response_path"]
 
 
 @pytest.mark.asyncio

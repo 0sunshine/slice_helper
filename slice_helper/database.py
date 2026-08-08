@@ -1,12 +1,31 @@
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
+import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
 import aiosqlite
+
+
+SOURCE_DATE_RE = re.compile(r"(?:^|[_-])(20\d{2})(\d{2})(\d{2})(?:[-_]|$)")
+
+
+def normalize_channel_name(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def infer_broadcast_date(source: str, program_start_time: str | None) -> str | None:
+    match = SOURCE_DATE_RE.search(source)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+    if program_start_time and re.match(r"^20\d{2}-\d{2}-\d{2}", program_start_time):
+        return program_start_time[:10]
+    return None
 
 
 def utc_now() -> str:
@@ -71,6 +90,14 @@ class Database:
                     applied_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS channels (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    normalized_name TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY,
                     source_path TEXT NOT NULL,
@@ -81,7 +108,9 @@ class Database:
                     islice_base_url TEXT NOT NULL DEFAULT '',
                     template_id TEXT NOT NULL,
                     language TEXT NOT NULL,
+                    channel_id TEXT REFERENCES channels(id),
                     channel_name TEXT NOT NULL DEFAULT '',
+                    broadcast_date TEXT,
                     program_start_time TEXT,
                     time_reference_source TEXT NOT NULL DEFAULT '',
                     time_reference_text TEXT NOT NULL DEFAULT '',
@@ -102,6 +131,8 @@ class Database:
                     updated_at TEXT NOT NULL,
                     started_at TEXT,
                     completed_at TEXT
+                    ,superseded_at TEXT
+                    ,superseded_by_job_id TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_status_created
                     ON jobs(status, created_at);
@@ -152,11 +183,15 @@ class Database:
                     absolute_start TEXT,
                     absolute_end TEXT,
                     title TEXT NOT NULL DEFAULT '',
+                    content_type TEXT NOT NULL DEFAULT '',
+                    news_event_type TEXT NOT NULL DEFAULT '',
                     topic TEXT NOT NULL DEFAULT '',
                     keywords_json TEXT NOT NULL DEFAULT '[]',
                     summary TEXT NOT NULL DEFAULT '',
                     segment_url TEXT NOT NULL DEFAULT '',
                     cover_img_url TEXT NOT NULL DEFAULT '',
+                    attempt_id INTEGER REFERENCES attempts(id),
+                    task_id TEXT NOT NULL DEFAULT '',
                     raw_json TEXT NOT NULL,
                     UNIQUE(window_id, source_index)
                 );
@@ -180,6 +215,10 @@ class Database:
                 "time_reference_error": "TEXT NOT NULL DEFAULT ''",
                 "islice_base_url": "TEXT NOT NULL DEFAULT ''",
                 "source_url": "TEXT NOT NULL DEFAULT ''",
+                "channel_id": "TEXT REFERENCES channels(id)",
+                "broadcast_date": "TEXT",
+                "superseded_at": "TEXT",
+                "superseded_by_job_id": "TEXT",
             }
             for column, declaration in migrations.items():
                 if column not in job_columns:
@@ -222,13 +261,246 @@ class Database:
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(6, ?)",
                 (utc_now(),),
             )
+            segment_columns = {
+                row["name"]
+                for row in await (await db.execute("PRAGMA table_info(segments)")).fetchall()
+            }
+            if "content_type" not in segment_columns:
+                await db.execute(
+                    "ALTER TABLE segments ADD COLUMN content_type TEXT NOT NULL DEFAULT ''"
+                )
+            if "news_event_type" not in segment_columns:
+                await db.execute(
+                    "ALTER TABLE segments ADD COLUMN news_event_type TEXT NOT NULL DEFAULT ''"
+                )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(7, ?)",
+                (utc_now(),),
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(8, ?)",
+                (utc_now(),),
+            )
+            backfill_rows = await (
+                await db.execute(
+                    "SELECT id, raw_json FROM segments WHERE news_event_type=''"
+                )
+            ).fetchall()
+            for row in backfill_rows:
+                try:
+                    raw = json.loads(row["raw_json"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                news_event_type = str(raw.get("newsEventType") or "")
+                if news_event_type:
+                    await db.execute(
+                        "UPDATE segments SET news_event_type=? WHERE id=?",
+                        (news_event_type, row["id"]),
+                    )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(9, ?)",
+                (utc_now(),),
+            )
+            version_10 = await (
+                await db.execute("SELECT 1 FROM schema_version WHERE version=10")
+            ).fetchone()
+            if version_10 is None:
+                now = utc_now()
+                existing_channels = await (
+                    await db.execute("SELECT id, normalized_name FROM channels")
+                ).fetchall()
+                channel_ids = {
+                    row["normalized_name"]: row["id"] for row in existing_channels
+                }
+                jobs = await (
+                    await db.execute(
+                        "SELECT id, channel_name, source_path, source_url, "
+                        "program_start_time, source_duration, created_at FROM jobs"
+                    )
+                ).fetchall()
+                grouped: dict[tuple[str, str], list[aiosqlite.Row]] = {}
+                for row in jobs:
+                    name = " ".join(str(row["channel_name"] or "").split())
+                    if not name:
+                        continue
+                    normalized = normalize_channel_name(name)
+                    channel_id = channel_ids.get(normalized)
+                    if channel_id is None:
+                        channel_id = uuid.uuid4().hex
+                        await db.execute(
+                            "INSERT INTO channels(id, name, normalized_name, created_at, updated_at) "
+                            "VALUES(?, ?, ?, ?, ?)",
+                            (channel_id, name, normalized, now, now),
+                        )
+                        channel_ids[normalized] = channel_id
+                    source = str(row["source_url"] or row["source_path"] or "")
+                    broadcast_date = infer_broadcast_date(
+                        source, row["program_start_time"]
+                    )
+                    await db.execute(
+                        "UPDATE jobs SET channel_id=?, channel_name=?, broadcast_date=? WHERE id=?",
+                        (channel_id, name, broadcast_date, row["id"]),
+                    )
+                    if broadcast_date:
+                        grouped.setdefault((channel_id, broadcast_date), []).append(row)
+                for duplicate_rows in grouped.values():
+                    if len(duplicate_rows) < 2:
+                        continue
+                    winner = max(
+                        duplicate_rows,
+                        key=lambda row: (
+                            float(row["source_duration"] or 0),
+                            str(row["created_at"] or ""),
+                            str(row["id"]),
+                        ),
+                    )
+                    for row in duplicate_rows:
+                        if row["id"] != winner["id"]:
+                            await db.execute(
+                                "UPDATE jobs SET superseded_at=?, superseded_by_job_id=? WHERE id=?",
+                                (now, winner["id"], row["id"]),
+                            )
+                await db.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_channel_date_current "
+                    "ON jobs(channel_id, broadcast_date) "
+                    "WHERE channel_id IS NOT NULL AND broadcast_date IS NOT NULL "
+                    "AND superseded_at IS NULL"
+                )
+                await db.execute(
+                    "INSERT INTO schema_version(version, applied_at) VALUES(10, ?)",
+                    (now,),
+                )
+            segment_columns = {
+                row["name"]
+                for row in await (await db.execute("PRAGMA table_info(segments)")).fetchall()
+            }
+            if "attempt_id" not in segment_columns:
+                await db.execute(
+                    "ALTER TABLE segments ADD COLUMN attempt_id INTEGER REFERENCES attempts(id)"
+                )
+            if "task_id" not in segment_columns:
+                await db.execute(
+                    "ALTER TABLE segments ADD COLUMN task_id TEXT NOT NULL DEFAULT ''"
+                )
+            await db.execute(
+                """
+                UPDATE segments
+                SET attempt_id=(
+                        SELECT a.id FROM attempts a
+                        WHERE a.window_id=segments.window_id
+                        ORDER BY CASE WHEN a.status='completed' THEN 0 ELSE 1 END,
+                                 a.attempt_no DESC LIMIT 1
+                    ),
+                    task_id=COALESCE((
+                        SELECT a.task_id FROM attempts a
+                        WHERE a.window_id=segments.window_id
+                        ORDER BY CASE WHEN a.status='completed' THEN 0 ELSE 1 END,
+                                 a.attempt_no DESC LIMIT 1
+                    ), '')
+                WHERE attempt_id IS NULL OR task_id=''
+                """
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(11, ?)",
+                (utc_now(),),
+            )
             await db.commit()
 
     @staticmethod
     def _row(row: aiosqlite.Row | None) -> dict[str, Any] | None:
         return dict(row) if row is not None else None
 
-    async def create_job(self, record: dict[str, Any]) -> dict[str, Any]:
+    async def create_channel(self, name: str) -> dict[str, Any]:
+        now = utc_now()
+        channel_id = uuid.uuid4().hex
+        normalized = normalize_channel_name(name)
+        async with self.connect() as db:
+            row = await (
+                await db.execute(
+                    "INSERT INTO channels(id, name, normalized_name, created_at, updated_at) "
+                    "VALUES(?, ?, ?, ?, ?) RETURNING *",
+                    (channel_id, name, normalized, now, now),
+                )
+            ).fetchone()
+            await db.commit()
+        return dict(row)
+
+    async def list_channels(self) -> list[dict[str, Any]]:
+        async with self.connect() as db:
+            rows = await (
+                await db.execute(
+                    """
+                    SELECT c.*,
+                           COUNT(CASE WHEN j.superseded_at IS NULL THEN 1 END) AS job_count
+                    FROM channels c
+                    LEFT JOIN jobs j ON j.channel_id=c.id
+                    GROUP BY c.id
+                    ORDER BY c.name, c.id
+                    """
+                )
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    async def get_channel(self, channel_id: str) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            row = await (
+                await db.execute("SELECT * FROM channels WHERE id=?", (channel_id,))
+            ).fetchone()
+        return self._row(row)
+
+    async def update_channel(self, channel_id: str, name: str) -> dict[str, Any] | None:
+        now = utc_now()
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            row = await (
+                await db.execute("SELECT id FROM channels WHERE id=?", (channel_id,))
+            ).fetchone()
+            if row is None:
+                await db.rollback()
+                return None
+            await db.execute(
+                "UPDATE channels SET name=?, normalized_name=?, updated_at=? WHERE id=?",
+                (name, normalize_channel_name(name), now, channel_id),
+            )
+            await db.execute(
+                "UPDATE jobs SET channel_name=?, updated_at=? WHERE channel_id=?",
+                (name, now, channel_id),
+            )
+            updated = await (
+                await db.execute("SELECT * FROM channels WHERE id=?", (channel_id,))
+            ).fetchone()
+            await db.commit()
+        return dict(updated)
+
+    async def delete_channel(self, channel_id: str) -> bool:
+        async with self.connect() as db:
+            count = await (
+                await db.execute(
+                    "SELECT COUNT(*) AS value FROM jobs WHERE channel_id=?", (channel_id,)
+                )
+            ).fetchone()
+            if int(count["value"]):
+                raise ValueError("Channel has jobs")
+            cursor = await db.execute("DELETE FROM channels WHERE id=?", (channel_id,))
+            await db.commit()
+        return cursor.rowcount > 0
+
+    async def get_current_job_for_channel_date(
+        self, channel_id: str, broadcast_date: str
+    ) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            row = await (
+                await db.execute(
+                    "SELECT * FROM jobs WHERE channel_id=? AND broadcast_date=? "
+                    "AND superseded_at IS NULL",
+                    (channel_id, broadcast_date),
+                )
+            ).fetchone()
+        return self._row(row)
+
+    async def create_job(
+        self, record: dict[str, Any], supersede_job_id: str | None = None
+    ) -> dict[str, Any]:
         now = utc_now()
         values = {
             **record,
@@ -246,6 +518,13 @@ class Database:
         columns = ", ".join(values)
         placeholders = ", ".join("?" for _ in values)
         async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            if supersede_job_id:
+                await db.execute(
+                    "UPDATE jobs SET superseded_at=?, superseded_by_job_id=?, updated_at=? "
+                    "WHERE id=? AND superseded_at IS NULL",
+                    (now, record["id"], now, supersede_job_id),
+                )
             row = await (
                 await db.execute(
                     f"INSERT INTO jobs ({columns}) VALUES ({placeholders}) RETURNING *",
@@ -306,6 +585,7 @@ class Database:
                     FROM jobs j
                     WHERE j.status IN ({active_placeholders})
                       AND j.islice_base_url<>''
+                      AND j.superseded_at IS NULL
                     GROUP BY j.islice_base_url
                     """,
                     active_statuses,
@@ -313,7 +593,8 @@ class Database:
             ).fetchall()
             candidates = await (
                 await db.execute(
-                    "SELECT * FROM jobs WHERE status='pending_schedule' ORDER BY created_at, id"
+                    "SELECT * FROM jobs WHERE status='pending_schedule' "
+                    "AND superseded_at IS NULL ORDER BY created_at, id"
                 )
             ).fetchall()
 
@@ -372,14 +653,96 @@ class Database:
             LEFT JOIN segments s ON s.job_id=j.id
         """
         params: list[Any] = []
+        query += " WHERE j.superseded_at IS NULL"
         if status:
-            query += " WHERE j.status=?"
+            query += " AND j.status=?"
             params.append(status)
         query += " GROUP BY j.id ORDER BY j.created_at DESC LIMIT ?"
         params.append(limit)
         async with self.connect() as db:
             rows = await (await db.execute(query, params)).fetchall()
         return [dict(row) for row in rows]
+
+    async def paginate_jobs(
+        self,
+        *,
+        page: int,
+        page_size: int,
+        status: str | None = None,
+        channel_id: str | None = None,
+        broadcast_date: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        where = ["j.superseded_at IS NULL"]
+        params: list[Any] = []
+        if status:
+            where.append("j.status=?")
+            params.append(status)
+        if channel_id:
+            where.append("j.channel_id=?")
+            params.append(channel_id)
+        if broadcast_date:
+            where.append("j.broadcast_date=?")
+            params.append(broadcast_date)
+        where_sql = " AND ".join(where)
+        async with self.connect() as db:
+            total_row = await (
+                await db.execute(
+                    f"SELECT COUNT(*) AS value FROM jobs j WHERE {where_sql}", params
+                )
+            ).fetchone()
+            rows = await (
+                await db.execute(
+                    f"""
+                    SELECT j.*,
+                           c.name AS channel_name,
+                           (SELECT COUNT(*) FROM windows w WHERE w.job_id=j.id) AS window_count,
+                           (SELECT COUNT(*) FROM segments s
+                            WHERE s.job_id=j.id AND s.accepted=1) AS accepted_segment_count
+                    FROM jobs j
+                    LEFT JOIN channels c ON c.id=j.channel_id
+                    WHERE {where_sql}
+                    ORDER BY j.created_at DESC, j.id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (*params, page_size, (page - 1) * page_size),
+                )
+            ).fetchall()
+        return [dict(row) for row in rows], int(total_row["value"])
+
+    async def get_channel_export(self, channel_id: str) -> dict[str, Any] | None:
+        channel = await self.get_channel(channel_id)
+        if channel is None:
+            return None
+        async with self.connect() as db:
+            jobs = await (
+                await db.execute(
+                    "SELECT * FROM jobs WHERE channel_id=? AND superseded_at IS NULL "
+                    "AND broadcast_date IS NOT NULL ORDER BY broadcast_date, created_at, id",
+                    (channel_id,),
+                )
+            ).fetchall()
+            segments = await (
+                await db.execute(
+                    """
+                    SELECT s.*, w.window_index, j.broadcast_date, j.source_path,
+                           j.source_url, j.created_at AS job_created_at
+                    FROM segments s
+                    JOIN windows w ON w.id=s.window_id
+                    JOIN jobs j ON j.id=s.job_id
+                    WHERE j.channel_id=? AND j.superseded_at IS NULL
+                      AND j.broadcast_date IS NOT NULL AND s.accepted=1
+                    ORDER BY j.broadcast_date,
+                             CASE WHEN s.absolute_start IS NULL THEN 1 ELSE 0 END,
+                             s.absolute_start, s.global_start, s.id
+                    """,
+                    (channel_id,),
+                )
+            ).fetchall()
+        return {
+            "channel": channel,
+            "jobs": [dict(row) for row in jobs],
+            "segments": [dict(row) for row in segments],
+        }
 
     async def update_job(self, job_id: str, **fields: Any) -> None:
         unknown = set(fields) - self.JOB_FIELDS
@@ -402,24 +765,63 @@ class Database:
             await db.execute(
                 """
                 UPDATE jobs SET status='pending_schedule', updated_at=?
-                WHERE status IN ('probing', 'running')
+                WHERE status IN ('probing', 'running') AND superseded_at IS NULL
                 """,
                 (now,),
             )
             await db.execute(
                 """
                 UPDATE jobs SET status='paused', pause_requested=0, updated_at=?
-                WHERE status='pause_requested'
+                WHERE status='pause_requested' AND superseded_at IS NULL
                 """,
                 (now,),
             )
             await db.execute(
                 """
                 UPDATE jobs SET status='stopped', stop_requested=0, updated_at=?
-                WHERE status='stop_requested'
+                WHERE status='stop_requested' AND superseded_at IS NULL
                 """,
                 (now,),
             )
+            await db.commit()
+
+    async def recover_interrupted_resplits(self) -> None:
+        message = "Helper restarted during manual resplit; start the resplit again"
+        now = utc_now()
+        async with self.connect() as db:
+            rows = await (
+                await db.execute(
+                    """
+                    SELECT DISTINCT w.id AS window_id, w.job_id
+                    FROM attempts a
+                    JOIN windows w ON w.id=a.window_id
+                    WHERE a.status IN ('resplit_queued', 'resplitting')
+                    """
+                )
+            ).fetchall()
+            if not rows:
+                return
+            await db.execute(
+                """
+                UPDATE attempts
+                SET status='failed', error_message=?, finished_at=?
+                WHERE status IN ('resplit_queued', 'resplitting')
+                """,
+                (message, now),
+            )
+            for row in rows:
+                await db.execute(
+                    "UPDATE windows SET status='failed', error_message=?, updated_at=? WHERE id=?",
+                    (message, now, row["window_id"]),
+                )
+                await db.execute(
+                    """
+                    UPDATE jobs
+                    SET status='paused', pause_requested=0, error_message=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (message, now, row["job_id"]),
+                )
             await db.commit()
 
     async def append_warning(self, job_id: str, warning: str) -> None:
@@ -550,17 +952,35 @@ class Database:
             "absolute_start",
             "absolute_end",
             "title",
+            "content_type",
+            "news_event_type",
             "topic",
             "keywords_json",
             "summary",
             "segment_url",
             "cover_img_url",
+            "attempt_id",
+            "task_id",
             "raw_json",
         )
         async with self.connect() as db:
+            attempt = await (
+                await db.execute(
+                    "SELECT id, task_id FROM attempts WHERE window_id=? "
+                    "ORDER BY CASE WHEN status='completed' THEN 0 ELSE 1 END, "
+                    "attempt_no DESC LIMIT 1",
+                    (window_id,),
+                )
+            ).fetchone()
             await db.execute("DELETE FROM segments WHERE window_id=?", (window_id,))
             for segment in segments:
-                row = {**segment, "job_id": job_id, "window_id": window_id}
+                row = {
+                    **segment,
+                    "job_id": job_id,
+                    "window_id": window_id,
+                    "attempt_id": attempt["id"] if attempt else None,
+                    "task_id": attempt["task_id"] if attempt else "",
+                }
                 await db.execute(
                     f"INSERT INTO segments ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
                     tuple(row[column] for column in columns),

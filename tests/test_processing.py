@@ -17,6 +17,8 @@ def segment(start: float, end: float, title: str = "item") -> dict:
         "startTime": start,
         "endTime": end,
         "title": title,
+        "contentType": "新闻",
+        "newsEventType": "时政要闻",
         "topic": "news",
         "keywords": ["one", "two"],
         "summary": "summary",
@@ -50,6 +52,8 @@ def test_short_tail_is_handed_to_next_window() -> None:
         program_start_time=None,
     )
     assert result.segments[0]["accepted"] == 1
+    assert result.segments[0]["content_type"] == "新闻"
+    assert result.segments[0]["news_event_type"] == "时政要闻"
     assert result.segments[1]["accepted"] == 0
     assert result.segments[1]["reason"] == "handoff"
     assert result.next_window_start == 3400
@@ -93,6 +97,22 @@ def test_tail_over_fifty_minutes_is_kept() -> None:
     assert long_tail.segments[-1]["reason"] == "long_tail_kept"
     assert long_tail.next_window_start == 3600
     assert long_tail.warning
+
+
+def test_news_event_type_is_preserved_without_content_type_filtering() -> None:
+    item = segment(0, 10)
+    item["contentType"] = "其他"
+    item["newsEventType"] = "其他"
+    result = process_segments(
+        [item],
+        window_start=0,
+        chunk_duration=10,
+        is_final_window=True,
+        handoff_max_seconds=3000,
+        program_start_time=None,
+    )
+    assert result.segments[0]["content_type"] == "其他"
+    assert result.segments[0]["news_event_type"] == "其他"
 
 
 def test_final_window_keeps_tail_and_calculates_absolute_time() -> None:

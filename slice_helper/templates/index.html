@@ -15,6 +15,7 @@
     <div class="topbar-actions">
       <span id="healthBadge" class="health neutral">检查中</span>
       <button id="refreshButton" class="button secondary" type="button">刷新</button>
+      <button id="manageChannelsButton" class="button secondary" type="button">频道管理</button>
       <button id="openCreateButton" class="button primary" type="button">新建作业</button>
     </div>
   </header>
@@ -26,9 +27,10 @@
           <h2>作业列表</h2>
           <span id="jobCount" class="count">0</span>
         </div>
-        <label class="filter-label">
-          状态
-          <select id="statusFilter">
+        <div class="job-filters">
+          <label class="filter-label">频道<select id="channelFilter"><option value="">全部频道</option></select></label>
+          <label class="filter-label">业务日期<input id="dateFilter" type="date"></label>
+          <label class="filter-label">状态<select id="statusFilter">
             <option value="">全部</option>
             <option value="pending_schedule">待调度</option>
             <option value="queued">已调度</option>
@@ -40,13 +42,16 @@
             <option value="failed">失败</option>
             <option value="stop_requested">等待停止</option>
             <option value="stopped">已停止</option>
-          </select>
-        </label>
+          </select></label>
+          <button id="exportChannelButton" class="button secondary" type="button" disabled>导出频道 Excel</button>
+        </div>
       </div>
       <div class="table-scroll">
         <table class="data-table">
           <thead>
             <tr>
+              <th>频道</th>
+              <th>业务日期</th>
               <th>源文件</th>
               <th>状态</th>
               <th>进度</th>
@@ -60,6 +65,13 @@
         </table>
       </div>
       <div id="emptyJobs" class="empty-state" hidden>暂无作业</div>
+      <div class="jobs-pagination" aria-label="作业列表分页">
+        <span id="jobPageSummary">共 0 条</span>
+        <label>每页<select id="jobPageSize"><option value="20">20</option><option value="50">50</option><option value="100">100</option></select></label>
+        <button id="previousJobPage" class="icon-button pagination-button" type="button" aria-label="上一页">&lsaquo;</button>
+        <span id="jobPageInfo">1 / 1</span>
+        <button id="nextJobPage" class="icon-button pagination-button" type="button" aria-label="下一页">&rsaquo;</button>
+      </div>
     </section>
 
     <section id="detailBand" class="band detail-band" hidden>
@@ -73,6 +85,8 @@
       </div>
 
       <div class="summary-grid">
+        <div><span>频道</span><strong id="summaryChannel"></strong></div>
+        <div><span>业务日期</span><strong id="summaryBroadcastDate"></strong></div>
         <div><span>iSlice 实例</span><strong id="summaryISlice" class="mono"></strong></div>
         <div><span>状态</span><strong id="summaryStatus"></strong></div>
         <div><span>源时长</span><strong id="summaryDuration"></strong></div>
@@ -119,7 +133,7 @@
           </div>
           <div class="table-scroll segments-table-scroll">
             <table class="data-table compact segments-table">
-              <thead><tr><th>源偏移</th><th>真实时间</th><th>标题</th><th>主题</th><th>关键词</th><th>来源窗口</th><th>状态</th></tr></thead>
+              <thead><tr><th>源偏移</th><th>真实时间</th><th>标题</th><th>节目类型</th><th>新闻事件</th><th>主题</th><th>关键词</th><th>来源窗口</th><th>状态</th></tr></thead>
               <tbody id="segmentsBody"></tbody>
             </table>
           </div>
@@ -131,7 +145,7 @@
           </div>
           <div class="table-scroll window-table-scroll">
             <table class="data-table compact window-table">
-              <thead><tr><th>#</th><th>源起点</th><th>整点终点</th><th>状态</th><th>小任务进度</th><th>交接起点</th><th>错误</th></tr></thead>
+              <thead><tr><th>#</th><th>源起点</th><th>整点终点</th><th>状态</th><th>小任务进度</th><th>交接起点</th><th>错误</th><th>操作</th></tr></thead>
               <tbody id="windowsBody"></tbody>
             </table>
           </div>
@@ -148,16 +162,55 @@
       </div>
       <div class="form-grid">
         <label class="full">TS 路径或 HTTP 地址<input name="sourcePath" required placeholder="D:\video\day.ts 或 https://host/day.ts"></label>
+        <label>频道<select id="createChannelId" name="channelId" required><option value="">请选择频道</option></select></label>
+        <label>业务日期<input name="broadcastDate" type="date" required></label>
         <label>模板<select name="templateId"><option value="general">综合新闻</option><option value="sports">体育</option><option value="live">直播</option></select></label>
         <label>语言<select name="language"><option value="zh">中文</option><option value="en">英文</option></select></label>
         <label>切割方式<select name="cutMode"><option value="copy">流复制</option><option value="transcode">重编码</option></select></label>
-        <label>频道<input name="channelName" placeholder="可选"></label>
         <label class="full">时间识别失败回退值<input name="programStartTime" type="datetime-local"></label>
       </div>
       <p id="createError" class="form-error" hidden></p>
       <div class="dialog-actions">
         <button id="cancelCreateButton" class="button secondary" type="button">取消</button>
         <button id="submitCreateButton" class="button primary" type="submit">创建作业</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="channelsDialog" class="channels-dialog">
+    <form id="channelCreateForm" method="dialog">
+      <div class="dialog-header">
+        <h2>频道管理</h2>
+        <button id="closeChannelsButton" class="icon-button" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="channel-create-row">
+        <label>频道名<input id="newChannelName" name="name" maxlength="255" required placeholder="例如：云南卫视"></label>
+        <button class="button primary" type="submit">添加频道</button>
+      </div>
+      <p id="channelError" class="form-error" hidden></p>
+      <div id="channelsList" class="channels-list"></div>
+      <div class="dialog-actions"><button id="doneChannelsButton" class="button secondary" type="button">完成</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="resplitDialog" class="confirm-dialog">
+    <form id="resplitForm" method="dialog">
+      <div class="dialog-header">
+        <h2>确认重新拆分</h2>
+        <button id="closeResplitButton" class="icon-button" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="confirm-dialog-body">
+        <p>将删除 iSlice 中的现有任务并使用相同任务 ID 重新提交。此操作不会创建新的 attempt。</p>
+        <dl>
+          <div><dt>窗口</dt><dd id="resplitWindow"></dd></div>
+          <div><dt>任务 ID</dt><dd id="resplitTaskId" class="mono"></dd></div>
+        </dl>
+        <p class="confirm-warning">重新拆分完成后，该窗口的拆条结果会被新结果替换。</p>
+        <p id="resplitError" class="form-error" hidden></p>
+      </div>
+      <div class="dialog-actions">
+        <button id="cancelResplitButton" class="button secondary" type="button">取消</button>
+        <button id="submitResplitButton" class="button danger" type="submit">确认重新拆分</button>
       </div>
     </form>
   </dialog>

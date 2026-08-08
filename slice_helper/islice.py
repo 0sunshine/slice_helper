@@ -87,6 +87,18 @@ class ISliceClient:
             return existing
         raise ISliceError(f"CreateTask returned HTTP {response.status_code}")
 
+    async def delete_task(self, task_id: str) -> bool:
+        """Delete a task, treating an already absent task as an idempotent success."""
+        try:
+            response = await self.client.post("/DeleteTask", json={"taskId": task_id})
+        except httpx.HTTPError as exc:
+            raise ISliceError(f"DeleteTask transport error: {exc}") from exc
+        if response.status_code == 200:
+            return True
+        if response.status_code == 404:
+            return False
+        raise ISliceError(f"DeleteTask returned HTTP {response.status_code}")
+
     @staticmethod
     def _verify_video_path(payload: dict[str, Any], expected: str) -> None:
         actual = str(payload.get("taskInfo", {}).get("videoPath") or "")

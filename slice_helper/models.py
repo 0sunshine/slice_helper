@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -40,11 +40,13 @@ class JobCreate(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     source_path: str = Field(alias="sourcePath", min_length=1, max_length=4096)
+    channel_id: str = Field(alias="channelId", min_length=32, max_length=32)
+    broadcast_date: date = Field(alias="broadcastDate")
     template_id: str = Field(default="general", alias="templateId")
     language: str = "zh"
-    channel_name: str | None = Field(default=None, alias="channelName", max_length=255)
     program_start_time: datetime | None = Field(default=None, alias="programStartTime")
     cut_mode: CutMode = Field(default=CutMode.COPY, alias="cutMode")
+    overwrite: bool = False
 
     @field_validator("source_path")
     @classmethod
@@ -77,6 +79,30 @@ class JobCreate(BaseModel):
         if normalized not in {"zh", "en"}:
             raise ValueError("language must be zh or en")
         return normalized
+
+
+class ChannelCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("Channel name is required")
+        return normalized
+
+
+class ChannelUpdate(ChannelCreate):
+    pass
+
+
+class WindowResplitRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    task_id: str = Field(
+        alias="taskId", min_length=1, max_length=64, pattern=r"^[\x21-\x7e]+$"
+    )
 
 
 class MediaProbe(BaseModel):

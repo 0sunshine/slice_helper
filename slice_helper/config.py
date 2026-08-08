@@ -39,8 +39,6 @@ class Settings:
     window_boundary_tolerance_seconds: float = 1.0
     handoff_max_seconds: float = 3000.0
     pipeline_progress_threshold: float = 71.0
-    # One initial submission plus three retries using the 5/15/45s backoff.
-    max_service_attempts: int = 4
     islice_base_urls: tuple[str, ...] = ()
 
     @property
