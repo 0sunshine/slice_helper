@@ -1,9 +1,13 @@
 const state = {
   jobs: [], channels: [], selectedJobId: null, detail: null, segments: [],
   jobPage: 1, jobPageSize: 20, jobTotal: 0, jobTotalPages: 1,
-  segmentPage: 1, previewUrl: null, resplitTarget: null
+  segmentPage: 1, previewUrl: null, resplitTarget: null, segmentEditTarget: null
 };
 const SEGMENTS_PER_PAGE = 10;
+const CONTENT_TYPES = [
+  "新闻", "电视剧", "电影", "综艺", "少儿", "体育", "纪录片", "科教",
+  "文艺", "生活服务", "商业广告", "公益广告", "电视购物", "其他"
+];
 
 const statusNames = {
   pending_schedule: "待调度", queued: "已调度", probing: "探测中", running: "处理中",
@@ -133,14 +137,38 @@ function renderJobs() {
       <td><span class="mini-progress"><span style="width:${Math.max(0, Math.min(100, job.progress || 0))}%"></span></span>${Number(job.progress || 0).toFixed(1)}%</td>
       <td>${job.current_window}/${job.total_windows}</td>
       <td>${job.accepted_segment_count}</td>
+      <td class="reviewed-cell"><input class="review-checkbox" data-job-id="${escapeHtml(job.id)}" type="checkbox" ${job.reviewed ? "checked" : ""} aria-label="${job.reviewed ? "取消" : "标记"}${escapeHtml(job.channel_name || sourceName(job))}已审核"></td>
       <td>${escapeHtml(formatDate(job.created_at))}</td>
       <td><button class="button secondary small view-job" data-job-id="${escapeHtml(job.id)}" type="button">查看</button></td>
     </tr>`).join("");
   body.querySelectorAll(".view-job").forEach((button) => button.addEventListener("click", () => loadDetail(button.dataset.jobId, true)));
+  body.querySelectorAll(".review-checkbox").forEach((checkbox) => checkbox.addEventListener("change", () => updateJobReview(checkbox)));
   $("jobPageSummary").textContent = `共 ${state.jobTotal} 条`;
   $("jobPageInfo").textContent = `${state.jobPage} / ${state.jobTotalPages}`;
   $("previousJobPage").disabled = state.jobPage <= 1;
   $("nextJobPage").disabled = state.jobPage >= state.jobTotalPages;
+}
+
+async function updateJobReview(checkbox) {
+  const jobId = checkbox.dataset.jobId;
+  const reviewed = checkbox.checked;
+  checkbox.disabled = true;
+  try {
+    const updated = await api(`/api/jobs/${jobId}/review`, {
+      method: "PATCH",
+      body: JSON.stringify({ reviewed })
+    });
+    const job = state.jobs.find((item) => item.id === jobId);
+    if (job) job.reviewed = updated.reviewed;
+    if (state.detail?.job?.id === jobId) state.detail.job.reviewed = updated.reviewed;
+    checkbox.setAttribute("aria-label", `${updated.reviewed ? "取消" : "标记"}${updated.channel_name || sourceName(updated)}已审核`);
+    showToast(updated.reviewed ? "作业已标记为审核完成" : "已取消作业审核标记");
+  } catch (error) {
+    checkbox.checked = !reviewed;
+    showToast(error.message);
+  } finally {
+    checkbox.disabled = false;
+  }
 }
 
 async function loadChannels() {
@@ -226,13 +254,19 @@ function renderDetail() {
 
   const latestAttempts = new Map();
   attempts.forEach((attempt) => latestAttempts.set(attempt.window_index, attempt));
+  const latestSubmittedAttempt = [...latestAttempts.values()].reduce((latest, attempt) => {
+    if (!attempt.submitted_at) return latest;
+    return !latest || attempt.submitted_at > latest.submitted_at ? attempt : latest;
+  }, null);
+  const latestSubmittedWindowIndex = latestSubmittedAttempt?.window_index;
   $("windowsBody").innerHTML = windows.map((windowItem) => `
-    <tr>
+    <tr class="window-row${windowItem.window_index === latestSubmittedWindowIndex ? " is-latest-submitted" : ""}">
       <td>${windowItem.window_index + 1}</td>
       <td>${formatSeconds(windowItem.requested_start)}</td>
       <td>${formatSeconds(windowItem.nominal_end)}</td>
       <td><span class="status-pill ${windowItem.status === "completed" ? "ok" : windowItem.status === "failed" ? "bad" : "neutral"}">${escapeHtml(windowItem.status)}</span></td>
       <td>${renderTaskProgress(latestAttempts.get(windowItem.window_index))}</td>
+      <td class="mono window-submitted-at">${escapeHtml(formatDate(latestAttempts.get(windowItem.window_index)?.submitted_at))}</td>
       <td>${windowItem.handoff_start == null ? "-" : formatSeconds(windowItem.handoff_start)}</td>
       <td>${escapeHtml(windowItem.error_message || "-")}</td>
       <td>${renderResplitAction(job, windowItem, latestAttempts.get(windowItem.window_index))}</td>
@@ -315,20 +349,154 @@ function renderSegments() {
     const title = segment.title || `片段 ${segmentIndex + 1}`;
     const keywords = (segment.keywords || []).join(", ") || "-";
     return `
-    <tr class="segment-row${previewable ? " is-previewable" : ""}${active ? " is-active" : ""}"
+    <tr class="segment-row${previewable ? " is-previewable" : ""}${active ? " is-active" : ""}${segment.ignored ? " is-ignored" : ""}"
         ${previewable ? `data-segment-index="${segmentIndex}" tabindex="0" aria-label="播放 ${escapeHtml(title)}"` : ""}
         ${active ? 'aria-current="true"' : ""}>
-      <td class="mono"><span class="segment-time-stack"><span>${formatSeconds(segment.global_start)}</span><span>${formatSeconds(segment.global_end)}</span></span></td>
+      <td>${segment.window_index + 1}</td>
       <td class="mono"><span class="segment-time-stack"><span>${formatRealTime(segment.absolute_start)}</span><span>${formatRealTime(segment.absolute_end)}</span></span></td>
       <td><span class="segment-title" title="${escapeHtml(title)}">${escapeHtml(title)}</span></td>
       <td class="segment-content-type">${escapeHtml(segment.content_type || "-")}</td>
       <td class="segment-news-event-type">${escapeHtml(segment.news_event_type || "-")}</td>
       <td class="segment-topic">${escapeHtml(segment.topic || "-")}</td>
       <td><span class="segment-keywords" title="${escapeHtml(keywords)}">${escapeHtml(keywords)}</span></td>
-      <td>${segment.window_index + 1}</td>
-      <td><span class="status-pill ${segment.accepted ? "ok" : "warn"}">${segment.accepted ? "采用" : escapeHtml(segment.reason || "舍弃")}</span></td>
-    </tr>`;
+      <td><span class="status-pill ${segment.ignored ? "neutral" : segment.accepted ? "ok" : "warn"}">${segment.ignored ? "忽略" : segment.accepted ? "采用" : escapeHtml(segment.reason || "舍弃")}</span></td>
+      <td><span class="segment-actions"><button class="button secondary small segment-detail" data-segment-index="${segmentIndex}" type="button">详情</button><button class="button secondary small edit-segment" data-segment-index="${segmentIndex}" type="button">编辑</button></span></td>
+     </tr>`;
   }).join("") || '<tr><td class="empty-table-row" colspan="9">暂无拆条结果</td></tr>';
+}
+
+function openSegmentEdit(segmentIndex) {
+  const segment = state.segments[segmentIndex];
+  if (!segment) return;
+  state.segmentEditTarget = { id: segment.id, index: segmentIndex };
+  $("segmentEditTitle").value = segment.title || "";
+  const currentType = segment.content_type || "";
+  const currentOption = $("segmentEditContentTypeCurrent");
+  if (CONTENT_TYPES.includes(currentType)) {
+    currentOption.textContent = "保持当前值";
+    $("segmentEditContentType").value = currentType;
+  } else {
+    currentOption.textContent = `保持当前（${currentType || "未填写"}）`;
+    $("segmentEditContentType").value = "";
+  }
+  $("segmentEditIgnored").checked = Boolean(segment.ignored);
+  $("segmentEditError").hidden = true;
+  $("segmentEditDialog").showModal();
+}
+
+async function submitSegmentEdit(event) {
+  event.preventDefault();
+  const target = state.segmentEditTarget;
+  const jobId = state.selectedJobId;
+  if (!target || !jobId) return;
+  const submit = $("submitSegmentEditButton");
+  submit.disabled = true;
+  submit.textContent = "保存中";
+  try {
+    const payload = {
+      title: $("segmentEditTitle").value,
+      ignored: $("segmentEditIgnored").checked
+    };
+    if ($("segmentEditContentType").value) {
+      payload.contentType = $("segmentEditContentType").value;
+    }
+    const updated = await api(`/api/jobs/${jobId}/segments/${target.id}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload)
+    });
+    const index = state.segments.findIndex((segment) => segment.id === updated.id);
+    if (index >= 0) state.segments[index] = updated;
+    if (state.previewUrl && updated.segment_url === state.previewUrl) {
+      $("previewTitle").textContent = updated.title || `片段 ${index + 1}`;
+    }
+    $("segmentEditDialog").close();
+    state.segmentEditTarget = null;
+    renderSegments();
+    showToast(updated.ignored ? "拆条结果已标记为忽略" : "拆条结果已保存");
+  } catch (error) {
+    $("segmentEditError").textContent = error.message;
+    $("segmentEditError").hidden = false;
+  } finally {
+    submit.disabled = false;
+    submit.textContent = "保存";
+  }
+}
+
+function exportDetailValue(value, kind = "text") {
+  const textValue = String(value ?? "");
+  if (!textValue) return '<span class="muted">（空）</span>';
+  if (kind === "link" && /^https?:\/\//i.test(textValue)) {
+    return `<a class="external-link" href="${escapeHtml(textValue)}" target="_blank" rel="noreferrer">${escapeHtml(textValue)}</a>`;
+  }
+  return escapeHtml(textValue);
+}
+
+function openSegmentDetail(segmentIndex) {
+  const segment = state.segments[segmentIndex];
+  const job = state.detail?.job;
+  if (!segment || !job) return;
+  const keywords = (segment.keywords || []).join(", ");
+  const exportDate = String(segment.absolute_start || "").match(/^(\d{4}-\d{2}-\d{2})/)?.[1] || job.broadcast_date || "";
+  const unmapped = "无映射（留空）";
+  const fields = [
+    ["节目ID", unmapped, ""],
+    ["program_name", "标题（最终值）", segment.title || ""],
+    ["关键字", "关键词", keywords],
+    ["摘要", "摘要", segment.summary || ""],
+    ["channel_name", "频道名", job.channel_name || ""],
+    ["begin_time", "实际开始时间", segment.absolute_start ? formatRealTime(segment.absolute_start) : "", "mono"],
+    ["end_time", "实际结束时间", segment.absolute_end ? formatRealTime(segment.absolute_end) : "", "mono"],
+    ["日期", "实际开始日期；无可靠时间时回退业务日期", exportDate, "mono"],
+    ["类型1", "节目类型（最终值）", segment.content_type || ""],
+    ["类型2", "新闻事件类型", segment.news_event_type || ""],
+    ["节目是否首播", unmapped, ""],
+    ["内容是否首播", unmapped, ""],
+    ["是否栏目", unmapped, ""],
+    ["栏目名称", unmapped, ""],
+    ["节目", unmapped, ""],
+    ["集数", unmapped, ""],
+    ["是否黄金时段", unmapped, ""],
+    ["是否国产", unmapped, ""],
+    ["是否收官", unmapped, ""],
+    ["标签", unmapped, ""],
+    ["是否含广告", unmapped, ""],
+    ["处理方式", unmapped, ""],
+    ["改后节目名称", unmapped, ""],
+    ["改后开始时间", unmapped, ""],
+    ["改后结束时间", unmapped, ""],
+    ["改后日期", unmapped, ""],
+    ["改后类型1", unmapped, ""],
+    ["改后类型2", unmapped, ""],
+    ["改后节目是否首播", unmapped, ""],
+    ["改后内容是否首播", unmapped, ""],
+    ["改后是否栏目", unmapped, ""],
+    ["改后栏目名称", unmapped, ""],
+    ["改后节目", unmapped, ""],
+    ["改后集数", unmapped, ""],
+    ["改后是否黄金时段", unmapped, ""],
+    ["改后是否国产", unmapped, ""],
+    ["改后是否收官", unmapped, ""],
+    ["改后标签", unmapped, ""],
+    ["是否合并", unmapped, ""],
+    ["是否拆条", unmapped, ""],
+    ["改后节目曾用名", unmapped, ""],
+    ["是否立即", unmapped, ""]
+  ];
+  const eligible = Boolean(segment.accepted && !segment.ignored && job.channel_id && job.broadcast_date);
+  let eligibilityText = "该片段会随频道 Excel 导出。";
+  if (!segment.accepted) eligibilityText = "该片段不是最终采用结果，不会导出。";
+  else if (segment.ignored) eligibilityText = "该片段已标记为忽略，不会导出。";
+  else if (!job.channel_id || !job.broadcast_date) eligibilityText = "作业缺少频道或业务日期，不会导出。";
+  $("segmentDetailTitle").textContent = segment.title || `片段 ${segmentIndex + 1}`;
+  $("segmentExportEligibility").textContent = eligibilityText;
+  $("segmentExportEligibility").className = `export-eligibility ${eligible ? "is-exported" : "is-excluded"}`;
+  $("segmentExportDetailGrid").innerHTML = fields.map(([excelField, systemField, value, kind]) => `
+    <tr>
+      <td>${escapeHtml(excelField)}</td>
+      <td class="mapping-source${systemField === unmapped ? " is-unmapped" : ""}">${escapeHtml(systemField)}</td>
+      <td class="${kind === "mono" ? "mono" : ""}">${exportDetailValue(value, kind)}</td>
+    </tr>`).join("");
+  $("segmentDetailDialog").showModal();
 }
 
 function previewSegment(segmentIndex) {
@@ -588,12 +756,27 @@ $("closeChannelsButton").addEventListener("click", () => $("channelsDialog").clo
 $("doneChannelsButton").addEventListener("click", () => $("channelsDialog").close());
 $("closeResplitButton").addEventListener("click", () => $("resplitDialog").close());
 $("cancelResplitButton").addEventListener("click", () => $("resplitDialog").close());
+$("closeSegmentEditButton").addEventListener("click", () => $("segmentEditDialog").close());
+$("cancelSegmentEditButton").addEventListener("click", () => $("segmentEditDialog").close());
+$("closeSegmentDetailButton").addEventListener("click", () => $("segmentDetailDialog").close());
+$("doneSegmentDetailButton").addEventListener("click", () => $("segmentDetailDialog").close());
 $("closePreviewButton").addEventListener("click", resetPreview);
 $("segmentsBody").addEventListener("click", (event) => {
+  const detailButton = event.target.closest(".segment-detail");
+  if (detailButton) {
+    openSegmentDetail(Number(detailButton.dataset.segmentIndex));
+    return;
+  }
+  const editButton = event.target.closest(".edit-segment");
+  if (editButton) {
+    openSegmentEdit(Number(editButton.dataset.segmentIndex));
+    return;
+  }
   const row = event.target.closest(".segment-row.is-previewable");
   if (row) previewSegment(Number(row.dataset.segmentIndex));
 });
 $("segmentsBody").addEventListener("keydown", (event) => {
+  if (event.target.closest("button")) return;
   const row = event.target.closest(".segment-row.is-previewable");
   if (row && (event.key === "Enter" || event.key === " ")) {
     event.preventDefault();
@@ -629,6 +812,7 @@ $("previewVideo").addEventListener("error", () => {
 $("createForm").addEventListener("submit", submitCreate);
 $("channelCreateForm").addEventListener("submit", submitChannel);
 $("resplitForm").addEventListener("submit", submitResplit);
+$("segmentEditForm").addEventListener("submit", submitSegmentEdit);
 $("refreshButton").addEventListener("click", () => loadJobs().catch((error) => showToast(error.message)));
 $("saveTimeReferenceButton").addEventListener("click", saveTimeReference);
 $("summaryRealTime").addEventListener("keydown", (event) => {

@@ -89,6 +89,8 @@ input:focus, select:focus { outline: 2px solid #8cc4b3; outline-offset: 1px; }
 .data-table tbody tr:hover { background: #f6faf8; }
 .data-table.compact th, .data-table.compact td { padding: 8px 10px; }
 .actions-column { width: 90px; }
+.reviewed-column, .reviewed-cell { width: 74px; min-width: 74px; text-align: center !important; }
+.review-checkbox { width: 18px; min-height: 18px; margin: 0; vertical-align: middle; accent-color: #176b57; }
 .filename { max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
 .mono { font-family: Consolas, "Courier New", monospace; }
 .muted { color: #737b75; }
@@ -104,6 +106,7 @@ input:focus, select:focus { outline: 2px solid #8cc4b3; outline-offset: 1px; }
 .mini-progress > span, .progress-value { height: 100%; display: block; background: #23836d; transition: width .2s ease; }
 .task-progress-cell { min-width: 245px; display: flex; flex-direction: column; gap: 5px; }
 .window-task-id { max-width: 245px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.window-submitted-at { min-width: 150px; white-space: nowrap; font-size: 12px; }
 .task-progress-meta { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
 .task-progress-meta .mini-progress { width: 105px; margin-right: 0; }
 .task-progress-meta strong { min-width: 34px; font-size: 12px; }
@@ -134,6 +137,8 @@ dialog::backdrop { background: #1c252180; }
 .form-grid { padding: 20px; display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
 .form-grid label { display: flex; flex-direction: column; gap: 6px; color: #4f5751; font-size: 12px; }
 .form-grid label.full { grid-column: 1 / -1; }
+.form-grid label.checkbox-field { min-height: 36px; flex-direction: row; align-items: center; gap: 8px; }
+.checkbox-field input { width: 18px; min-height: 18px; margin: 0; }
 .dialog-actions { padding: 14px 20px; border-top: 1px solid #dfe3df; display: flex; justify-content: flex-end; gap: 8px; }
 .form-error { margin: 0 20px 14px; color: #a52e21; }
 .confirm-dialog { width: min(560px, calc(100vw - 28px)); }
@@ -173,6 +178,8 @@ dialog::backdrop { background: #1c252180; }
 .window-table-scroll { flex: 1; border: 0; }
 .window-table { min-width: 900px; }
 .window-table th, .window-table td { padding: 7px 8px; }
+.data-table tbody tr.window-row.is-latest-submitted, .data-table tbody tr.window-row.is-latest-submitted:hover { background: #fff4cf; box-shadow: inset 4px 0 #c88a12; }
+.window-row.is-latest-submitted .window-submitted-at { color: #765000; font-weight: 700; }
 .preview-label { display: block; margin-bottom: 4px; color: #727a74; font-size: 11px; }
 .preview-status { min-height: 22px; padding-top: 9px; color: #d5d9d6; font-size: 12px; }
 .preview-status.ready { color: #9bd6c4; }
@@ -181,15 +188,38 @@ dialog::backdrop { background: #1c252180; }
 .preview-time { color: #626a64; font-family: Consolas, "Courier New", monospace; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .preview-actions { flex: 0 0 auto; }
 .segments-table td.mono { white-space: nowrap; }
+.segments-table th:first-child, .segments-table td:first-child { width: 48px; min-width: 48px; max-width: 48px; text-align: center; white-space: nowrap; }
 .segment-time-stack { display: flex; flex-direction: column; gap: 2px; line-height: 1.2; }
 .segments-table .segment-title, .segments-table .segment-keywords { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .segments-table .segment-title { max-width: 280px; font-weight: 600; }
 .segments-table .segment-keywords { max-width: 320px; }
 .segments-table .segment-content-type, .segments-table .segment-news-event-type, .segments-table .segment-topic { white-space: nowrap; }
+.segment-actions { display: inline-flex; gap: 5px; white-space: nowrap; }
+.segments-table .edit-segment, .segments-table .segment-detail { min-width: 50px; }
+.segments-table th:last-child, .segments-table td:last-child { position: sticky; right: 0; box-shadow: -1px 0 #dfe3df; }
+.segments-table th:last-child { background: #f5f7f5; }
+.segments-table td:last-child { background: #ffffff; }
 .segment-row.is-previewable { cursor: pointer; }
+.data-table tbody tr.segment-row.is-ignored, .data-table tbody tr.segment-row.is-ignored:hover { background: #f1f2f0; color: #6b726d; }
+.data-table tbody tr.segment-row:hover td:last-child { background: #f6faf8; }
+.data-table tbody tr.segment-row.is-ignored td:last-child, .data-table tbody tr.segment-row.is-ignored:hover td:last-child { background: #f1f2f0; }
+.segment-row.is-ignored .segment-title { font-weight: 500; }
 .segment-row.is-previewable:focus { outline: 2px solid #23836d; outline-offset: -2px; }
 .data-table tbody tr.segment-row.is-active, .data-table tbody tr.segment-row.is-active:hover { background: #e3f4ec; box-shadow: inset 3px 0 #23836d; }
 .empty-table-row { padding: 24px !important; text-align: center !important; color: #737b75; }
+.segment-detail-dialog { width: min(1080px, calc(100vw - 28px)); }
+.segment-detail-body { max-height: min(68vh, 720px); padding: 18px 20px 22px; overflow-y: auto; }
+.export-eligibility { margin-bottom: 14px; padding: 10px 12px; border-left: 4px solid; font-weight: 650; }
+.export-eligibility.is-exported { color: #176b57; background: #eaf7f1; border-color: #23836d; }
+.export-eligibility.is-excluded { color: #875200; background: #fff5dd; border-color: #d69a25; }
+.export-mapping-scroll { max-height: min(58vh, 610px); border: 1px solid #dfe3df; }
+.export-mapping-table { min-width: 760px; table-layout: fixed; }
+.export-mapping-table th { position: sticky; top: 0; z-index: 1; background: #f5f7f5; }
+.export-mapping-table th:nth-child(1), .export-mapping-table td:nth-child(1) { width: 180px; }
+.export-mapping-table th:nth-child(2), .export-mapping-table td:nth-child(2) { width: 290px; }
+.export-mapping-table td { vertical-align: top; white-space: pre-wrap; overflow-wrap: anywhere; }
+.export-mapping-table .mapping-source { color: #34483f; font-weight: 600; }
+.export-mapping-table .mapping-source.is-unmapped { color: #828984; font-weight: 400; }
 .toast { position: fixed; right: 20px; bottom: 20px; max-width: min(420px, calc(100vw - 40px)); padding: 11px 14px; color: #ffffff; background: #303732; border-radius: 6px; box-shadow: 0 8px 24px #0003; z-index: 20; }
 
 @media (max-width: 1000px) {

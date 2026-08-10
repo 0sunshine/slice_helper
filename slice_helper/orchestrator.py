@@ -429,12 +429,14 @@ class Orchestrator:
             )
             await islice_client.delete_task(task_id)
             existing = await islice_client.ensure_task(task_id, request)
+            submitted_at = utc_now()
             service_status, service_progress = self._task_progress(existing)
             await self.database.update_attempt(
                 attempt["id"],
                 status="resplitting",
                 service_status=service_status,
                 progress=service_progress,
+                submitted_at=submitted_at,
             )
             await self.database.update_window(
                 window["id"], status=WindowStatus.POLLING.value
@@ -790,12 +792,17 @@ class Orchestrator:
                 existing = await islice_client.ensure_task(attempt["task_id"], request)
                 await self._raise_if_control_requested(job_id)
                 service_status, service_progress = self._task_progress(existing)
+                attempt_fields: dict[str, Any] = {
+                    "status": "polling",
+                    "service_status": service_status,
+                    "progress": service_progress,
+                    "error_message": "",
+                }
+                if not attempt.get("submitted_at"):
+                    attempt_fields["submitted_at"] = utc_now()
                 await self.database.update_attempt(
                     attempt["id"],
-                    status="polling",
-                    service_status=service_status,
-                    progress=service_progress,
-                    error_message="",
+                    **attempt_fields,
                 )
                 await self.database.update_window(
                     window["id"], status=WindowStatus.POLLING.value
@@ -1224,10 +1231,11 @@ class Orchestrator:
         segments = await self.database.get_segments(job_id)
         for segment in segments:
             segment["accepted"] = bool(segment["accepted"])
+            segment["ignored"] = bool(segment["ignored"])
             segment["keywords"] = json.loads(segment.pop("keywords_json"))
             segment["raw"] = json.loads(segment.pop("raw_json"))
         manifest = {
-            "schemaVersion": 4,
+            "schemaVersion": 5,
             "generatedAt": utc_now(),
             "externalMediaMayExpire": True,
             "job": {
@@ -1246,6 +1254,7 @@ class Orchestrator:
         payload = dict(job)
         payload["pause_requested"] = bool(payload["pause_requested"])
         payload["stop_requested"] = bool(payload["stop_requested"])
+        payload["reviewed"] = bool(payload.get("reviewed"))
         payload["warnings"] = json.loads(payload.pop("warnings_json") or "[]")
         return payload
 

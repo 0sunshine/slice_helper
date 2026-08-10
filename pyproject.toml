@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slice-helper"
-version = "0.7.0"
+version = "0.11.1"
 description = "Continuous TS window orchestrator for iSlice"
 requires-python = ">=3.11"
 dependencies = [
@@ -16,7 +16,7 @@ dependencies = [
   "python-dotenv>=1,<2",
   "rapidocr-onnxruntime>=1.4,<2",
   "uvicorn[standard]>=0.30,<1",
-  "XlsxWriter>=3.2,<4",
+  "openpyxl>=3.1,<4",
 ]
 
 [project.optional-dependencies]
@@ -27,6 +27,9 @@ dev = [
 
 [tool.setuptools.packages.find]
 include = ["slice_helper*"]
+
+[tool.setuptools.package-data]
+slice_helper = ["static/*", "templates/*.html", "templates/*.xlsx"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -461,13 +461,15 @@ async def test_two_window_job_hands_tail_to_next_window(tmp_path: Path) -> None:
     assert [item["accepted"] for item in segments] == [1, 0, 1, 1]
     assert segments[2]["global_start"] == 3500
     assert [item["content_type"] for item in segments] == ["新闻", "广告", "广告", "电视剧"]
+    assert all(item["submitted_at"] for item in await database.get_attempts_for_job("abc123"))
     manifest = json.loads(
         (configured.data_dir / "jobs" / "abc123" / "result.json").read_text(encoding="utf-8")
     )
-    assert manifest["schemaVersion"] == 4
+    assert manifest["schemaVersion"] == 5
     assert manifest["job"]["status"] == "completed"
     assert len(manifest["segments"]) == 4
     assert manifest["segments"][0]["content_type"] == "新闻"
+    assert manifest["segments"][0]["ignored"] is False
     assert not list(configured.temp_dir.rglob("*.ts"))
 
 
@@ -697,6 +699,8 @@ async def test_manual_resplit_reuses_task_id_and_replaces_window_results(
     attempts_before = await database.get_attempts(window["id"])
     assert len(attempts_before) == 1
     task_id = attempts_before[0]["task_id"]
+    first_submitted_at = attempts_before[0]["submitted_at"]
+    assert first_submitted_at
     assert not Path(window["chunk_path"]).exists()
     assert {item["title"] for item in await database.get_segments("abc123")} == {
         "first",
@@ -717,6 +721,7 @@ async def test_manual_resplit_reuses_task_id_and_replaces_window_results(
     assert len(attempts_after) == 1
     assert attempts_after[0]["task_id"] == task_id
     assert attempts_after[0]["status"] == "completed"
+    assert attempts_after[0]["submitted_at"] > first_submitted_at
     segments = await database.get_segments("abc123")
     assert [item["title"] for item in segments] == ["replacement"]
     assert (await database.get_job("abc123"))["status"] == "completed"

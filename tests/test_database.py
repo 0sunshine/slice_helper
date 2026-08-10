@@ -35,7 +35,7 @@ async def test_database_persists_and_recovers_jobs(tmp_path: Path) -> None:
 
     async with database.connect() as db:
         versions = await (await db.execute("SELECT version FROM schema_version ORDER BY version")).fetchall()
-    assert [row["version"] for row in versions] == list(range(1, 13))
+    assert [row["version"] for row in versions] == list(range(1, 16))
     async with database.connect() as db:
         segment_columns = {
             row["name"]
@@ -45,12 +45,21 @@ async def test_database_persists_and_recovers_jobs(tmp_path: Path) -> None:
     assert "news_event_type" in segment_columns
     assert "attempt_id" in segment_columns
     assert "task_id" in segment_columns
+    assert "ignored" in segment_columns
+    async with database.connect() as db:
+        attempt_columns = {
+            row["name"]
+            for row in await (await db.execute("PRAGMA table_info(attempts)")).fetchall()
+        }
+    assert "submitted_at" in attempt_columns
     async with database.connect() as db:
         job_columns = {
             row["name"]
             for row in await (await db.execute("PRAGMA table_info(jobs)")).fetchall()
         }
     assert "time_reference_frame_offset" in job_columns
+    assert "reviewed" in job_columns
+    assert recovered["reviewed"] == 0
     assert recovered["islice_base_url"] == ""
     assert recovered["source_url"] == ""
 
@@ -61,6 +70,7 @@ async def test_database_persists_and_recovers_jobs(tmp_path: Path) -> None:
     attempt = await database.create_attempt(window["id"], 1, "legacy-task")
     assert attempt["service_status"] == ""
     assert attempt["progress"] == 0
+    assert attempt["submitted_at"] == ""
     await database.assign_legacy_jobs_with_attempts("http://islice-a.test/")
     assert (await database.get_job("job1"))["islice_base_url"] == "http://islice-a.test"
 

@@ -61,6 +61,7 @@ class Database:
         "time_reference_frame_path",
         "time_reference_frame_offset",
         "time_reference_error",
+        "reviewed",
     }
     WINDOW_FIELDS = {
         "requested_start",
@@ -77,6 +78,7 @@ class Database:
         "progress",
         "raw_response_path",
         "error_message",
+        "submitted_at",
         "finished_at",
     }
 
@@ -141,6 +143,7 @@ class Database:
                     total_windows INTEGER NOT NULL,
                     pause_requested INTEGER NOT NULL DEFAULT 0,
                     stop_requested INTEGER NOT NULL DEFAULT 0,
+                    reviewed INTEGER NOT NULL DEFAULT 0,
                     error_message TEXT NOT NULL DEFAULT '',
                     warnings_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
@@ -181,6 +184,7 @@ class Database:
                     raw_response_path TEXT NOT NULL DEFAULT '',
                     error_message TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
+                    submitted_at TEXT NOT NULL DEFAULT '',
                     finished_at TEXT,
                     UNIQUE(window_id, attempt_no)
                 );
@@ -191,6 +195,7 @@ class Database:
                     window_id INTEGER NOT NULL REFERENCES windows(id) ON DELETE CASCADE,
                     source_index INTEGER NOT NULL,
                     accepted INTEGER NOT NULL,
+                    ignored INTEGER NOT NULL DEFAULT 0,
                     reason TEXT NOT NULL DEFAULT '',
                     local_start REAL NOT NULL,
                     local_end REAL NOT NULL,
@@ -236,6 +241,7 @@ class Database:
                 "broadcast_date": "TEXT",
                 "superseded_at": "TEXT",
                 "superseded_by_job_id": "TEXT",
+                "reviewed": "INTEGER NOT NULL DEFAULT 0",
             }
             for column, declaration in migrations.items():
                 if column not in job_columns:
@@ -266,10 +272,16 @@ class Database:
             attempt_migrations = {
                 "service_status": "TEXT NOT NULL DEFAULT ''",
                 "progress": "REAL NOT NULL DEFAULT 0",
+                "submitted_at": "TEXT NOT NULL DEFAULT ''",
             }
+            needs_submitted_at_backfill = "submitted_at" not in attempt_columns
             for column, declaration in attempt_migrations.items():
                 if column not in attempt_columns:
                     await db.execute(f"ALTER TABLE attempts ADD COLUMN {column} {declaration}")
+            if needs_submitted_at_backfill:
+                await db.execute(
+                    "UPDATE attempts SET submitted_at=created_at WHERE submitted_at=''"
+                )
             await db.execute(
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(5, ?)",
                 (utc_now(),),
@@ -399,6 +411,10 @@ class Database:
                 await db.execute(
                     "ALTER TABLE segments ADD COLUMN task_id TEXT NOT NULL DEFAULT ''"
                 )
+            if "ignored" not in segment_columns:
+                await db.execute(
+                    "ALTER TABLE segments ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0"
+                )
             await db.execute(
                 """
                 UPDATE segments
@@ -423,6 +439,18 @@ class Database:
             )
             await db.execute(
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(12, ?)",
+                (utc_now(),),
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(13, ?)",
+                (utc_now(),),
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(14, ?)",
+                (utc_now(),),
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(15, ?)",
                 (utc_now(),),
             )
             await db.commit()
@@ -751,7 +779,7 @@ class Database:
                     JOIN windows w ON w.id=s.window_id
                     JOIN jobs j ON j.id=s.job_id
                     WHERE j.channel_id=? AND j.superseded_at IS NULL
-                      AND j.broadcast_date IS NOT NULL AND s.accepted=1
+                      AND j.broadcast_date IS NOT NULL AND s.accepted=1 AND s.ignored=0
                     ORDER BY j.broadcast_date,
                              CASE WHEN s.absolute_start IS NULL THEN 1 ELSE 0 END,
                              s.absolute_start, s.global_start, s.id
@@ -1104,6 +1132,35 @@ class Database:
         async with self.connect() as db:
             rows = await (await db.execute(query, params)).fetchall()
         return [dict(row) for row in rows]
+
+    async def update_segment(
+        self, job_id: str, segment_id: int, **fields: Any
+    ) -> dict[str, Any] | None:
+        allowed = {"title", "content_type", "ignored"}
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"Unknown segment fields: {sorted(unknown)}")
+        if not fields:
+            return None
+        assignments = ", ".join(f"{key}=?" for key in fields)
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                f"UPDATE segments SET {assignments} WHERE id=? AND job_id=?",
+                (*fields.values(), segment_id, job_id),
+            )
+            if cursor.rowcount == 0:
+                await db.rollback()
+                return None
+            updated = await (
+                await db.execute(
+                    "SELECT s.*, w.window_index FROM segments s "
+                    "JOIN windows w ON w.id=s.window_id WHERE s.id=?",
+                    (segment_id,),
+                )
+            ).fetchone()
+            await db.commit()
+        return self._row(updated)
 
     async def get_attempts_for_job(self, job_id: str) -> list[dict[str, Any]]:
         async with self.connect() as db:

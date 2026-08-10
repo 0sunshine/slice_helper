@@ -6,11 +6,13 @@ import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import openpyxl
 from fastapi.testclient import TestClient
 
 from slice_helper.app import create_app
 from slice_helper.config import Settings
 from slice_helper.database import Database
+from slice_helper.excel_export import HEADERS, TEMPLATE_PATH
 from slice_helper.media import MediaError
 from slice_helper.models import MediaProbe
 from slice_helper.orchestrator import Orchestrator
@@ -124,17 +126,40 @@ def test_job_api_control_and_database_backed_chunk_route(
         assert 'class="window-timeline-panel"' in home.text
         assert 'id="resplitDialog"' in home.text
         assert 'id="resplitForm"' in home.text
+        assert 'id="segmentEditDialog"' in home.text
+        assert 'id="segmentEditForm"' in home.text
+        assert 'id="segmentDetailDialog"' in home.text
+        assert 'id="segmentExportDetailGrid"' in home.text
+        assert "Excel 字段" in home.text
+        assert "对应系统字段" in home.text
+        assert "本条导出值" in home.text
         assert "确认重新拆分" in home.text
         assert "<th>操作</th>" in home.text
         assert "小任务进度" in home.text
+        assert "下发时间" in home.text
+        assert "<th>源偏移</th>" not in home.text
+        assert "<th>窗口</th>" in home.text
         assert "<th>节目类型</th>" in home.text
         assert "<th>新闻事件</th>" in home.text
+        assert "已审核" in home.text
+        for content_type in (
+            "新闻", "电视剧", "电影", "综艺", "少儿", "体育", "纪录片",
+            "科教", "文艺", "生活服务", "商业广告", "公益广告", "电视购物", "其他",
+        ):
+            assert f'<option value="{content_type}">{content_type}</option>' in home.text
         assert 'id="summaryISlice"' in home.text
-        assert "/static/styles.css?v=0.7.0" in home.text
-        assert "/static/app.js?v=0.7.0" in home.text
+        assert "/static/styles.css?v=0.11.1" in home.text
+        assert "/static/app.js?v=0.11.1" in home.text
         assert "TS 路径或 HTTP 地址" in home.text
         assert 'id="manageChannelsButton"' in home.text
         assert 'id="jobPageInfo"' in home.text
+        app_js = client.get("/static/app.js")
+        styles_css = client.get("/static/styles.css")
+        assert app_js.status_code == 200
+        assert styles_css.status_code == 200
+        assert "is-latest-submitted" in app_js.text
+        assert "is-latest-submitted" in styles_css.text
+        assert "width: 48px" in styles_css.text
 
         channel_id = create_channel(client)
 
@@ -156,6 +181,14 @@ def test_job_api_control_and_database_backed_chunk_route(
         assert job["status"] == "pending_schedule"
         assert job["islice_base_url"] == ""
         assert job["channel_name"] == "测试频道"
+        assert job["reviewed"] is False
+
+        reviewed = client.patch(f"/api/jobs/{job_id}/review", json={"reviewed": True})
+        assert reviewed.status_code == 200
+        assert reviewed.json()["reviewed"] is True
+        assert client.get(f"/api/jobs/{job_id}").json()["job"]["reviewed"] is True
+        assert client.get(f"/api/jobs/{job_id}/result").json()["job"]["reviewed"] is True
+        assert client.patch("/api/jobs/missing/review", json={"reviewed": True}).status_code == 404
         assert job["broadcast_date"] == "2026-06-20"
         assert job["program_start_time"] == "2026-06-20T12:29:59"
         assert job["time_reference_source"] == "ocr"
@@ -688,6 +721,41 @@ def test_channel_date_overwrite_pagination_and_excel_export(
             )
 
         asyncio.run(add_results())
+        accepted_segment = client.get(
+            f"/api/jobs/{replacement_id}/segments", params={"acceptedOnly": True}
+        ).json()[0]
+        assert accepted_segment["ignored"] is False
+        edited = client.patch(
+            f"/api/jobs/{replacement_id}/segments/{accepted_segment['id']}",
+            json={
+                "title": "手工修改标题",
+                "contentType": "纪录片",
+                "ignored": True,
+            },
+        )
+        assert edited.status_code == 200
+        assert edited.json()["title"] == "手工修改标题"
+        assert edited.json()["content_type"] == "纪录片"
+        assert edited.json()["ignored"] is True
+        assert client.patch(
+            f"/api/jobs/{replacement_id}/segments/{accepted_segment['id']}",
+            json={"contentType": "专题"},
+        ).status_code == 422
+        assert client.patch(
+            f"/api/jobs/{replacement_id}/segments/{accepted_segment['id']}", json={}
+        ).status_code == 422
+        assert client.patch(
+            f"/api/jobs/{replacement_id}/segments/999999", json={"ignored": True}
+        ).status_code == 404
+        manifest = client.get(f"/api/jobs/{replacement_id}/result").json()
+        manifest_segment = next(
+            item for item in manifest["segments"] if item["id"] == accepted_segment["id"]
+        )
+        assert manifest["schemaVersion"] == 5
+        assert manifest_segment["title"] == "手工修改标题"
+        assert manifest_segment["content_type"] == "纪录片"
+        assert manifest_segment["ignored"] is True
+
         second_date = client.post(
             "/api/jobs",
             json={
@@ -710,22 +778,76 @@ def test_channel_date_overwrite_pagination_and_excel_export(
         assert filtered["total"] == 1
         assert filtered["items"][0]["id"] == replacement_id
 
+        ignored_export = client.get(f"/api/channels/{channel_id}/export.xlsx")
+        ignored_workbook = openpyxl.load_workbook(io.BytesIO(ignored_export.content))
+        ignored_values = [
+            cell.value
+            for sheet in ignored_workbook.worksheets
+            for row in sheet.iter_rows()
+            for cell in row
+        ]
+        assert "手工修改标题" not in ignored_values
+        assert "界面未显示的完整摘要" not in ignored_values
+
+        restored = client.patch(
+            f"/api/jobs/{replacement_id}/segments/{accepted_segment['id']}",
+            json={"ignored": False},
+        )
+        assert restored.status_code == 200
+        assert restored.json()["ignored"] is False
+
         exported = client.get(f"/api/channels/{channel_id}/export.xlsx")
         assert exported.status_code == 200
         assert exported.headers["content-type"].startswith(
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-        with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
-            workbook_xml = archive.read("xl/workbook.xml").decode("utf-8")
-            shared_strings = archive.read("xl/sharedStrings.xml").decode("utf-8")
-            first_sheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
-        assert "2026-06-20" in workbook_xml
-        assert "2026-06-21" in workbook_xml
-        assert "最终采用标题" in shared_strings
-        assert "界面未显示的完整摘要" in shared_strings
-        assert "task-export-1" in shared_strings
-        assert "不应导出的舍弃标题" not in shared_strings
-        assert "IF(AND(D2" in first_sheet
+        exported_workbook = openpyxl.load_workbook(io.BytesIO(exported.content))
+        assert exported_workbook.sheetnames == ["2026-06-20", "2026-06-21"]
+        first_sheet = exported_workbook["2026-06-20"]
+        assert tuple(cell.value for cell in first_sheet[1][:42]) == HEADERS
+        assert first_sheet["B2"].value == "手工修改标题"
+        assert first_sheet["C2"].value == "关键词一, 关键词二"
+        assert first_sheet["D2"].value == "界面未显示的完整摘要"
+        assert first_sheet["E2"].value == "测试频道"
+        assert first_sheet["F2"].value == datetime(2026, 6, 20, 0, 0, 0)
+        assert first_sheet["G2"].value == datetime(2026, 6, 20, 0, 0, 30)
+        assert first_sheet["H2"].value == datetime(2026, 6, 20, 0, 0, 0)
+        assert first_sheet["I2"].value == "纪录片"
+        assert first_sheet["J2"].value == "时政要闻"
+        assert first_sheet["T2"].value is None
+        assert first_sheet["V2"].value is None
+        exported_values = [cell.value for row in first_sheet.iter_rows() for cell in row]
+        assert "task-export-1" not in exported_values
+        assert "http://media.test/accepted.mp4" not in exported_values
+        assert "时政" not in exported_values
+        assert "不应导出的舍弃标题" not in exported_values
+        assert first_sheet.auto_filter.ref == "A1:AP2"
+        assert all(cell.data_type != "f" for row in first_sheet.iter_rows() for cell in row)
+
+        style_template = openpyxl.load_workbook(TEMPLATE_PATH).active
+        assert first_sheet.freeze_panes == style_template.freeze_panes == "O2"
+        assert first_sheet.row_dimensions[1].height == style_template.row_dimensions[1].height == 45
+        for column in ("A", "B", "F", "H", "U", "V", "AP"):
+            assert (
+                first_sheet.column_dimensions[column].width
+                == style_template.column_dimensions[column].width
+            )
+        for column in range(1, 43):
+            assert first_sheet.cell(1, column)._style == style_template.cell(1, column)._style
+            assert first_sheet.cell(2, column)._style == style_template.cell(2, column)._style
+            assert (
+                exported_workbook["2026-06-21"].cell(1, column)._style
+                == style_template.cell(1, column)._style
+            )
+            assert (
+                exported_workbook["2026-06-21"].cell(2, column)._style
+                == style_template.cell(2, column)._style
+            )
+
+        app_js = client.get("/static/app.js").text
+        assert '["类型2", "新闻事件类型", segment.news_event_type || ""]' in app_js
+        assert '["标签", unmapped, ""]' in app_js
+        assert '["视频链接"' not in app_js
 
         renamed = client.patch(
             f"/api/channels/{channel_id}", json={"name": "测试频道（新）"}

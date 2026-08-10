@@ -5,7 +5,25 @@ from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+CONTENT_TYPES = (
+    "新闻",
+    "电视剧",
+    "电影",
+    "综艺",
+    "少儿",
+    "体育",
+    "纪录片",
+    "科教",
+    "文艺",
+    "生活服务",
+    "商业广告",
+    "公益广告",
+    "电视购物",
+    "其他",
+)
 
 
 class JobStatus(StrEnum):
@@ -101,6 +119,34 @@ class TimeReferenceUpdate(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     program_start_time: datetime = Field(alias="programStartTime")
+
+
+class JobReviewUpdate(BaseModel):
+    reviewed: bool
+
+
+class SegmentUpdate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    title: str | None = Field(default=None, max_length=500)
+    content_type: str | None = Field(default=None, alias="contentType", max_length=100)
+    ignored: bool | None = None
+
+    @field_validator("title", "content_type")
+    @classmethod
+    def normalize_text(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
+
+    @model_validator(mode="after")
+    def require_update(self):
+        if not self.model_fields_set:
+            raise ValueError("At least one segment field must be supplied")
+        if (
+            "content_type" in self.model_fields_set
+            and self.content_type not in CONTENT_TYPES
+        ):
+            raise ValueError("节目类型必须从预设选项中选择")
+        return self
 
 
 class WindowResplitRequest(BaseModel):

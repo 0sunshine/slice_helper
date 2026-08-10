@@ -57,6 +57,7 @@
               <th>进度</th>
               <th>窗口</th>
               <th>结果片段</th>
+              <th class="reviewed-column">已审核</th>
               <th>创建时间</th>
               <th class="actions-column">操作</th>
             </tr>
@@ -140,7 +141,7 @@
           </div>
           <div class="table-scroll segments-table-scroll">
             <table class="data-table compact segments-table">
-              <thead><tr><th>源偏移</th><th>真实时间</th><th>标题</th><th>节目类型</th><th>新闻事件</th><th>主题</th><th>关键词</th><th>来源窗口</th><th>状态</th></tr></thead>
+              <thead><tr><th>窗口</th><th>真实时间</th><th>标题</th><th>节目类型</th><th>新闻事件</th><th>主题</th><th>关键词</th><th>状态</th><th>操作</th></tr></thead>
               <tbody id="segmentsBody"></tbody>
             </table>
           </div>
@@ -152,7 +153,7 @@
           </div>
           <div class="table-scroll window-table-scroll">
             <table class="data-table compact window-table">
-              <thead><tr><th>#</th><th>源起点</th><th>整点终点</th><th>状态</th><th>小任务进度</th><th>交接起点</th><th>错误</th><th>操作</th></tr></thead>
+              <thead><tr><th>#</th><th>源起点</th><th>整点终点</th><th>状态</th><th>小任务进度</th><th>下发时间</th><th>交接起点</th><th>错误</th><th>操作</th></tr></thead>
               <tbody id="windowsBody"></tbody>
             </table>
           </div>
@@ -220,6 +221,65 @@
         <button id="submitResplitButton" class="button danger" type="submit">确认重新拆分</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="segmentEditDialog" class="segment-edit-dialog">
+    <form id="segmentEditForm" method="dialog">
+      <div class="dialog-header">
+        <h2>编辑拆条结果</h2>
+        <button id="closeSegmentEditButton" class="icon-button" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="form-grid segment-edit-grid">
+        <label class="full">标题<input id="segmentEditTitle" maxlength="500"></label>
+        <label class="full">节目类型
+          <select id="segmentEditContentType">
+            <option id="segmentEditContentTypeCurrent" value="">保持当前值</option>
+            <option value="新闻">新闻</option>
+            <option value="电视剧">电视剧</option>
+            <option value="电影">电影</option>
+            <option value="综艺">综艺</option>
+            <option value="少儿">少儿</option>
+            <option value="体育">体育</option>
+            <option value="纪录片">纪录片</option>
+            <option value="科教">科教</option>
+            <option value="文艺">文艺</option>
+            <option value="生活服务">生活服务</option>
+            <option value="商业广告">商业广告</option>
+            <option value="公益广告">公益广告</option>
+            <option value="电视购物">电视购物</option>
+            <option value="其他">其他</option>
+          </select>
+        </label>
+        <label class="full checkbox-field"><input id="segmentEditIgnored" type="checkbox"> 忽略</label>
+      </div>
+      <p id="segmentEditError" class="form-error" hidden></p>
+      <div class="dialog-actions">
+        <button id="cancelSegmentEditButton" class="button secondary" type="button">取消</button>
+        <button id="submitSegmentEditButton" class="button primary" type="submit">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="segmentDetailDialog" class="segment-detail-dialog">
+    <div class="dialog-header">
+      <div>
+        <span class="preview-label">深度 EPG Excel 字段映射</span>
+        <h2 id="segmentDetailTitle">拆条详情</h2>
+      </div>
+      <button id="closeSegmentDetailButton" class="icon-button" type="button" aria-label="关闭详情">×</button>
+    </div>
+    <div class="segment-detail-body">
+      <p id="segmentExportEligibility" class="export-eligibility"></p>
+      <div class="table-scroll export-mapping-scroll">
+        <table class="data-table compact export-mapping-table">
+          <thead><tr><th>Excel 字段</th><th>对应系统字段</th><th>本条导出值</th></tr></thead>
+          <tbody id="segmentExportDetailGrid"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="dialog-actions">
+      <button id="doneSegmentDetailButton" class="button secondary" type="button">关闭</button>
+    </div>
   </dialog>
 
   <div id="toast" class="toast" hidden></div>

@@ -26,8 +26,10 @@ from .media import MediaError, MediaService
 from .models import (
     ChannelCreate,
     ChannelUpdate,
+    JobReviewUpdate,
     JobCreate,
     JobStatus,
+    SegmentUpdate,
     TimeReferenceUpdate,
     WindowResplitRequest,
 )
@@ -49,6 +51,7 @@ def _public_job(job: dict[str, Any]) -> dict[str, Any]:
     result = dict(job)
     result["pause_requested"] = bool(result.get("pause_requested"))
     result["stop_requested"] = bool(result.get("stop_requested"))
+    result["reviewed"] = bool(result.get("reviewed"))
     result["warnings"] = json.loads(result.pop("warnings_json", "[]") or "[]")
     result["accepted_segment_count"] = int(result.get("accepted_segment_count") or 0)
     result["window_count"] = int(result.get("window_count") or 0)
@@ -385,6 +388,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         attempts = await request.app.state.database.get_attempts_for_job(job_id)
         return {"job": _public_job(job), "windows": windows, "attempts": attempts}
 
+    @application.patch("/api/jobs/{job_id}/review")
+    async def update_job_review(
+        request: Request, job_id: str, body: JobReviewUpdate
+    ):
+        if not await request.app.state.database.get_job(job_id):
+            raise HTTPException(status_code=404, detail="Job not found")
+        await request.app.state.database.update_job(
+            job_id, reviewed=int(body.reviewed)
+        )
+        updated = await request.app.state.database.get_job(job_id)
+        await request.app.state.orchestrator.write_manifest(job_id)
+        return _public_job(updated)
+
     @application.get("/api/jobs/{job_id}/segments")
     async def get_segments(
         request: Request,
@@ -396,9 +412,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         rows = await request.app.state.database.get_segments(job_id, accepted_only=accepted_only)
         for row in rows:
             row["accepted"] = bool(row["accepted"])
+            row["ignored"] = bool(row["ignored"])
             row["keywords"] = json.loads(row.pop("keywords_json"))
             row["raw"] = json.loads(row.pop("raw_json"))
         return rows
+
+    @application.patch("/api/jobs/{job_id}/segments/{segment_id}")
+    async def update_segment(
+        request: Request, job_id: str, segment_id: int, body: SegmentUpdate
+    ):
+        fields: dict[str, Any] = {}
+        if "title" in body.model_fields_set:
+            fields["title"] = body.title or ""
+        if "content_type" in body.model_fields_set:
+            fields["content_type"] = body.content_type or ""
+        if "ignored" in body.model_fields_set:
+            fields["ignored"] = int(bool(body.ignored))
+        updated = await request.app.state.database.update_segment(
+            job_id, segment_id, **fields
+        )
+        if updated is None:
+            raise HTTPException(status_code=404, detail="Segment not found")
+        await request.app.state.orchestrator.write_manifest(job_id)
+        updated["accepted"] = bool(updated["accepted"])
+        updated["ignored"] = bool(updated["ignored"])
+        updated["keywords"] = json.loads(updated.pop("keywords_json"))
+        updated["raw"] = json.loads(updated.pop("raw_json"))
+        return updated
 
     @application.patch("/api/jobs/{job_id}/time-reference")
     async def update_job_time_reference(
