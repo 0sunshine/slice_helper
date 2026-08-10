@@ -1133,6 +1133,18 @@ class Database:
             rows = await (await db.execute(query, params)).fetchall()
         return [dict(row) for row in rows]
 
+    async def get_segment(self, job_id: str, segment_id: int) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            row = await (
+                await db.execute(
+                    "SELECT s.*, w.window_index FROM segments s "
+                    "JOIN windows w ON w.id=s.window_id "
+                    "WHERE s.id=? AND s.job_id=?",
+                    (segment_id, job_id),
+                )
+            ).fetchone()
+        return self._row(row)
+
     async def update_segment(
         self, job_id: str, segment_id: int, **fields: Any
     ) -> dict[str, Any] | None:

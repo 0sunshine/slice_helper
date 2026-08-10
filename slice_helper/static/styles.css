@@ -140,6 +140,8 @@ dialog::backdrop { background: #1c252180; }
 .form-grid label.checkbox-field { min-height: 36px; flex-direction: row; align-items: center; gap: 8px; }
 .checkbox-field input { width: 18px; min-height: 18px; margin: 0; }
 .dialog-actions { padding: 14px 20px; border-top: 1px solid #dfe3df; display: flex; justify-content: flex-end; gap: 8px; }
+.dialog-actions .restore-action { margin-right: auto; }
+.segment-restore-hint { margin: 0 20px 12px; }
 .form-error { margin: 0 20px 14px; color: #a52e21; }
 .confirm-dialog { width: min(560px, calc(100vw - 28px)); }
 .confirm-dialog-body { padding: 18px 20px; }

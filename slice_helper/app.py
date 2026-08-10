@@ -24,6 +24,7 @@ from .excel_export import build_channel_workbook, safe_export_filename
 from .islice import ISlicePool
 from .media import MediaError, MediaService
 from .models import (
+    CONTENT_TYPES,
     ChannelCreate,
     ChannelUpdate,
     JobReviewUpdate,
@@ -421,6 +422,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def update_segment(
         request: Request, job_id: str, segment_id: int, body: SegmentUpdate
     ):
+        existing = await request.app.state.database.get_segment(job_id, segment_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Segment not found")
+        if (
+            "content_type" in body.model_fields_set
+            and body.content_type not in CONTENT_TYPES
+        ):
+            try:
+                task_info = json.loads(existing.get("raw_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                task_info = {}
+            if not isinstance(task_info, dict):
+                task_info = {}
+            task_content_type = str(task_info.get("contentType") or "")
+            if not body.restored_from_task or body.content_type != task_content_type:
+                raise HTTPException(
+                    status_code=422,
+                    detail="节目类型必须从预设选项中选择",
+                )
         fields: dict[str, Any] = {}
         if "title" in body.model_fields_set:
             fields["title"] = body.title or ""
@@ -439,6 +459,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         updated["keywords"] = json.loads(updated.pop("keywords_json"))
         updated["raw"] = json.loads(updated.pop("raw_json"))
         return updated
+
+    @application.get("/api/jobs/{job_id}/segments/{segment_id}/task-values")
+    async def get_segment_task_values(
+        request: Request, job_id: str, segment_id: int
+    ):
+        segment = await request.app.state.database.get_segment(job_id, segment_id)
+        if segment is None:
+            raise HTTPException(status_code=404, detail="Segment not found")
+        try:
+            task_info = json.loads(segment.get("raw_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=409, detail="任务信息无法读取") from exc
+        if not isinstance(task_info, dict):
+            raise HTTPException(status_code=409, detail="任务信息无法读取")
+        if "title" not in task_info and "contentType" not in task_info:
+            raise HTTPException(status_code=409, detail="任务信息中没有可还原的内容")
+        return {
+            "title": str(task_info.get("title") or ""),
+            "contentType": str(task_info.get("contentType") or ""),
+        }
 
     @application.patch("/api/jobs/{job_id}/time-reference")
     async def update_job_time_reference(

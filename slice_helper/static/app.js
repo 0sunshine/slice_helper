@@ -368,10 +368,11 @@ function renderSegments() {
 function openSegmentEdit(segmentIndex) {
   const segment = state.segments[segmentIndex];
   if (!segment) return;
-  state.segmentEditTarget = { id: segment.id, index: segmentIndex };
+  state.segmentEditTarget = { id: segment.id, index: segmentIndex, restoredFromTask: false };
   $("segmentEditTitle").value = segment.title || "";
   const currentType = segment.content_type || "";
   const currentOption = $("segmentEditContentTypeCurrent");
+  currentOption.value = "";
   if (CONTENT_TYPES.includes(currentType)) {
     currentOption.textContent = "保持当前值";
     $("segmentEditContentType").value = currentType;
@@ -380,8 +381,43 @@ function openSegmentEdit(segmentIndex) {
     $("segmentEditContentType").value = "";
   }
   $("segmentEditIgnored").checked = Boolean(segment.ignored);
+  $("segmentEditRestoreHint").hidden = true;
   $("segmentEditError").hidden = true;
   $("segmentEditDialog").showModal();
+}
+
+async function restoreSegmentEdit() {
+  const target = state.segmentEditTarget;
+  const jobId = state.selectedJobId;
+  if (!target || !jobId) return;
+  const button = $("restoreSegmentEditButton");
+  button.disabled = true;
+  button.textContent = "读取中";
+  $("segmentEditError").hidden = true;
+  try {
+    const taskValues = await api(`/api/jobs/${jobId}/segments/${target.id}/task-values`);
+    $("segmentEditTitle").value = taskValues.title || "";
+    const taskType = taskValues.contentType || "";
+    const currentOption = $("segmentEditContentTypeCurrent");
+    if (CONTENT_TYPES.includes(taskType)) {
+      currentOption.value = "";
+      currentOption.textContent = "保持当前值";
+      $("segmentEditContentType").value = taskType;
+    } else {
+      currentOption.value = taskType;
+      currentOption.textContent = `任务原值（${taskType || "未填写"}）`;
+      $("segmentEditContentType").value = taskType;
+    }
+    target.restoredFromTask = true;
+    $("segmentEditRestoreHint").textContent = "已从任务信息填入原始标题和节目类型，点击保存后生效。";
+    $("segmentEditRestoreHint").hidden = false;
+  } catch (error) {
+    $("segmentEditError").textContent = error.message;
+    $("segmentEditError").hidden = false;
+  } finally {
+    button.disabled = false;
+    button.textContent = "还原";
+  }
 }
 
 async function submitSegmentEdit(event) {
@@ -397,7 +433,8 @@ async function submitSegmentEdit(event) {
       title: $("segmentEditTitle").value,
       ignored: $("segmentEditIgnored").checked
     };
-    if ($("segmentEditContentType").value) {
+    if (target.restoredFromTask) payload.restoredFromTask = true;
+    if ($("segmentEditContentType").value || target.restoredFromTask) {
       payload.contentType = $("segmentEditContentType").value;
     }
     const updated = await api(`/api/jobs/${jobId}/segments/${target.id}`, {
@@ -758,6 +795,7 @@ $("closeResplitButton").addEventListener("click", () => $("resplitDialog").close
 $("cancelResplitButton").addEventListener("click", () => $("resplitDialog").close());
 $("closeSegmentEditButton").addEventListener("click", () => $("segmentEditDialog").close());
 $("cancelSegmentEditButton").addEventListener("click", () => $("segmentEditDialog").close());
+$("restoreSegmentEditButton").addEventListener("click", restoreSegmentEdit);
 $("closeSegmentDetailButton").addEventListener("click", () => $("segmentDetailDialog").close());
 $("doneSegmentDetailButton").addEventListener("click", () => $("segmentDetailDialog").close());
 $("closePreviewButton").addEventListener("click", resetPreview);

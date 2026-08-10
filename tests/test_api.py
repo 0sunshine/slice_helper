@@ -128,6 +128,7 @@ def test_job_api_control_and_database_backed_chunk_route(
         assert 'id="resplitForm"' in home.text
         assert 'id="segmentEditDialog"' in home.text
         assert 'id="segmentEditForm"' in home.text
+        assert 'id="restoreSegmentEditButton"' in home.text
         assert 'id="segmentDetailDialog"' in home.text
         assert 'id="segmentExportDetailGrid"' in home.text
         assert "Excel 字段" in home.text
@@ -148,8 +149,8 @@ def test_job_api_control_and_database_backed_chunk_route(
         ):
             assert f'<option value="{content_type}">{content_type}</option>' in home.text
         assert 'id="summaryISlice"' in home.text
-        assert "/static/styles.css?v=0.11.1" in home.text
-        assert "/static/app.js?v=0.11.1" in home.text
+        assert "/static/styles.css?v=0.11.2" in home.text
+        assert "/static/app.js?v=0.11.2" in home.text
         assert "TS 路径或 HTTP 地址" in home.text
         assert 'id="manageChannelsButton"' in home.text
         assert 'id="jobPageInfo"' in home.text
@@ -706,7 +707,7 @@ def test_channel_date_overwrite_pagination_and_excel_export(
                         "accepted": 1,
                         "title": "最终采用标题",
                         "summary": "界面未显示的完整摘要",
-                        "raw_json": "{}",
+                        "raw_json": '{"title":"任务原标题","contentType":"广告"}',
                     },
                     {
                         **base,
@@ -737,6 +738,35 @@ def test_channel_date_overwrite_pagination_and_excel_export(
         assert edited.json()["title"] == "手工修改标题"
         assert edited.json()["content_type"] == "纪录片"
         assert edited.json()["ignored"] is True
+        task_values = client.get(
+            f"/api/jobs/{replacement_id}/segments/{accepted_segment['id']}/task-values"
+        )
+        assert task_values.status_code == 200
+        assert task_values.json() == {
+            "title": "任务原标题",
+            "contentType": "广告",
+        }
+        assert client.patch(
+            f"/api/jobs/{replacement_id}/segments/{accepted_segment['id']}",
+            json={"contentType": "广告"},
+        ).status_code == 422
+        restored_from_task = client.patch(
+            f"/api/jobs/{replacement_id}/segments/{accepted_segment['id']}",
+            json={
+                "title": task_values.json()["title"],
+                "contentType": task_values.json()["contentType"],
+                "restoredFromTask": True,
+                "ignored": True,
+            },
+        )
+        assert restored_from_task.status_code == 200
+        assert restored_from_task.json()["title"] == "任务原标题"
+        assert restored_from_task.json()["content_type"] == "广告"
+        edited = client.patch(
+            f"/api/jobs/{replacement_id}/segments/{accepted_segment['id']}",
+            json={"title": "手工修改标题", "contentType": "纪录片", "ignored": True},
+        )
+        assert edited.status_code == 200
         assert client.patch(
             f"/api/jobs/{replacement_id}/segments/{accepted_segment['id']}",
             json={"contentType": "专题"},
@@ -746,6 +776,9 @@ def test_channel_date_overwrite_pagination_and_excel_export(
         ).status_code == 422
         assert client.patch(
             f"/api/jobs/{replacement_id}/segments/999999", json={"ignored": True}
+        ).status_code == 404
+        assert client.get(
+            f"/api/jobs/{replacement_id}/segments/999999/task-values"
         ).status_code == 404
         manifest = client.get(f"/api/jobs/{replacement_id}/result").json()
         manifest_segment = next(

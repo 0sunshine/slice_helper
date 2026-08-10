@@ -131,6 +131,7 @@ class SegmentUpdate(BaseModel):
     title: str | None = Field(default=None, max_length=500)
     content_type: str | None = Field(default=None, alias="contentType", max_length=100)
     ignored: bool | None = None
+    restored_from_task: bool = Field(default=False, alias="restoredFromTask")
 
     @field_validator("title", "content_type")
     @classmethod
@@ -139,11 +140,13 @@ class SegmentUpdate(BaseModel):
 
     @model_validator(mode="after")
     def require_update(self):
-        if not self.model_fields_set:
+        editable_fields = {"title", "content_type", "ignored"}
+        if not self.model_fields_set.intersection(editable_fields):
             raise ValueError("At least one segment field must be supplied")
         if (
             "content_type" in self.model_fields_set
             and self.content_type not in CONTENT_TYPES
+            and not self.restored_from_task
         ):
             raise ValueError("节目类型必须从预设选项中选择")
         return self
