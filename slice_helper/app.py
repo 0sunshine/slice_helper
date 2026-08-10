@@ -32,6 +32,8 @@ from .models import (
     JobStatus,
     SegmentUpdate,
     TimeReferenceUpdate,
+    WindowRangePreviewRequest,
+    WindowRangeResplitRequest,
     WindowResplitRequest,
 )
 from .orchestrator import Orchestrator, ResplitConflictError, ResplitValidationError
@@ -167,6 +169,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         existing = await request.app.state.database.get_current_job_for_channel_date(
             body.channel_id, broadcast_date
         )
+        if existing:
+            await _ensure_no_active_range_resplit(request, existing["id"])
         if existing and not body.overwrite:
             raise HTTPException(
                 status_code=409,
@@ -387,7 +391,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Job not found")
         windows = await request.app.state.database.get_windows(job_id)
         attempts = await request.app.state.database.get_attempts_for_job(job_id)
-        return {"job": _public_job(job), "windows": windows, "attempts": attempts}
+        range_batch = await request.app.state.database.get_latest_resplit_batch(job_id)
+        range_windows = (
+            await request.app.state.database.get_resplit_batch_windows(range_batch["id"])
+            if range_batch
+            else []
+        )
+        return {
+            "job": _public_job(job),
+            "windows": windows,
+            "attempts": attempts,
+            "rangeResplit": (
+                {"batch": range_batch, "windows": range_windows} if range_batch else None
+            ),
+        }
 
     @application.patch("/api/jobs/{job_id}/review")
     async def update_job_review(
@@ -395,6 +412,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ):
         if not await request.app.state.database.get_job(job_id):
             raise HTTPException(status_code=404, detail="Job not found")
+        await _ensure_no_active_range_resplit(request, job_id)
         await request.app.state.database.update_job(
             job_id, reviewed=int(body.reviewed)
         )
@@ -425,6 +443,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         existing = await request.app.state.database.get_segment(job_id, segment_id)
         if existing is None:
             raise HTTPException(status_code=404, detail="Segment not found")
+        await _ensure_no_active_range_resplit(request, job_id)
         if (
             "content_type" in body.model_fields_set
             and body.content_type not in CONTENT_TYPES
@@ -484,6 +503,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def update_job_time_reference(
         request: Request, job_id: str, body: TimeReferenceUpdate
     ):
+        await _ensure_no_active_range_resplit(request, job_id)
         updated, segment_count = await request.app.state.database.update_time_reference(
             job_id, body.program_start_time.isoformat()
         )
@@ -514,6 +534,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ResplitValidationError as exc:
             status_code = 404 if str(exc) in {"Job not found", "Window not found"} else 400
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+    @application.post("/api/jobs/{job_id}/window-range-resplits/preview")
+    async def preview_window_range_resplit(
+        request: Request, job_id: str, body: WindowRangePreviewRequest
+    ):
+        try:
+            return await request.app.state.orchestrator.preview_range_resplit(
+                job_id, body.start_window_index, body.end_window_index
+            )
+        except ResplitConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ResplitValidationError as exc:
+            status_code = 404 if str(exc) == "Job not found" else 400
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+    @application.post("/api/jobs/{job_id}/window-range-resplits", status_code=202)
+    async def resplit_window_range(
+        request: Request, job_id: str, body: WindowRangeResplitRequest
+    ):
+        try:
+            return await request.app.state.orchestrator.schedule_range_resplit(
+                job_id, body.preview_id, body.confirmation_text
+            )
+        except ResplitConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ResplitValidationError as exc:
+            status_code = 404 if str(exc) == "Job not found" else 400
             raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
     @application.post(
@@ -570,6 +618,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.post("/api/jobs/{job_id}/resume")
     async def resume_job(request: Request, job_id: str):
         job = await _require_job(request, job_id)
+        await _ensure_no_active_range_resplit(request, job_id)
         if job["status"] not in {JobStatus.PAUSED.value, JobStatus.FAILED.value}:
             raise HTTPException(status_code=409, detail="Only paused or failed jobs can be resumed")
         await request.app.state.database.update_job(
@@ -619,6 +668,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             filename=f"{job_id}-window-{window_index:03d}.ts",
         )
 
+    @application.get(
+        "/internal/range-resplit-chunks/{batch_id}/{window_index}.ts",
+        include_in_schema=False,
+    )
+    async def get_range_resplit_chunk(request: Request, batch_id: str, window_index: int):
+        batch = await request.app.state.database.get_resplit_batch(batch_id)
+        if not batch:
+            raise HTTPException(status_code=404, detail="Range resplit batch not found")
+        rows = await request.app.state.database.get_resplit_batch_windows(batch_id)
+        row = next(
+            (item for item in rows if int(item["window_index"]) == window_index), None
+        )
+        if not row or not row.get("chunk_path"):
+            raise HTTPException(status_code=404, detail="Range resplit chunk not found")
+        path = Path(row["chunk_path"])
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="Range resplit chunk is unavailable")
+        return FileResponse(
+            path,
+            media_type="video/mp2t",
+            filename=f"{batch['job_id']}-range-{window_index:03d}.ts",
+        )
+
     @application.get("/health/live")
     async def live():
         return {"status": "ok"}
@@ -646,6 +718,15 @@ async def _require_job(request: Request, job_id: str) -> dict[str, Any]:
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+async def _ensure_no_active_range_resplit(request: Request, job_id: str) -> None:
+    batch = await request.app.state.database.get_latest_resplit_batch(job_id)
+    if batch and batch["status"] in {"queued", "running", "committing"}:
+        raise HTTPException(
+            status_code=409,
+            detail="连续窗口重新拆条进行中，当前作业暂时不能修改或恢复运行",
+        )
 
 
 app = create_app()

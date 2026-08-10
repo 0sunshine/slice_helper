@@ -160,6 +160,26 @@ class WindowResplitRequest(BaseModel):
     )
 
 
+class WindowRangePreviewRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    start_window_index: int = Field(alias="startWindowIndex", ge=0)
+    end_window_index: int = Field(alias="endWindowIndex", ge=0)
+
+    @model_validator(mode="after")
+    def validate_range(self):
+        if self.end_window_index < self.start_window_index:
+            raise ValueError("endWindowIndex must be greater than or equal to startWindowIndex")
+        return self
+
+
+class WindowRangeResplitRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    preview_id: str = Field(alias="previewId", min_length=16, max_length=64)
+    confirmation_text: str = Field(alias="confirmationText", min_length=1, max_length=64)
+
+
 class MediaProbe(BaseModel):
     duration: float
     format_name: str

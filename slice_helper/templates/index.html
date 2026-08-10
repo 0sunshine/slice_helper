@@ -150,10 +150,15 @@
         <section class="window-timeline-panel">
           <div class="window-timeline-heading">
             <h3>窗口时间线</h3>
+            <div class="window-range-toolbar">
+              <span id="windowRangeSelection" class="muted">未选择窗口</span>
+              <span id="windowRangeProgress" class="muted"></span>
+              <button id="previewWindowRangeResplitButton" class="button danger small" type="button" disabled>重新拆条所选窗口</button>
+            </div>
           </div>
           <div class="table-scroll window-table-scroll">
             <table class="data-table compact window-table">
-              <thead><tr><th>#</th><th>源起点</th><th>整点终点</th><th>状态</th><th>小任务进度</th><th>下发时间</th><th>交接起点</th><th>错误</th><th>操作</th></tr></thead>
+              <thead><tr><th>选择</th><th>#</th><th>源起点</th><th>整点终点</th><th>状态</th><th>小任务进度</th><th>下发时间</th><th>交接起点</th><th>错误</th><th>操作</th></tr></thead>
               <tbody id="windowsBody"></tbody>
             </table>
           </div>
@@ -219,6 +224,39 @@
       <div class="dialog-actions">
         <button id="cancelResplitButton" class="button secondary" type="button">取消</button>
         <button id="submitResplitButton" class="button danger" type="submit">确认重新拆分</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="windowRangeResplitDialog" class="confirm-dialog range-resplit-dialog">
+    <form id="windowRangeResplitForm" method="dialog">
+      <div class="dialog-header">
+        <h2>确认连续窗口重新拆条</h2>
+        <button id="closeWindowRangeResplitButton" class="icon-button" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="confirm-dialog-body">
+        <p>系统会依次重新拆条所选连续窗口。全部候选结果成功并通过边界校验后，才会一次性替换正式结果。</p>
+        <dl>
+          <div><dt>频道 / 日期</dt><dd id="rangeResplitChannelDate"></dd></div>
+          <div><dt>窗口范围</dt><dd id="rangeResplitWindows"></dd></div>
+          <div><dt>实际时间</dt><dd id="rangeResplitRealTime"></dd></div>
+          <div><dt>源时间范围</dt><dd id="rangeResplitSourceTime"></dd></div>
+          <div><dt>重新创建任务数</dt><dd id="rangeResplitTaskCount"></dd></div>
+          <div><dt>将替换片段数</dt><dd id="rangeResplitSegmentCount"></dd></div>
+        </dl>
+        <details>
+          <summary>查看原任务 ID</summary>
+          <pre id="rangeResplitTaskIds" class="range-task-ids"></pre>
+        </details>
+        <p class="confirm-warning">任一窗口失败，本批次的候选结果全部不采用。处理时间可能较长，请勿在处理期间修改该作业。</p>
+        <label class="range-confirm-label">请输入 <strong id="rangeResplitConfirmationHint"></strong> 进行二次确认
+          <input id="rangeResplitConfirmationInput" name="confirmationText" autocomplete="off" required>
+        </label>
+        <p id="windowRangeResplitError" class="form-error" hidden></p>
+      </div>
+      <div class="dialog-actions">
+        <button id="cancelWindowRangeResplitButton" class="button secondary" type="button">取消</button>
+        <button id="submitWindowRangeResplitButton" class="button danger" type="submit" disabled>确认并开始重新拆条</button>
       </div>
     </form>
   </dialog>

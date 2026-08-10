@@ -48,6 +48,8 @@ def test_job_api_control_and_database_backed_chunk_route(
 ) -> None:
     resplit_call: dict[str, object] = {}
     overlap_call: dict[str, object] = {}
+    range_preview_call: dict[str, object] = {}
+    range_resplit_call: dict[str, object] = {}
 
     async def fake_probe(_self, _path):
         return MediaProbe(
@@ -98,6 +100,29 @@ def test_job_api_control_and_database_backed_chunk_route(
             "status": "overlap_accepted",
         }
 
+    async def fake_range_preview(_self, job_id, start_window_index, end_window_index):
+        range_preview_call.update(
+            job_id=job_id,
+            start_window_index=start_window_index,
+            end_window_index=end_window_index,
+        )
+        return {
+            "previewId": "preview-1234567890",
+            "jobId": job_id,
+            "startWindowIndex": start_window_index,
+            "endWindowIndex": end_window_index,
+            "windowCount": end_window_index - start_window_index + 1,
+            "confirmationText": "重拆 1-1",
+        }
+
+    async def fake_range_resplit(_self, job_id, preview_id, confirmation_text):
+        range_resplit_call.update(
+            job_id=job_id,
+            preview_id=preview_id,
+            confirmation_text=confirmation_text,
+        )
+        return {"batchId": "batch-1", "jobId": job_id, "status": "queued"}
+
     monkeypatch.setattr("slice_helper.media.MediaService.probe", fake_probe)
     monkeypatch.setattr(
         "slice_helper.media.MediaService.detect_time_reference", fake_time_reference
@@ -105,6 +130,8 @@ def test_job_api_control_and_database_backed_chunk_route(
     monkeypatch.setattr(Orchestrator, "start", no_start)
     monkeypatch.setattr(Orchestrator, "stop", no_stop)
     monkeypatch.setattr(Orchestrator, "schedule_resplit", fake_resplit)
+    monkeypatch.setattr(Orchestrator, "preview_range_resplit", fake_range_preview)
+    monkeypatch.setattr(Orchestrator, "schedule_range_resplit", fake_range_resplit)
     monkeypatch.setattr(
         Orchestrator, "accept_resplit_overlap", fake_accept_overlap
     )
@@ -126,6 +153,8 @@ def test_job_api_control_and_database_backed_chunk_route(
         assert 'class="window-timeline-panel"' in home.text
         assert 'id="resplitDialog"' in home.text
         assert 'id="resplitForm"' in home.text
+        assert 'id="windowRangeResplitDialog"' in home.text
+        assert 'id="previewWindowRangeResplitButton"' in home.text
         assert 'id="segmentEditDialog"' in home.text
         assert 'id="segmentEditForm"' in home.text
         assert 'id="restoreSegmentEditButton"' in home.text
@@ -149,8 +178,8 @@ def test_job_api_control_and_database_backed_chunk_route(
         ):
             assert f'<option value="{content_type}">{content_type}</option>' in home.text
         assert 'id="summaryISlice"' in home.text
-        assert "/static/styles.css?v=0.11.2" in home.text
-        assert "/static/app.js?v=0.11.2" in home.text
+        assert "/static/styles.css?v=0.12.0" in home.text
+        assert "/static/app.js?v=0.12.0" in home.text
         assert "TS 路径或 HTTP 地址" in home.text
         assert 'id="manageChannelsButton"' in home.text
         assert 'id="jobPageInfo"' in home.text
@@ -249,6 +278,31 @@ def test_job_api_control_and_database_backed_chunk_route(
             "job_id": job_id,
             "window_index": 0,
             "task_id": "sh-test-w000-a1",
+        }
+
+        range_preview = client.post(
+            f"/api/jobs/{job_id}/window-range-resplits/preview",
+            json={"startWindowIndex": 0, "endWindowIndex": 0},
+        )
+        assert range_preview.status_code == 200
+        assert range_preview.json()["confirmationText"] == "重拆 1-1"
+        assert range_preview_call == {
+            "job_id": job_id,
+            "start_window_index": 0,
+            "end_window_index": 0,
+        }
+        range_resplit = client.post(
+            f"/api/jobs/{job_id}/window-range-resplits",
+            json={
+                "previewId": "preview-1234567890",
+                "confirmationText": "重拆 1-1",
+            },
+        )
+        assert range_resplit.status_code == 202
+        assert range_resplit_call == {
+            "job_id": job_id,
+            "preview_id": "preview-1234567890",
+            "confirmation_text": "重拆 1-1",
         }
 
         stopped = client.post(f"/api/jobs/{job_id}/stop")

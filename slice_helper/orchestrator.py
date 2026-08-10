@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import time
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -114,11 +115,14 @@ class Orchestrator:
         self._submission_gate = _ISliceSubmissionGate()
         self._gate_monitors: dict[str, asyncio.Task[None]] = {}
         self._resplit_tasks: dict[tuple[str, int], asyncio.Task[None]] = {}
+        self._range_resplit_tasks: dict[str, asyncio.Task[None]] = {}
+        self._range_resplit_previews: dict[str, dict[str, Any]] = {}
         self._resplit_lock = asyncio.Lock()
         self._wake = asyncio.Event()
         self._stopping = False
 
     async def start(self) -> None:
+        await self.database.recover_interrupted_range_resplits()
         await self.database.recover_interrupted_resplits()
         await self.database.recover_jobs()
         self._stopping = False
@@ -141,6 +145,11 @@ class Orchestrator:
         if self._resplit_tasks:
             await asyncio.gather(*self._resplit_tasks.values(), return_exceptions=True)
         self._resplit_tasks.clear()
+        for task in self._range_resplit_tasks.values():
+            task.cancel()
+        if self._range_resplit_tasks:
+            await asyncio.gather(*self._range_resplit_tasks.values(), return_exceptions=True)
+        self._range_resplit_tasks.clear()
         for task in self._gate_monitors.values():
             task.cancel()
         if self._gate_monitors:
@@ -155,7 +164,10 @@ class Orchestrator:
     ) -> dict[str, Any]:
         key = (job_id, window_index)
         async with self._resplit_lock:
-            if any(active_job_id == job_id for active_job_id, _index in self._resplit_tasks):
+            if (
+                any(active_job_id == job_id for active_job_id, _index in self._resplit_tasks)
+                or job_id in self._range_resplit_tasks
+            ):
                 raise ResplitConflictError("This job already has a resplit in progress")
             job = await self.database.get_job(job_id)
             if not job:
@@ -212,6 +224,562 @@ class Orchestrator:
                 "status": "resplit_queued",
             }
 
+    async def preview_range_resplit(
+        self, job_id: str, start_window_index: int, end_window_index: int
+    ) -> dict[str, Any]:
+        async with self._resplit_lock:
+            if (
+                any(active_job_id == job_id for active_job_id, _ in self._resplit_tasks)
+                or job_id in self._range_resplit_tasks
+            ):
+                raise ResplitConflictError("This job already has a resplit in progress")
+            job, selected = await self._validate_range_resplit_selection(
+                job_id, start_window_index, end_window_index
+            )
+            preview_id = uuid.uuid4().hex
+            confirmation_text = f"重拆 {start_window_index + 1}-{end_window_index + 1}"
+            segments = await self.database.get_segments(job_id)
+            affected = sum(
+                start_window_index <= int(item["window_index"]) <= end_window_index
+                for item in segments
+            )
+            expires_at = time.monotonic() + 10 * 60
+            self._range_resplit_previews = {
+                key: value
+                for key, value in self._range_resplit_previews.items()
+                if float(value["expires_at"]) > time.monotonic()
+            }
+            self._range_resplit_previews[preview_id] = {
+                "job_id": job_id,
+                "start": start_window_index,
+                "end": end_window_index,
+                "task_ids": [item["attempt"]["task_id"] for item in selected],
+                "window_updated_at": [item["window"]["updated_at"] for item in selected],
+                "confirmation_text": confirmation_text,
+                "affected": affected,
+                "expires_at": expires_at,
+            }
+            base_time = (
+                datetime.fromisoformat(job["program_start_time"])
+                if job.get("program_start_time")
+                else None
+            )
+            first_start = float(selected[0]["window"]["requested_start"])
+            last_end = float(selected[-1]["window"]["nominal_end"])
+            return {
+                "previewId": preview_id,
+                "jobId": job_id,
+                "startWindowIndex": start_window_index,
+                "endWindowIndex": end_window_index,
+                "windowCount": len(selected),
+                "sourceStart": first_start,
+                "sourceEnd": last_end,
+                "durationSeconds": max(0.0, last_end - first_start),
+                "realStart": (base_time + timedelta(seconds=first_start)).isoformat()
+                if base_time
+                else None,
+                "realEnd": (base_time + timedelta(seconds=last_end)).isoformat()
+                if base_time
+                else None,
+                "affectedSegmentCount": affected,
+                "taskIds": [item["attempt"]["task_id"] for item in selected],
+                "confirmationText": confirmation_text,
+                "channelName": job.get("channel_name") or "",
+                "broadcastDate": job.get("broadcast_date"),
+                "source": job.get("source_url") or job.get("source_path"),
+            }
+
+    async def schedule_range_resplit(
+        self, job_id: str, preview_id: str, confirmation_text: str
+    ) -> dict[str, Any]:
+        async with self._resplit_lock:
+            preview = self._range_resplit_previews.pop(preview_id, None)
+            if not preview or float(preview["expires_at"]) <= time.monotonic():
+                raise ResplitValidationError("The range resplit preview expired; preview it again")
+            if preview["job_id"] != job_id:
+                raise ResplitValidationError("The preview does not belong to this job")
+            if confirmation_text != preview["confirmation_text"]:
+                raise ResplitValidationError("The confirmation text does not match")
+            if (
+                any(active_job_id == job_id for active_job_id, _ in self._resplit_tasks)
+                or job_id in self._range_resplit_tasks
+            ):
+                raise ResplitConflictError("This job already has a resplit in progress")
+            job, selected = await self._validate_range_resplit_selection(
+                job_id, int(preview["start"]), int(preview["end"])
+            )
+            if [item["attempt"]["task_id"] for item in selected] != preview["task_ids"] or [
+                item["window"]["updated_at"] for item in selected
+            ] != preview["window_updated_at"]:
+                raise ResplitConflictError(
+                    "The selected windows changed after the preview; preview them again"
+                )
+            batch_id = uuid.uuid4().hex
+            rows = [
+                {
+                    "window_id": item["window"]["id"],
+                    "window_index": item["window"]["window_index"],
+                    "original_task_id": item["attempt"]["task_id"],
+                    "candidate_task_id": (
+                        f"sh-{job_id[:16]}-w{int(item['window']['window_index']):03d}"
+                        f"-r{batch_id[:8]}"
+                    ),
+                    "nominal_end": item["window"]["nominal_end"],
+                }
+                for item in selected
+            ]
+            try:
+                await self.database.create_resplit_batch(
+                    batch_id,
+                    job_id,
+                    int(preview["start"]),
+                    int(preview["end"]),
+                    int(preview["affected"]),
+                    rows,
+                )
+            except ValueError as exc:
+                raise ResplitConflictError(str(exc)) from exc
+            task = asyncio.create_task(
+                self._run_range_resplit(batch_id), name=f"range-resplit-{batch_id[:8]}"
+            )
+            self._range_resplit_tasks[job_id] = task
+            task.add_done_callback(
+                lambda done, active_job_id=job_id: self._range_resplit_finished(
+                    active_job_id, done
+                )
+            )
+            return {
+                "batchId": batch_id,
+                "jobId": job_id,
+                "startWindowIndex": int(preview["start"]),
+                "endWindowIndex": int(preview["end"]),
+                "windowCount": len(rows),
+                "status": "queued",
+            }
+
+    async def _validate_range_resplit_selection(
+        self, job_id: str, start_window_index: int, end_window_index: int
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        if end_window_index < start_window_index:
+            raise ResplitValidationError("The selected window range is invalid")
+        job = await self.database.get_job(job_id)
+        if not job:
+            raise ResplitValidationError("Job not found")
+        if job_id in self._active or job["status"] in {
+            JobStatus.PENDING_SCHEDULE.value,
+            JobStatus.QUEUED.value,
+            JobStatus.PROBING.value,
+            JobStatus.RUNNING.value,
+            JobStatus.PAUSE_REQUESTED.value,
+            JobStatus.STOP_REQUESTED.value,
+        }:
+            raise ResplitConflictError(
+                "Pause or finish the job before resplitting a window range"
+            )
+        if not job.get("islice_base_url"):
+            raise ResplitValidationError("The job has not been assigned to an iSlice instance")
+        if not self._source_unchanged(job):
+            raise ResplitValidationError("Source file size or modification time changed")
+        windows = await self.database.get_windows(job_id)
+        by_index = {int(item["window_index"]): item for item in windows}
+        if start_window_index < 0 or end_window_index >= len(windows):
+            raise ResplitValidationError("The selected range contains a missing window")
+        requested_indexes = range(start_window_index, end_window_index + 1)
+        selected: list[dict[str, Any]] = []
+        for index in requested_indexes:
+            window = by_index[index]
+            attempts = await self.database.get_attempts(window["id"])
+            if not attempts:
+                raise ResplitValidationError(
+                    f"Window {index + 1} has not been submitted to iSlice"
+                )
+            attempt = attempts[-1]
+            if attempt["status"] not in {"completed", "failed", "discarded"}:
+                raise ResplitConflictError(f"Window {index + 1} iSlice task is still active")
+            selected.append({"window": window, "attempt": attempt})
+        return job, selected
+
+    def _range_resplit_finished(self, job_id: str, task: asyncio.Task[None]) -> None:
+        if self._range_resplit_tasks.get(job_id) is task:
+            self._range_resplit_tasks.pop(job_id, None)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("Range resplit task failed unexpectedly: %s", task.exception())
+
+    async def _run_range_resplit(self, batch_id: str) -> None:
+        batch = await self.database.get_resplit_batch(batch_id)
+        if not batch:
+            return
+        job_id = str(batch["job_id"])
+        candidate_rows = await self.database.get_resplit_batch_windows(batch_id)
+        current_row: dict[str, Any] | None = None
+        try:
+            job = await self.database.get_job(job_id)
+            if not job:
+                raise ResplitValidationError("Job not found")
+            snapshot_path = await self._write_range_resplit_snapshot(
+                batch_id, job, candidate_rows
+            )
+            await self.database.update_resplit_batch(
+                batch_id,
+                status="running",
+                snapshot_path=str(snapshot_path),
+                started_at=utc_now(),
+                error_message="",
+            )
+            next_start: float | None = None
+            completed = 0
+            for candidate in candidate_rows:
+                current_row = candidate
+                if not self._source_unchanged(job):
+                    raise ResplitValidationError("Source file size or modification time changed")
+                index = int(candidate["window_index"])
+                source_window = await self.database.get_window(job_id, index)
+                if not source_window:
+                    raise ResplitValidationError(f"Window {index + 1} no longer exists")
+                start = (
+                    float(source_window["requested_start"])
+                    if next_start is None
+                    else float(next_start)
+                )
+                end = float(candidate["nominal_end"])
+                if start >= end:
+                    raise SegmentValidationError(
+                        f"Window {index + 1} candidate start {start:.3f} is not before its end {end:.3f}"
+                    )
+                await self.database.update_resplit_batch(
+                    batch_id, current_window_index=index
+                )
+                chunk_path = (
+                    self.settings.temp_dir
+                    / job_id
+                    / "range-resplit"
+                    / batch_id
+                    / f"window-{index:03d}.ts"
+                )
+                chunk_url = (
+                    f"{self.settings.public_base_url}/internal/range-resplit-chunks/"
+                    f"{batch_id}/{index}.ts"
+                )
+                await self.database.update_resplit_batch_window(
+                    candidate["id"],
+                    status="cutting",
+                    requested_start=start,
+                    chunk_path=str(chunk_path),
+                    error_message="",
+                )
+                await self.media.cut(
+                    Path(job["source_path"]),
+                    chunk_path,
+                    start,
+                    end,
+                    CutMode(job["cut_mode"]),
+                )
+                task_id = str(candidate["candidate_task_id"])
+                request = self._create_task_request(job, task_id, chunk_url, start)
+                islice_client = self._islice_client(job)
+                gate_url = str(job["islice_base_url"])
+                gate_released = False
+                await self.database.update_resplit_batch_window(
+                    candidate["id"], status="submitting", service_status="waiting", progress=0.0
+                )
+                await self._await_submission_turn(
+                    job_id, gate_url, task_id, float(job.get("progress") or 0)
+                )
+                try:
+                    existing = await islice_client.ensure_task(task_id, request)
+                    submitted_at = utc_now()
+                    status, progress = self._task_progress(existing)
+                    await self.database.update_resplit_batch_window(
+                        candidate["id"],
+                        status="polling",
+                        service_status=status,
+                        progress=progress,
+                        submitted_at=submitted_at,
+                    )
+                    if self._pipeline_ready(status, progress):
+                        gate_released = await self._release_submission_turn(
+                            gate_url, task_id
+                        )
+                    payload = (
+                        existing
+                        if self._is_terminal(existing)
+                        else await self._poll_range_resplit_candidate(
+                            candidate["id"], task_id, islice_client, gate_url
+                        )
+                    )
+                    gate_released = await self._release_submission_turn(
+                        gate_url, task_id
+                    ) or gate_released
+                finally:
+                    if not gate_released:
+                        await self._release_submission_turn(gate_url, task_id)
+
+                raw_path = await self._write_range_resplit_raw(
+                    job_id, batch_id, index, payload
+                )
+                status, progress = self._task_progress(payload)
+                if status != "completed":
+                    raise ISliceError(
+                        str(
+                            payload.get("taskInfo", {}).get("errorMessage")
+                            or f"Window {index + 1} candidate iSlice task failed"
+                        )
+                    )
+                base_time = (
+                    datetime.fromisoformat(job["program_start_time"])
+                    if job.get("program_start_time")
+                    else None
+                )
+                processed = process_segments(
+                    payload.get("segments"),
+                    window_start=start,
+                    chunk_duration=end - start,
+                    is_final_window=index == int(job["total_windows"]) - 1,
+                    handoff_max_seconds=self.settings.handoff_max_seconds,
+                    program_start_time=base_time,
+                )
+                next_start = (
+                    float(processed.next_window_start)
+                    if processed.next_window_start is not None
+                    else end
+                )
+                await self.database.update_resplit_batch_window(
+                    candidate["id"],
+                    status="candidate_ready",
+                    service_status=status,
+                    progress=progress,
+                    handoff_start=processed.handoff_start,
+                    next_window_start=next_start,
+                    raw_response_path=str(raw_path),
+                    processed_json=json.dumps(
+                        processed.segments, ensure_ascii=False, separators=(",", ":")
+                    ),
+                    warning=processed.warning or "",
+                    error_message="",
+                    finished_at=utc_now(),
+                )
+                candidate["requested_start"] = start
+                candidate["next_window_start"] = next_start
+                candidate["processed_json"] = json.dumps(processed.segments, ensure_ascii=False)
+                candidate["status"] = "candidate_ready"
+                completed += 1
+                await self.database.update_resplit_batch(
+                    batch_id, completed_window_count=completed
+                )
+
+            await self._validate_range_resplit_boundaries(job_id, batch, candidate_rows)
+            await self.database.update_resplit_batch(batch_id, status="committing")
+            await self.database.commit_resplit_batch(batch_id)
+            await self.write_manifest(job_id)
+            for candidate in candidate_rows:
+                raw_chunk = str(candidate.get("chunk_path") or "")
+                path = Path(raw_chunk) if raw_chunk else (
+                    self.settings.temp_dir
+                    / job_id
+                    / "range-resplit"
+                    / batch_id
+                    / f"window-{int(candidate['window_index']):03d}.ts"
+                )
+                with contextlib.suppress(OSError):
+                    path.unlink(missing_ok=True)
+        except asyncio.CancelledError:
+            await self._fail_range_resplit(
+                batch_id, candidate_rows, current_row, "Range resplit was interrupted"
+            )
+            raise
+        except Exception as exc:
+            message = str(exc) or exc.__class__.__name__
+            logger.exception("Job %s range resplit %s failed", job_id, batch_id)
+            await self._fail_range_resplit(
+                batch_id, candidate_rows, current_row, message
+            )
+
+    async def _poll_range_resplit_candidate(
+        self,
+        candidate_row_id: int,
+        task_id: str,
+        islice_client: ISliceClient,
+        gate_url: str,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + self.settings.window_timeout_seconds
+        consecutive_errors = 0
+        while time.monotonic() < deadline:
+            try:
+                payload = await islice_client.get_task_info(task_id)
+                if payload is None:
+                    raise ISliceError("Task disappeared from iSlice")
+                consecutive_errors = 0
+            except ISliceError:
+                consecutive_errors += 1
+                if consecutive_errors >= 3:
+                    raise
+                await asyncio.sleep(self.RETRY_DELAYS[consecutive_errors - 1])
+                continue
+            status, progress = self._task_progress(payload)
+            await self.database.update_resplit_batch_window(
+                candidate_row_id, service_status=status, progress=progress
+            )
+            if self._pipeline_ready(status, progress):
+                await self._release_submission_turn(gate_url, task_id)
+            if self._is_terminal(payload):
+                return payload
+            await asyncio.sleep(self.settings.poll_interval_seconds)
+        raise TimeoutError(f"Task {task_id} exceeded the window timeout")
+
+    async def _validate_range_resplit_boundaries(
+        self,
+        job_id: str,
+        batch: dict[str, Any],
+        candidate_rows: list[dict[str, Any]],
+    ) -> None:
+        start_index = int(batch["start_window_index"])
+        end_index = int(batch["end_window_index"])
+        tolerance = self.settings.window_boundary_tolerance_seconds
+        existing = await self.database.get_segments(job_id, accepted_only=True)
+        previous = [item for item in existing if int(item["window_index"]) < start_index]
+        following = [item for item in existing if int(item["window_index"]) > end_index]
+        candidates: list[dict[str, Any]] = []
+        for row in candidate_rows:
+            for segment in json.loads(row["processed_json"]):
+                if segment["accepted"]:
+                    candidates.append({**segment, "window_index": int(row["window_index"])})
+        candidates.sort(key=lambda item: (item["global_start"], item["global_end"]))
+        if previous and candidates:
+            previous_end = max(float(item["global_end"]) for item in previous)
+            candidate_start = min(float(item["global_start"]) for item in candidates)
+            if candidate_start < previous_end - tolerance:
+                raise SegmentValidationError(
+                    "range resplit overlaps the previous window: "
+                    f"previous end {previous_end:.3f}, candidate start {candidate_start:.3f}"
+                )
+        for left, right in zip(candidates, candidates[1:]):
+            if (
+                int(left["window_index"]) != int(right["window_index"])
+                and float(right["global_start"]) < float(left["global_end"]) - tolerance
+            ):
+                raise SegmentValidationError(
+                    "candidate windows overlap: "
+                    f"window {int(left['window_index']) + 1} end {float(left['global_end']):.3f}, "
+                    f"window {int(right['window_index']) + 1} start {float(right['global_start']):.3f}"
+                )
+        windows = await self.database.get_windows(job_id)
+        next_window = next(
+            (item for item in windows if int(item["window_index"]) == end_index + 1),
+            None,
+        )
+        if next_window:
+            new_next_start = float(candidate_rows[-1]["next_window_start"])
+            existing_start = float(next_window["requested_start"])
+            if abs(new_next_start - existing_start) > tolerance:
+                raise SegmentValidationError(
+                    "range resplit handoff changed from the following window start: "
+                    f"new {new_next_start:.3f}, existing {existing_start:.3f}"
+                )
+        if following and candidates:
+            candidate_end = max(float(item["global_end"]) for item in candidates)
+            following_start = min(float(item["global_start"]) for item in following)
+            if candidate_end > following_start + tolerance:
+                raise SegmentValidationError(
+                    "range resplit overlaps a following window: "
+                    f"candidate end {candidate_end:.3f}, following start {following_start:.3f}"
+                )
+
+    async def _write_range_resplit_snapshot(
+        self,
+        batch_id: str,
+        job: dict[str, Any],
+        candidate_rows: list[dict[str, Any]],
+    ) -> Path:
+        start = int(candidate_rows[0]["window_index"])
+        end = int(candidate_rows[-1]["window_index"])
+        windows = [
+            item
+            for item in await self.database.get_windows(str(job["id"]))
+            if start <= int(item["window_index"]) <= end
+        ]
+        attempts = [
+            item
+            for item in await self.database.get_attempts_for_job(str(job["id"]))
+            if start <= int(item["window_index"]) <= end
+        ]
+        segments = [
+            item
+            for item in await self.database.get_segments(str(job["id"]))
+            if start <= int(item["window_index"]) <= end
+        ]
+        path = (
+            self.settings.data_dir
+            / "jobs"
+            / str(job["id"])
+            / "range-resplits"
+            / batch_id
+            / "snapshot.json"
+        )
+        await asyncio.to_thread(
+            self._atomic_json,
+            path,
+            {"createdAt": utc_now(), "job": job, "windows": windows, "attempts": attempts, "segments": segments},
+        )
+        return path
+
+    async def _write_range_resplit_raw(
+        self, job_id: str, batch_id: str, window_index: int, payload: dict[str, Any]
+    ) -> Path:
+        path = (
+            self.settings.data_dir
+            / "jobs"
+            / job_id
+            / "range-resplits"
+            / batch_id
+            / f"window-{window_index:03d}.json"
+        )
+        await asyncio.to_thread(self._atomic_json, path, payload)
+        return path
+
+    async def _fail_range_resplit(
+        self,
+        batch_id: str,
+        candidate_rows: list[dict[str, Any]],
+        current_row: dict[str, Any] | None,
+        message: str,
+    ) -> None:
+        if current_row is not None:
+            await self.database.update_resplit_batch_window(
+                current_row["id"], status="failed", error_message=message, finished_at=utc_now()
+            )
+        latest_rows = await self.database.get_resplit_batch_windows(batch_id)
+        for row in candidate_rows:
+            latest = next(
+                (
+                    item
+                    for item in latest_rows
+                    if int(item["id"]) == int(row["id"])
+                ),
+                row,
+            )
+            if latest.get("status") in {"queued", "cutting", "submitting", "polling"}:
+                await self.database.update_resplit_batch_window(
+                    row["id"], status="not_run", error_message="Batch did not complete"
+                )
+            raw_chunk = str(latest.get("chunk_path") or "")
+            if raw_chunk:
+                with contextlib.suppress(OSError):
+                    Path(raw_chunk).unlink(missing_ok=True)
+        batch = await self.database.get_resplit_batch(batch_id)
+        job = await self.database.get_job(str(batch["job_id"])) if batch else None
+        if job:
+            islice_client = self._islice_client(job)
+            for row in latest_rows:
+                with contextlib.suppress(Exception):
+                    await islice_client.delete_task(str(row["candidate_task_id"]))
+        await self.database.update_resplit_batch(
+            batch_id,
+            status="failed",
+            current_window_index=None,
+            error_message=message,
+            finished_at=utc_now(),
+        )
+
     async def accept_resplit_overlap(
         self, job_id: str, window_index: int, expected_task_id: str
     ) -> dict[str, Any]:
@@ -222,7 +790,10 @@ class Orchestrator:
         boundary guard.
         """
         async with self._resplit_lock:
-            if any(active_job_id == job_id for active_job_id, _ in self._resplit_tasks):
+            if (
+                any(active_job_id == job_id for active_job_id, _ in self._resplit_tasks)
+                or job_id in self._range_resplit_tasks
+            ):
                 raise ResplitConflictError("This job already has a resplit in progress")
 
             job = await self.database.get_job(job_id)
