@@ -325,7 +325,8 @@ function renderRangeWindowStatus(rangeRow) {
   const names = {
     queued: "批量等待中", cutting: "批量切片中", submitting: "批量下发中",
     polling: "批量处理中", candidate_ready: "候选结果就绪", failed: "批量失败",
-    not_run: "本批次未执行"
+    not_run: "本批次未执行", not_adopted: "候选结果未采用", adopted: "已采用",
+    boundary_rejected: "边界不兼容，未采用"
   };
   const progress = Math.max(0, Math.min(100, Number(rangeRow.progress || 0)));
   return `<span class="window-range-status">
@@ -354,9 +355,21 @@ function updateWindowRangeSelection(rangeBatch) {
   }
   const active = Boolean(rangeBatch && ["queued", "running", "committing"].includes(rangeBatch.status));
   button.disabled = !selected.length || !contiguous || active;
-  const batchNames = { queued: "等待开始", running: "处理中", committing: "正在整体采用", completed: "已完成", failed: "失败" };
+  const batchNames = {
+    queued: "等待开始", running: "处理中", committing: "正在采用兼容结果",
+    completed: "已完成", partial_completed: "部分完成", failed: "失败"
+  };
+  const activeProgress = rangeBatch
+    ? Number(rangeBatch.processed_window_count ?? rangeBatch.completed_window_count ?? 0)
+    : 0;
+  const adoptedProgress = rangeBatch
+    ? Number(rangeBatch.adopted_window_count ?? rangeBatch.completed_window_count ?? 0)
+    : 0;
+  const progressCount = rangeBatch && ["queued", "running", "committing"].includes(rangeBatch.status)
+    ? activeProgress
+    : adoptedProgress;
   $("windowRangeProgress").textContent = rangeBatch
-    ? `最近批次：${batchNames[rangeBatch.status] || rangeBatch.status} ${rangeBatch.completed_window_count}/${rangeBatch.total_window_count}${rangeBatch.error_message ? ` · ${rangeBatch.error_message}` : ""}`
+    ? `最近批次：${batchNames[rangeBatch.status] || rangeBatch.status} ${progressCount}/${rangeBatch.total_window_count}${rangeBatch.error_message ? ` · ${rangeBatch.error_message}` : ""}`
     : "";
 }
 

@@ -35,7 +35,7 @@ async def test_database_persists_and_recovers_jobs(tmp_path: Path) -> None:
 
     async with database.connect() as db:
         versions = await (await db.execute("SELECT version FROM schema_version ORDER BY version")).fetchall()
-    assert [row["version"] for row in versions] == list(range(1, 17))
+    assert [row["version"] for row in versions] == list(range(1, 18))
     async with database.connect() as db:
         segment_columns = {
             row["name"]

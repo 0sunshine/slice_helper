@@ -178,8 +178,8 @@ def test_job_api_control_and_database_backed_chunk_route(
         ):
             assert f'<option value="{content_type}">{content_type}</option>' in home.text
         assert 'id="summaryISlice"' in home.text
-        assert "/static/styles.css?v=0.12.0" in home.text
-        assert "/static/app.js?v=0.12.0" in home.text
+        assert "/static/styles.css?v=0.12.1" in home.text
+        assert "/static/app.js?v=0.12.1" in home.text
         assert "TS 路径或 HTTP 地址" in home.text
         assert 'id="manageChannelsButton"' in home.text
         assert 'id="jobPageInfo"' in home.text
@@ -304,6 +304,49 @@ def test_job_api_control_and_database_backed_chunk_route(
             "preview_id": "preview-1234567890",
             "confirmation_text": "重拆 1-1",
         }
+
+        async def record_active_range_resplit() -> None:
+            database = Database(configured.database_path)
+            window = await database.get_window(job_id, 0)
+            await database.create_resplit_batch(
+                "active-batch",
+                job_id,
+                0,
+                0,
+                0,
+                [
+                    {
+                        "window_id": window["id"],
+                        "window_index": 0,
+                        "original_task_id": "sh-test-w000-a1",
+                        "candidate_task_id": "sh-test-w000-range",
+                        "nominal_end": 120.0,
+                    }
+                ],
+            )
+            rows = await database.get_resplit_batch_windows("active-batch")
+            await database.update_resplit_batch_window(
+                rows[0]["id"],
+                processed_json='[{"title":"large private payload"}]',
+                chunk_path=str(configured.temp_dir / "private.ts"),
+                raw_response_path=str(configured.data_dir / "private.json"),
+            )
+
+        asyncio.run(record_active_range_resplit())
+        detail = client.get(f"/api/jobs/{job_id}")
+        assert detail.status_code == 200
+        range_window = detail.json()["rangeResplit"]["windows"][0]
+        assert "processed_json" not in range_window
+        assert "chunk_path" not in range_window
+        assert "raw_response_path" not in range_window
+        assert client.post(f"/api/jobs/{job_id}/pause").status_code == 409
+        assert client.post(f"/api/jobs/{job_id}/stop").status_code == 409
+
+        async def finish_active_range_resplit() -> None:
+            database = Database(configured.database_path)
+            await database.update_resplit_batch("active-batch", status="failed")
+
+        asyncio.run(finish_active_range_resplit())
 
         stopped = client.post(f"/api/jobs/{job_id}/stop")
         assert stopped.status_code == 200
