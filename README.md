@@ -47,9 +47,16 @@ cp .env.example .env
 
 helper 不限制每台 iSlice 已绑定的长文件作业总数；新作业优先分配给当前活动作业较少的实例。同一实例上一个子任务达到 71% 或终态后，等待创建子任务的作业中总体完成度最高者优先；完成度相同则按进入等待队列的先后顺序。实际执行并发仍由 iSlice 控制。`MAX_ACTIVE_JOBS` 是所有实例合计的全局作业并发上限。
 
-## iSlice 实例与备份
+## iSlice 服务与备份
 
-首页右上角的“iSlice 与备份”进入统一管理页。每个实例包含稳定的 `sourceId`、显示名称、iSlice API 地址、归档 `catalog.json` 地址和“允许调度新作业”开关。
+首页右上角的“iSlice 与备份”进入统一管理页。“添加服务”可以同时填写稳定的 `sourceId`、iSlice API、SSH 主机/端口/账号/密码、代理安装目录、iSlice 数据库与 storage 路径，以及远端归档连接信息。保存时可自动通过 SSH 部署并拉起归档代理。
+
+- 自动部署不使用 systemd、不要求 sudo。脚本、配置、状态库、PID、日志、manifest 和重置备份全部放在页面填写的绝对 Linux 安装目录中
+- 代理使用 `nohup ... run-forever` 作为普通 SSH 用户进程，每 5 分钟执行一次归档扫描；页面可“部署/拉起”或手工刷新状态
+- helper 每 30 秒通过 SSH 检查 PID、`/proc/{pid}/cmdline` 和代理版本，并在服务卡片持续显示在线、离线、部署中或异常状态
+- SSH 密码使用 Fernet 加密后存入 SQLite，API 永不返回密文。默认密钥保存在 `DATA_DIR/service-credential.key` 并限制为当前用户读取；生产环境推荐通过 `SERVICE_CREDENTIAL_KEY` 注入独立密钥并妥善备份
+- 第一次 SSH 成功连接采用 TOFU 记录主机密钥 SHA-256，后续密钥发生变化会拒绝连接。服务卡片显示已记录的密钥摘要
+- SSH 账号必须能读取页面填写的 iSlice `tasks.db` 和 storage，能写代理安装目录，并已配置访问远端归档服务器的私钥和 `known_hosts`；自动部署会先验证这些条件和远端归档 SSH 连通性
 
 - 新作业只分配给允许调度的实例；作业一旦绑定，全部窗口、恢复和重试都继续使用原实例，关闭调度不会迁移历史作业
 - 已产生作业的实例不能修改 API 地址或 `sourceId`，防止归档命名空间与任务来源错配；名称、catalog 地址和调度开关仍可修改
@@ -153,6 +160,11 @@ iSlice 片段的 `contentType` 原样保存为节目类型；`newsEventType` 原
 主要接口：
 
 - `GET /api/channels`
+- `GET /api/islice-instances`
+- `POST /api/islice-instances`
+- `PUT /api/islice-instances/{id}`
+- `POST /api/islice-instances/{id}/deploy-agent`
+- `POST /api/islice-instances/{id}/check-agent`
 - `POST /api/channels`
 - `PATCH /api/channels/{id}`
 - `DELETE /api/channels/{id}`

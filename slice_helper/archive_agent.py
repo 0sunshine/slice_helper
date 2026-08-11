@@ -14,6 +14,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,6 +31,7 @@ except ImportError:  # pragma: no cover - the deployed agent runs on Linux
 
 
 logger = logging.getLogger("islice-archiver")
+ARCHIVER_AGENT_VERSION = "3.1"
 TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 RESET_REQUEST_PATTERN = re.compile(r"^[0-9a-f]{32}$")
@@ -1083,6 +1085,23 @@ class Archiver:
                 self.archive(row)
             self.publish_catalog()
 
+    def run_forever(self, interval_seconds: float) -> None:
+        if interval_seconds < 10:
+            raise ArchiveError("run-forever interval must be at least 10 seconds")
+        logger.info(
+            "Archive agent %s running every %.0f seconds",
+            ARCHIVER_AGENT_VERSION,
+            interval_seconds,
+        )
+        while True:
+            started = time.monotonic()
+            try:
+                self.run_once()
+            except Exception:
+                logger.exception("Archive cycle failed")
+            delay = max(1.0, interval_seconds - (time.monotonic() - started))
+            time.sleep(delay)
+
     def discover(self) -> None:
         for task, task_path, output_path in self.tasks.completed():
             task_id = require_task_id(str(task["task_id"]))
@@ -1543,10 +1562,13 @@ def configure_logging(verbose: bool) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Archive completed iSlice task media")
+    parser.add_argument("--version", action="version", version=ARCHIVER_AGENT_VERSION)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--verbose", action="store_true")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("run-once")
+    forever_parser = commands.add_parser("run-forever")
+    forever_parser.add_argument("--interval", type=float, default=300.0)
     status_parser = commands.add_parser("status")
     status_parser.add_argument("--json", action="store_true")
     retry_parser = commands.add_parser("retry")
@@ -1596,6 +1618,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         state.initialize()
         if args.command == "run-once":
             Archiver(config, state=state).run_once()
+        elif args.command == "run-forever":
+            try:
+                Archiver(config, state=state).run_forever(args.interval)
+            except KeyboardInterrupt:
+                logger.info("Archive agent stopped")
         elif args.command == "retry":
             state.retry(require_task_id(args.task_id))
         elif args.command == "status":

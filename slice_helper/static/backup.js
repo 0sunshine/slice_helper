@@ -22,6 +22,12 @@ function statusClass(value) {
   return "bad";
 }
 
+function agentStatus(item) {
+  const labels = { online: "代理在线", offline: "代理离线", deploying: "部署中", error: "部署异常", unconfigured: "未部署" };
+  const css = item.agent_status === "online" ? "ok" : item.agent_status === "deploying" ? "warn" : ["offline", "error"].includes(item.agent_status) ? "bad" : "neutral";
+  return { label: labels[item.agent_status] || item.agent_status || "未部署", css };
+}
+
 function bytes(value) {
   let size = Number(value || 0);
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -67,22 +73,30 @@ async function request(url, options = {}) {
 function renderInstances() {
   $("instanceCount").textContent = state.instances.length;
   $("emptyInstances").hidden = state.instances.length > 0;
-  $("instanceCards").innerHTML = state.instances.map((item) => `
+  $("instanceCards").innerHTML = state.instances.map((item) => {
+    const agent = agentStatus(item);
+    return `
     <article class="instance-card">
       <div class="instance-card-head">
         <div><strong>${escapeHtml(item.name)}</strong><span class="mono">${escapeHtml(item.source_id)}</span></div>
-        <span class="status-pill ${item.schedulable ? "ok" : "neutral"}">${item.schedulable ? "参与调度" : "停止调度"}</span>
+        <div class="instance-statuses"><span class="status-pill ${agent.css}">${escapeHtml(agent.label)}</span><span class="status-pill ${item.schedulable ? "ok" : "neutral"}">${item.schedulable ? "参与调度" : "停止调度"}</span></div>
       </div>
       <dl>
         <div><dt>API</dt><dd class="mono">${escapeHtml(item.base_url)}</dd></div>
         <div><dt>Catalog</dt><dd class="mono">${escapeHtml(item.archive_catalog_url || "未配置")}</dd></div>
+        <div><dt>SSH</dt><dd class="mono">${escapeHtml(item.ssh_host ? `${item.ssh_username}@${item.ssh_host}:${item.ssh_port}` : "未配置")}</dd></div>
+        <div><dt>主机密钥</dt><dd class="mono">${escapeHtml(item.ssh_host_key_sha256 ? `SHA256:${item.ssh_host_key_sha256.slice(0, 18)}…` : "首次连接时记录")}</dd></div>
+        <div><dt>代理</dt><dd>${escapeHtml(item.agent_version || "—")}<small class="table-subtext">检查：${dateTime(item.agent_last_checked_at)}</small>${item.agent_last_error ? `<small class="table-subtext error-text" title="${escapeHtml(item.agent_last_error)}">${escapeHtml(item.agent_last_error)}</small>` : ""}</dd></div>
         <div><dt>作业</dt><dd>${item.job_count} 个，活动 ${item.active_job_count} 个</dd></div>
       </dl>
       <div class="instance-actions">
         <button class="button secondary small edit-instance" data-id="${item.id}" type="button">编辑</button>
+        <button class="button secondary small check-agent" data-id="${item.id}" type="button" ${item.ssh_host ? "" : "disabled"}>检查</button>
+        <button class="button primary small deploy-agent" data-id="${item.id}" type="button" ${item.ssh_host ? "" : "disabled"}>部署/拉起</button>
         <button class="button danger small delete-instance" data-id="${item.id}" type="button" ${item.job_count ? "disabled" : ""}>删除</button>
       </div>
-    </article>`).join("");
+    </article>`;
+  }).join("");
   $("backupSource").innerHTML = '<option value="">全部来源</option>' + state.instances
     .map((item) => `<option value="${escapeHtml(item.source_id)}">${escapeHtml(item.name)}</option>`).join("");
 }
@@ -384,13 +398,27 @@ async function executeSystemReset() {
 }
 
 function openInstance(item = null) {
-  $("instanceDialogTitle").textContent = item ? "编辑 iSlice 实例" : "添加 iSlice 实例";
+  $("instanceDialogTitle").textContent = item ? "编辑服务" : "添加服务";
   $("instanceId").value = item?.id || "";
   $("instanceName").value = item?.name || "";
   $("instanceSourceId").value = item?.source_id || "";
   $("instanceBaseUrl").value = item?.base_url || "";
   $("instanceCatalogUrl").value = item?.archive_catalog_url || "";
+  $("instanceSshHost").value = item?.ssh_host || "";
+  $("instanceSshPort").value = item?.ssh_port || 22;
+  $("instanceSshUsername").value = item?.ssh_username || "root";
+  $("instanceSshPassword").value = "";
+  $("instanceAgentInstallPath").value = item?.agent_install_path || "";
+  $("instanceDatabasePath").value = item?.islice_database_path || "/mnt/c/WorkSpace/PublishPackage/iSlice/data/tasks.db";
+  $("instanceStorageRoot").value = item?.storage_root || "/mnt/c/WorkSpace/PublishPackage/iSlice/storage";
+  $("instanceArchiveRemoteHost").value = item?.archive_remote_host || "192.168.6.200";
+  $("instanceArchiveRemoteUser").value = item?.archive_remote_user || "codex";
+  $("instanceArchiveRemoteRoot").value = item?.archive_remote_root || (item?.source_id ? `/mpeg/mpeg2/codex/archive/sources/${item.source_id}` : "");
+  $("instanceArchiveHttpBase").value = item?.archive_http_base || (item?.archive_catalog_url || "").replace(/\/catalog\.json$/, "");
+  $("instanceArchiveSshKey").value = item?.archive_ssh_key || "/root/.ssh/islice_archiver_ed25519";
+  $("instanceArchiveKnownHosts").value = item?.archive_known_hosts || "/root/.ssh/known_hosts";
   $("instanceSchedulable").checked = item?.schedulable ?? true;
+  $("deployAfterSave").checked = Boolean(item?.ssh_host || !item);
   $("instanceDialog").showModal();
 }
 
@@ -403,18 +431,56 @@ $("instanceForm").addEventListener("submit", async (event) => {
     baseUrl: $("instanceBaseUrl").value,
     archiveCatalogUrl: $("instanceCatalogUrl").value,
     schedulable: $("instanceSchedulable").checked,
+    sshHost: $("instanceSshHost").value,
+    sshPort: Number($("instanceSshPort").value),
+    sshUsername: $("instanceSshUsername").value,
+    sshPassword: $("instanceSshPassword").value || null,
+    agentInstallPath: $("instanceAgentInstallPath").value,
+    isliceDatabasePath: $("instanceDatabasePath").value,
+    storageRoot: $("instanceStorageRoot").value,
+    archiveRemoteHost: $("instanceArchiveRemoteHost").value,
+    archiveRemoteUser: $("instanceArchiveRemoteUser").value,
+    archiveRemoteRoot: $("instanceArchiveRemoteRoot").value,
+    archiveHttpBase: $("instanceArchiveHttpBase").value,
+    archiveSshKey: $("instanceArchiveSshKey").value,
+    archiveKnownHosts: $("instanceArchiveKnownHosts").value,
   };
   try {
-    await request(id ? `/api/islice-instances/${id}` : "/api/islice-instances", {
+    const saved = await request(id ? `/api/islice-instances/${id}` : "/api/islice-instances", {
       method: id ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
-    $("instanceDialog").close(); await loadInstances(); await loadBackups(); toast("实例配置已保存");
+    $("instanceDialog").close();
+    if ($("deployAfterSave").checked) {
+      try {
+        await request(`/api/islice-instances/${saved.id}/deploy-agent`, { method: "POST" });
+        toast("服务配置已保存，归档代理已部署并拉起");
+      } catch (deployError) {
+        toast(`服务已保存，但代理部署失败：${deployError.message}`, true);
+      }
+    } else toast("服务配置已保存");
+    await loadInstances(); await loadBackups();
   } catch (error) { toast(error.message, true); }
 });
 
 $("instanceCards").addEventListener("click", async (event) => {
   const edit = event.target.closest(".edit-instance");
   if (edit) return openInstance(state.instances.find((item) => item.id === edit.dataset.id));
+  const check = event.target.closest(".check-agent");
+  if (check) {
+    check.disabled = true;
+    try { await request(`/api/islice-instances/${check.dataset.id}/check-agent`, { method: "POST" }); await loadInstances(); toast("代理状态已更新"); }
+    catch (error) { toast(error.message, true); }
+    finally { check.disabled = false; }
+    return;
+  }
+  const deploy = event.target.closest(".deploy-agent");
+  if (deploy) {
+    deploy.disabled = true;
+    try { await request(`/api/islice-instances/${deploy.dataset.id}/deploy-agent`, { method: "POST" }); await loadInstances(); toast("归档代理已部署并拉起"); }
+    catch (error) { await loadInstances(); toast(error.message, true); }
+    finally { deploy.disabled = false; }
+    return;
+  }
   const remove = event.target.closest(".delete-instance");
   if (!remove || !confirm("确定删除这个未使用的 iSlice 实例吗？")) return;
   try { await request(`/api/islice-instances/${remove.dataset.id}`, { method: "DELETE" }); await loadInstances(); await loadBackups(); }
@@ -461,3 +527,4 @@ $("resetDialog").addEventListener("click", async (event) => {
 Promise.all([loadInstances(), loadChannels()])
   .then(loadBackups)
   .catch((error) => toast(error.message, true));
+setInterval(() => loadInstances().catch(() => {}), 15000);

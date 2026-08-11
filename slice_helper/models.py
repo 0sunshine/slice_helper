@@ -126,6 +126,43 @@ class ISliceInstanceUpsert(BaseModel):
         default="", alias="archiveCatalogUrl", max_length=2048
     )
     schedulable: bool = True
+    ssh_host: str = Field(default="", alias="sshHost", max_length=255)
+    ssh_port: int = Field(default=22, alias="sshPort", ge=1, le=65535)
+    ssh_username: str = Field(default="root", alias="sshUsername", max_length=128)
+    ssh_password: str | None = Field(default=None, alias="sshPassword", max_length=1024)
+    agent_install_path: str = Field(
+        default="", alias="agentInstallPath", max_length=2048
+    )
+    islice_database_path: str = Field(
+        default="/mnt/c/WorkSpace/PublishPackage/iSlice/data/tasks.db",
+        alias="isliceDatabasePath",
+        max_length=2048,
+    )
+    storage_root: str = Field(
+        default="/mnt/c/WorkSpace/PublishPackage/iSlice/storage",
+        alias="storageRoot",
+        max_length=2048,
+    )
+    archive_remote_host: str = Field(
+        default="192.168.6.200", alias="archiveRemoteHost", max_length=255
+    )
+    archive_remote_user: str = Field(
+        default="codex", alias="archiveRemoteUser", max_length=128
+    )
+    archive_remote_root: str = Field(
+        default="", alias="archiveRemoteRoot", max_length=2048
+    )
+    archive_http_base: str = Field(
+        default="", alias="archiveHttpBase", max_length=2048
+    )
+    archive_ssh_key: str = Field(
+        default="/root/.ssh/islice_archiver_ed25519",
+        alias="archiveSshKey",
+        max_length=2048,
+    )
+    archive_known_hosts: str = Field(
+        default="/root/.ssh/known_hosts", alias="archiveKnownHosts", max_length=2048
+    )
 
     @field_validator("source_id")
     @classmethod
@@ -158,6 +195,47 @@ class ISliceInstanceUpsert(BaseModel):
         parsed = urlsplit(normalized)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("archiveCatalogUrl must be an HTTP URL")
+        return normalized
+
+    @field_validator(
+        "ssh_host", "ssh_username", "archive_remote_host", "archive_remote_user"
+    )
+    @classmethod
+    def normalize_service_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if any(char in normalized for char in ("\x00", "\r", "\n")):
+            raise ValueError("service values cannot contain control characters")
+        return normalized
+
+    @field_validator(
+        "agent_install_path", "islice_database_path", "storage_root", "archive_remote_root",
+        "archive_ssh_key", "archive_known_hosts"
+    )
+    @classmethod
+    def validate_linux_path(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        if not normalized:
+            return ""
+        if not normalized.startswith("/") or any(char in normalized for char in ("\x00", "\r", "\n")):
+            raise ValueError("service paths must be absolute Linux paths")
+        return normalized
+
+    @field_validator("agent_install_path")
+    @classmethod
+    def validate_agent_install_path(cls, value: str) -> str:
+        if value in {"/", "/bin", "/boot", "/dev", "/etc", "/lib", "/proc", "/sbin", "/sys", "/usr"}:
+            raise ValueError("agentInstallPath cannot be a system root directory")
+        return value
+
+    @field_validator("archive_http_base")
+    @classmethod
+    def validate_archive_http_base(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        if not normalized:
+            return ""
+        parsed = urlsplit(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("archiveHttpBase must be an HTTP URL")
         return normalized
 
 

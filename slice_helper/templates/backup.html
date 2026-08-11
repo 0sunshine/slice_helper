@@ -3,25 +3,25 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>iSlice 实例与备份</title>
+  <title>iSlice 服务与备份</title>
   <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}?v={{ version }}">
 </head>
 <body>
   <header class="topbar">
-    <div><h1>iSlice 实例与备份</h1><span class="version">v{{ version }}</span></div>
+    <div><h1>iSlice 服务与备份</h1><span class="version">v{{ version }}</span></div>
     <div class="topbar-actions">
       <span id="catalogHealth" class="health neutral">检查中</span>
       <a class="button secondary button-link" href="/">返回作业</a>
       <button id="refreshBackup" class="button secondary" type="button">刷新</button>
-      <button id="addInstance" class="button primary" type="button">添加 iSlice</button>
+      <button id="addInstance" class="button primary" type="button">添加服务</button>
     </div>
   </header>
 
   <main class="backup-page">
     <section class="band">
-      <div class="section-heading"><div><h2>实例与调度</h2><span id="instanceCount" class="count">0</span></div></div>
+      <div class="section-heading"><div><h2>服务与调度</h2><span id="instanceCount" class="count">0</span></div></div>
       <div id="instanceCards" class="instance-grid"></div>
-      <div id="emptyInstances" class="empty-state" hidden>尚未配置 iSlice 实例</div>
+      <div id="emptyInstances" class="empty-state" hidden>尚未配置 iSlice 服务</div>
     </section>
 
     <section class="band backup-band">
@@ -74,17 +74,34 @@
 
   <dialog id="instanceDialog" class="instance-dialog">
     <form id="instanceForm" method="dialog">
-      <div class="dialog-header"><h2 id="instanceDialogTitle">添加 iSlice 实例</h2><button id="closeInstanceDialog" class="icon-button" type="button">×</button></div>
+      <div class="dialog-header"><h2 id="instanceDialogTitle">添加服务</h2><button id="closeInstanceDialog" class="icon-button" type="button">×</button></div>
       <input id="instanceId" type="hidden">
       <div class="form-grid instance-form-grid">
         <label>显示名称<input id="instanceName" required maxlength="255" placeholder="iSlice 128"></label>
         <label>来源标识 sourceId<input id="instanceSourceId" required maxlength="64" placeholder="islice-128"></label>
         <label class="full">iSlice API 地址<input id="instanceBaseUrl" required placeholder="http://192.168.104.128:8000"></label>
         <label class="full">归档 catalog 地址<input id="instanceCatalogUrl" placeholder="http://192.168.6.200:18080/sources/islice-128/catalog.json"></label>
+        <h3 class="form-section-title full">服务主机 SSH</h3>
+        <label>SSH 主机<input id="instanceSshHost" required placeholder="192.168.104.128"></label>
+        <label>SSH 端口<input id="instanceSshPort" required type="number" min="1" max="65535" value="22"></label>
+        <label>SSH 账号<input id="instanceSshUsername" required value="root"></label>
+        <label>SSH 密码<input id="instanceSshPassword" type="password" autocomplete="new-password" placeholder="编辑时留空表示不修改"></label>
+        <label class="full">代理安装目录<input id="instanceAgentInstallPath" required placeholder="/home/codex/islice-archiver"></label>
+        <h3 class="form-section-title full">iSlice 本地信息</h3>
+        <label class="full">iSlice 数据库<input id="instanceDatabasePath" required placeholder="/mnt/c/WorkSpace/PublishPackage/iSlice/data/tasks.db"></label>
+        <label class="full">iSlice storage<input id="instanceStorageRoot" required placeholder="/mnt/c/WorkSpace/PublishPackage/iSlice/storage"></label>
+        <h3 class="form-section-title full">远端归档存储</h3>
+        <label>归档 SSH 主机<input id="instanceArchiveRemoteHost" required value="192.168.6.200"></label>
+        <label>归档 SSH 账号<input id="instanceArchiveRemoteUser" required value="codex"></label>
+        <label class="full">远端归档目录<input id="instanceArchiveRemoteRoot" required placeholder="/mpeg/mpeg2/codex/archive/sources/islice-128"></label>
+        <label class="full">归档 HTTP 根地址<input id="instanceArchiveHttpBase" required placeholder="http://192.168.6.200:18080/sources/islice-128"></label>
+        <label class="full">主机上的归档私钥<input id="instanceArchiveSshKey" required value="/root/.ssh/islice_archiver_ed25519"></label>
+        <label class="full">主机上的 known_hosts<input id="instanceArchiveKnownHosts" required value="/root/.ssh/known_hosts"></label>
         <label class="checkbox-label full"><input id="instanceSchedulable" type="checkbox" checked>允许调度新作业</label>
+        <label class="checkbox-label full"><input id="deployAfterSave" type="checkbox" checked>保存后自动部署并拉起归档代理</label>
       </div>
       <p class="muted instance-help">关闭调度只影响后续新作业；已经绑定到该实例的作业不会迁移。</p>
-      <div class="dialog-actions"><button id="cancelInstance" class="button secondary" type="button">取消</button><button class="button primary" type="submit">保存</button></div>
+      <div class="dialog-actions"><button id="cancelInstance" class="button secondary" type="button">取消</button><button class="button primary" type="submit">保存服务</button></div>
     </form>
   </dialog>
 

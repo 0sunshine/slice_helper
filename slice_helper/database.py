@@ -126,6 +126,25 @@ class Database:
                     base_url TEXT NOT NULL UNIQUE,
                     archive_catalog_url TEXT NOT NULL DEFAULT '',
                     schedulable INTEGER NOT NULL DEFAULT 1,
+                    ssh_host TEXT NOT NULL DEFAULT '',
+                    ssh_port INTEGER NOT NULL DEFAULT 22,
+                    ssh_username TEXT NOT NULL DEFAULT 'root',
+                    ssh_password_encrypted TEXT NOT NULL DEFAULT '',
+                    ssh_host_key_sha256 TEXT NOT NULL DEFAULT '',
+                    agent_install_path TEXT NOT NULL DEFAULT '',
+                    islice_database_path TEXT NOT NULL DEFAULT '',
+                    storage_root TEXT NOT NULL DEFAULT '',
+                    archive_remote_host TEXT NOT NULL DEFAULT '',
+                    archive_remote_user TEXT NOT NULL DEFAULT '',
+                    archive_remote_root TEXT NOT NULL DEFAULT '',
+                    archive_http_base TEXT NOT NULL DEFAULT '',
+                    archive_ssh_key TEXT NOT NULL DEFAULT '',
+                    archive_known_hosts TEXT NOT NULL DEFAULT '',
+                    agent_status TEXT NOT NULL DEFAULT 'unconfigured',
+                    agent_version TEXT NOT NULL DEFAULT '',
+                    agent_last_checked_at TEXT,
+                    agent_last_error TEXT NOT NULL DEFAULT '',
+                    agent_deployed_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -576,6 +595,42 @@ class Database:
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(20, ?)",
                 (utc_now(),),
             )
+            instance_columns = {
+                row["name"]
+                for row in await (
+                    await db.execute("PRAGMA table_info(islice_instances)")
+                ).fetchall()
+            }
+            instance_migrations = {
+                "ssh_host": "TEXT NOT NULL DEFAULT ''",
+                "ssh_port": "INTEGER NOT NULL DEFAULT 22",
+                "ssh_username": "TEXT NOT NULL DEFAULT 'root'",
+                "ssh_password_encrypted": "TEXT NOT NULL DEFAULT ''",
+                "ssh_host_key_sha256": "TEXT NOT NULL DEFAULT ''",
+                "agent_install_path": "TEXT NOT NULL DEFAULT ''",
+                "islice_database_path": "TEXT NOT NULL DEFAULT ''",
+                "storage_root": "TEXT NOT NULL DEFAULT ''",
+                "archive_remote_host": "TEXT NOT NULL DEFAULT ''",
+                "archive_remote_user": "TEXT NOT NULL DEFAULT ''",
+                "archive_remote_root": "TEXT NOT NULL DEFAULT ''",
+                "archive_http_base": "TEXT NOT NULL DEFAULT ''",
+                "archive_ssh_key": "TEXT NOT NULL DEFAULT ''",
+                "archive_known_hosts": "TEXT NOT NULL DEFAULT ''",
+                "agent_status": "TEXT NOT NULL DEFAULT 'unconfigured'",
+                "agent_version": "TEXT NOT NULL DEFAULT ''",
+                "agent_last_checked_at": "TEXT",
+                "agent_last_error": "TEXT NOT NULL DEFAULT ''",
+                "agent_deployed_at": "TEXT",
+            }
+            for name, definition in instance_migrations.items():
+                if name not in instance_columns:
+                    await db.execute(
+                        f"ALTER TABLE islice_instances ADD COLUMN {name} {definition}"
+                    )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(21, ?)",
+                (utc_now(),),
+            )
             await db.commit()
 
     @staticmethod
@@ -796,12 +851,25 @@ class Database:
             ).fetchall()
         result = []
         for row in rows:
-            item = dict(row)
-            item["schedulable"] = bool(item["schedulable"])
+            item = self._public_islice_instance(dict(row))
             item["job_count"] = int(item["job_count"] or 0)
             item["active_job_count"] = int(item["active_job_count"] or 0)
             result.append(item)
         return result
+
+    @staticmethod
+    def _public_islice_instance(item: dict[str, Any]) -> dict[str, Any]:
+        encrypted = str(item.pop("ssh_password_encrypted", "") or "")
+        item["has_ssh_password"] = bool(encrypted)
+        item["schedulable"] = bool(item["schedulable"])
+        return item
+
+    async def list_islice_instances_secret(self) -> list[dict[str, Any]]:
+        async with self.connect() as db:
+            rows = await (
+                await db.execute("SELECT * FROM islice_instances ORDER BY source_id,id")
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     async def get_islice_instance(self, instance_id: str) -> dict[str, Any] | None:
         async with self.connect() as db:
@@ -810,9 +878,14 @@ class Database:
             ).fetchone()
         if row is None:
             return None
-        result = dict(row)
-        result["schedulable"] = bool(result["schedulable"])
-        return result
+        return self._public_islice_instance(dict(row))
+
+    async def get_islice_instance_secret(self, instance_id: str) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            row = await (
+                await db.execute("SELECT * FROM islice_instances WHERE id=?", (instance_id,))
+            ).fetchone()
+        return dict(row) if row else None
 
     async def create_islice_instance(self, record: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
@@ -823,6 +896,20 @@ class Database:
             "base_url": record["base_url"].rstrip("/"),
             "archive_catalog_url": record.get("archive_catalog_url", "").rstrip("/"),
             "schedulable": int(bool(record.get("schedulable", True))),
+            "ssh_host": record.get("ssh_host", ""),
+            "ssh_port": int(record.get("ssh_port", 22)),
+            "ssh_username": record.get("ssh_username", "root"),
+            "ssh_password_encrypted": record.get("ssh_password_encrypted", ""),
+            "agent_install_path": record.get("agent_install_path", ""),
+            "islice_database_path": record.get("islice_database_path", ""),
+            "storage_root": record.get("storage_root", ""),
+            "archive_remote_host": record.get("archive_remote_host", ""),
+            "archive_remote_user": record.get("archive_remote_user", ""),
+            "archive_remote_root": record.get("archive_remote_root", ""),
+            "archive_http_base": record.get("archive_http_base", ""),
+            "archive_ssh_key": record.get("archive_ssh_key", ""),
+            "archive_known_hosts": record.get("archive_known_hosts", ""),
+            "agent_status": "unconfigured",
             "created_at": now,
             "updated_at": now,
         }
@@ -832,27 +919,47 @@ class Database:
                     """
                     INSERT INTO islice_instances(
                         id,source_id,name,base_url,archive_catalog_url,
-                        schedulable,created_at,updated_at
+                        schedulable,ssh_host,ssh_port,ssh_username,
+                        ssh_password_encrypted,agent_install_path,islice_database_path,
+                        storage_root,archive_remote_host,archive_remote_user,
+                        archive_remote_root,archive_http_base,archive_ssh_key,
+                        archive_known_hosts,agent_status,created_at,updated_at
                     ) VALUES(:id,:source_id,:name,:base_url,:archive_catalog_url,
-                             :schedulable,:created_at,:updated_at) RETURNING *
+                             :schedulable,:ssh_host,:ssh_port,:ssh_username,
+                             :ssh_password_encrypted,:agent_install_path,
+                             :islice_database_path,:storage_root,:archive_remote_host,
+                             :archive_remote_user,:archive_remote_root,:archive_http_base,
+                             :archive_ssh_key,:archive_known_hosts,:agent_status,
+                             :created_at,:updated_at) RETURNING *
                     """,
                     values,
                 )
             ).fetchone()
             await db.commit()
-        result = dict(row)
-        result["schedulable"] = bool(result["schedulable"])
-        return result
+        return self._public_islice_instance(dict(row))
 
     async def update_islice_instance(
         self, instance_id: str, record: dict[str, Any]
     ) -> dict[str, Any] | None:
-        current = await self.get_islice_instance(instance_id)
+        current = await self.get_islice_instance_secret(instance_id)
         if current is None:
             return None
         old_url = str(current["base_url"])
         new_url = str(record["base_url"]).rstrip("/")
         source_id_changed = str(current["source_id"]) != str(record["source_id"])
+        ssh_endpoint_changed = (
+            str(current.get("ssh_host") or "") != str(record.get("ssh_host") or "")
+            or int(current.get("ssh_port") or 22) != int(record.get("ssh_port") or 22)
+        )
+        deploy_config_changed = any(
+            str(current.get(key) or "") != str(record.get(key) or "")
+            for key in (
+                "ssh_host", "ssh_port", "ssh_username", "agent_install_path",
+                "islice_database_path", "storage_root", "archive_remote_host",
+                "archive_remote_user", "archive_remote_root", "archive_http_base",
+                "archive_ssh_key", "archive_known_hosts",
+            )
+        ) or "ssh_password_encrypted" in record
         if old_url != new_url or source_id_changed:
             async with self.connect() as db:
                 used = await (
@@ -874,6 +981,28 @@ class Database:
             "base_url": new_url,
             "archive_catalog_url": record.get("archive_catalog_url", "").rstrip("/"),
             "schedulable": int(bool(record.get("schedulable", True))),
+            "ssh_host": record.get("ssh_host", ""),
+            "ssh_port": int(record.get("ssh_port", 22)),
+            "ssh_username": record.get("ssh_username", "root"),
+            "ssh_password_encrypted": record.get(
+                "ssh_password_encrypted", current.get("ssh_password_encrypted", "")
+            ),
+            "agent_install_path": record.get("agent_install_path", ""),
+            "islice_database_path": record.get("islice_database_path", ""),
+            "storage_root": record.get("storage_root", ""),
+            "archive_remote_host": record.get("archive_remote_host", ""),
+            "archive_remote_user": record.get("archive_remote_user", ""),
+            "archive_remote_root": record.get("archive_remote_root", ""),
+            "archive_http_base": record.get("archive_http_base", ""),
+            "archive_ssh_key": record.get("archive_ssh_key", ""),
+            "archive_known_hosts": record.get("archive_known_hosts", ""),
+            "ssh_host_key_sha256": (
+                "" if ssh_endpoint_changed else current.get("ssh_host_key_sha256", "")
+            ),
+            "agent_status": (
+                "unconfigured" if deploy_config_changed else current.get("agent_status", "unconfigured")
+            ),
+            "agent_last_error": "" if deploy_config_changed else current.get("agent_last_error", ""),
             "updated_at": utc_now(),
             "id": instance_id,
         }
@@ -883,16 +1012,62 @@ class Database:
                     """
                     UPDATE islice_instances SET source_id=:source_id,name=:name,
                         base_url=:base_url,archive_catalog_url=:archive_catalog_url,
-                        schedulable=:schedulable,updated_at=:updated_at
+                        schedulable=:schedulable,ssh_host=:ssh_host,ssh_port=:ssh_port,
+                        ssh_username=:ssh_username,
+                        ssh_password_encrypted=:ssh_password_encrypted,
+                        agent_install_path=:agent_install_path,
+                        islice_database_path=:islice_database_path,
+                        storage_root=:storage_root,
+                        archive_remote_host=:archive_remote_host,
+                        archive_remote_user=:archive_remote_user,
+                        archive_remote_root=:archive_remote_root,
+                        archive_http_base=:archive_http_base,
+                        archive_ssh_key=:archive_ssh_key,
+                        archive_known_hosts=:archive_known_hosts,
+                        ssh_host_key_sha256=:ssh_host_key_sha256,
+                        agent_status=:agent_status,
+                        agent_last_error=:agent_last_error,
+                        updated_at=:updated_at
                     WHERE id=:id RETURNING *
                     """,
                     fields,
                 )
             ).fetchone()
             await db.commit()
-        result = dict(row)
-        result["schedulable"] = bool(result["schedulable"])
-        return result
+        return self._public_islice_instance(dict(row))
+
+    async def update_agent_health(
+        self,
+        instance_id: str,
+        *,
+        status: str,
+        version: str | None = None,
+        error: str = "",
+        host_key: str = "",
+        deployed: bool = False,
+    ) -> None:
+        now = utc_now()
+        assignments = [
+            "agent_status=?", "agent_last_checked_at=?", "agent_last_error=?",
+            "updated_at=?",
+        ]
+        values: list[Any] = [status, now, error, now]
+        if version is not None:
+            assignments.append("agent_version=?")
+            values.append(version)
+        if host_key:
+            assignments.append("ssh_host_key_sha256=?")
+            values.append(host_key)
+        if deployed:
+            assignments.append("agent_deployed_at=?")
+            values.append(now)
+        values.append(instance_id)
+        async with self.connect() as db:
+            await db.execute(
+                f"UPDATE islice_instances SET {', '.join(assignments)} WHERE id=?",
+                values,
+            )
+            await db.commit()
 
     async def delete_islice_instance(self, instance_id: str) -> bool:
         current = await self.get_islice_instance(instance_id)

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -148,20 +149,24 @@ def validate_agent_receipts(
 
 
 def prepare_agent_command(
-    source_id: str, request_id: str, nonce: str, confirmation: str
+    source_id: str, request_id: str, nonce: str, confirmation: str, install_path: str
 ) -> str:
+    root = install_path.rstrip("/") or "/opt/islice-archiver"
     return (
-        "python3 /opt/islice-archiver/islice_archiver.py "
-        "--config /etc/islice-archiver.ini prepare-reset "
+        f"python3 {shlex.quote(root + '/islice_archiver.py')} "
+        f"--config {shlex.quote(root + '/islice-archiver.ini')} prepare-reset "
         f"--request-id {request_id} --nonce {nonce} "
         f"--confirm '{confirmation}' --json"
     )
 
 
-def commit_agent_command(receipt: dict[str, Any], confirmation: str) -> str:
+def commit_agent_command(
+    receipt: dict[str, Any], confirmation: str, install_path: str
+) -> str:
+    root = install_path.rstrip("/") or "/opt/islice-archiver"
     return (
-        "python3 /opt/islice-archiver/islice_archiver.py "
-        "--config /etc/islice-archiver.ini commit-reset "
+        f"python3 {shlex.quote(root + '/islice_archiver.py')} "
+        f"--config {shlex.quote(root + '/islice-archiver.ini')} commit-reset "
         f"--request-id {receipt['requestId']} --proof {receipt['proof']} "
         f"--confirm '{confirmation}' --services-stopped"
     )

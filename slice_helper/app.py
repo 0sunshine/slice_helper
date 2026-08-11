@@ -60,6 +60,7 @@ from .system_reset import (
 )
 from .processing import calculate_total_windows
 from .source_download import HttpSourceDownloader, SourceDownloadError
+from .service_manager import ServiceManagementError, ServiceManager
 from .time_ocr import TimeReference
 
 
@@ -168,6 +169,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         archive_catalog = ArchiveCatalogReader()
         orchestrator = Orchestrator(configured, database, media, islice)
+        service_manager = ServiceManager(
+            database, configured.data_dir, configured.public_base_url, PACKAGE_DIR
+        )
         app.state.settings = configured
         app.state.database = database
         app.state.media = media
@@ -175,14 +179,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.islice = islice
         app.state.archive_catalog = archive_catalog
         app.state.orchestrator = orchestrator
+        app.state.service_manager = service_manager
         app.state.system_reset_lock = asyncio.Lock()
         app.state.system_write_condition = asyncio.Condition()
         app.state.active_write_requests = 0
         app.state.system_reset_in_progress = False
         await orchestrator.start()
+        await service_manager.start()
         try:
             yield
         finally:
+            await service_manager.stop()
             await orchestrator.stop()
             await archive_catalog.close()
             await islice.close()
@@ -235,9 +242,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.post("/api/islice-instances", status_code=201)
     async def create_islice_instance(request: Request, body: ISliceInstanceUpsert):
+        record = body.model_dump()
+        password = record.pop("ssh_password", None)
+        record["ssh_password_encrypted"] = (
+            request.app.state.service_manager.cipher.encrypt(password) if password else ""
+        )
         try:
             instance = await request.app.state.database.create_islice_instance(
-                body.model_dump()
+                record
             )
         except sqlite3.IntegrityError as exc:
             raise HTTPException(status_code=409, detail="sourceId 或 iSlice 地址已存在") from exc
@@ -251,9 +263,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def update_islice_instance(
         request: Request, instance_id: str, body: ISliceInstanceUpsert
     ):
+        record = body.model_dump()
+        password = record.pop("ssh_password", None)
+        if password:
+            record["ssh_password_encrypted"] = (
+                request.app.state.service_manager.cipher.encrypt(password)
+            )
         try:
             instance = await request.app.state.database.update_islice_instance(
-                instance_id, body.model_dump()
+                instance_id, record
             )
         except sqlite3.IntegrityError as exc:
             raise HTTPException(status_code=409, detail="sourceId 或 iSlice 地址已存在") from exc
@@ -266,6 +284,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         request.app.state.orchestrator.notify()
         return instance
+
+    @application.post("/api/islice-instances/{instance_id}/deploy-agent")
+    async def deploy_archive_agent(request: Request, instance_id: str):
+        try:
+            result = await request.app.state.service_manager.deploy(instance_id)
+        except ServiceManagementError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return result
+
+    @application.post("/api/islice-instances/{instance_id}/check-agent")
+    async def check_archive_agent(request: Request, instance_id: str):
+        instance = await request.app.state.database.get_islice_instance(instance_id)
+        if instance is None:
+            raise HTTPException(status_code=404, detail="服务不存在")
+        return await request.app.state.service_manager.probe(instance_id)
 
     @application.delete("/api/islice-instances/{instance_id}", status_code=204)
     async def delete_islice_instance(request: Request, instance_id: str):
@@ -408,6 +441,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "sourceId": str(instance["source_id"]),
                 "name": str(instance["name"]),
                 "baseUrl": str(instance["base_url"]),
+                "agentInstallPath": str(instance.get("agent_install_path") or ""),
                 "prepareConfirmation": f"BACKUP {instance['source_id']} {short_id}",
             }
             for instance in instances
@@ -433,6 +467,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 request_id,
                 nonce,
                 source["prepareConfirmation"],
+                source["agentInstallPath"],
             )
         return {
             **preview,
@@ -499,6 +534,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 except (SystemResetError, ValueError, OSError, sqlite3.Error) as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
                 commands = []
+                install_paths = {
+                    str(source["sourceId"]): str(source.get("agentInstallPath") or "")
+                    for source in preview.get("sources", [])
+                }
                 for receipt in receipts:
                     confirmation = (
                         f"RESET {receipt['sourceId']} {body.request_id[:8]}"
@@ -507,7 +546,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         {
                             "sourceId": receipt["sourceId"],
                             "confirmation": confirmation,
-                            "command": commit_agent_command(receipt, confirmation),
+                            "command": commit_agent_command(
+                                receipt,
+                                confirmation,
+                                install_paths.get(str(receipt["sourceId"]), ""),
+                            ),
                         }
                     )
                 request.app.state.orchestrator.notify()

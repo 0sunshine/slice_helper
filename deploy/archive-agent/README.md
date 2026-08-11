@@ -33,6 +33,27 @@ Archive sequence:
 An empty or missing media URL in `segments.json` causes `archived_hold`: the
 available output is archived, but the local task is never deleted automatically.
 
+## Managed deployment (no systemd)
+
+The helper's “添加服务” workflow uploads the agent and generated INI into the
+absolute installation directory entered on the page. It does not install a
+systemd unit and does not require sudo. It starts a normal user process:
+
+```bash
+nohup python3 INSTALL_DIR/islice_archiver.py \
+  --config INSTALL_DIR/islice-archiver.ini run-forever --interval 300 \
+  >> INSTALL_DIR/agent.log 2>&1 < /dev/null &
+```
+
+`agent.pid`, `agent.log`, `archive.db`, manifests and reset backups stay below
+that same directory. The SSH account must be able to read the iSlice database
+and storage paths and must already have a private key plus `known_hosts` entry
+for the archive server. The helper records the service host's SSH fingerprint
+on first connection and rejects later changes.
+
+The `.service` and `.timer` files in this directory are retained only for older
+manual installations; the web deployment workflow never uploads or uses them.
+
 ## Commands
 
 ```bash

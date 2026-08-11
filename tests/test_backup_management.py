@@ -339,11 +339,15 @@ def test_backup_page_and_instance_api(tmp_path: Path, monkeypatch) -> None:
     with TestClient(create_app(make_settings(tmp_path))) as client:
         page = client.get("/backup")
         assert page.status_code == 200
-        assert "iSlice 实例与备份" in page.text
+        assert "iSlice 服务与备份" in page.text
         assert 'id="backupChannel"' in page.text
         assert 'id="backupDate"' in page.text
         assert 'id="archivePreviewDialog"' in page.text
         assert 'id="archivePreviewVideo"' in page.text
+        assert 'id="instanceSshHost"' in page.text
+        assert 'id="instanceAgentInstallPath"' in page.text
+        assert "保存后自动部署并拉起归档代理" in page.text
+        assert "添加服务" in page.text
         assert 'id="startSystemReset"' in page.text
         assert 'id="resetDialog"' in page.text
         assert "媒体目录不会被备份或删除" in page.text
@@ -360,6 +364,18 @@ def test_backup_page_and_instance_api(tmp_path: Path, monkeypatch) -> None:
             },
         )
         assert response.status_code == 201
+        assert response.json()["has_ssh_password"] is False
+        assert "ssh_password_encrypted" not in response.json()
+
+        async def fake_deploy(instance_id):
+            return {"online": True, "version": "test", "instanceId": instance_id}
+
+        client.app.state.service_manager.deploy = fake_deploy
+        deployed = client.post(
+            f"/api/islice-instances/{response.json()['id']}/deploy-agent"
+        )
+        assert deployed.status_code == 200
+        assert deployed.json()["online"] is True
         status = client.get("/api/archive/status").json()
         assert status["total"] == 0
         preview = client.get("/api/archive/tasks/islice-128/task-1/preview")

@@ -236,6 +236,7 @@ dialog::backdrop { background: #1c252180; }
 .instance-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
 .instance-card { padding: 14px; border: 1px solid #d8ddd9; border-radius: 7px; background: #fff; }
 .instance-card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.instance-statuses { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
 .instance-card-head > div { display: flex; flex-direction: column; gap: 4px; }
 .instance-card-head strong { font-size: 15px; }
 .instance-card-head .mono { color: #737b75; font-size: 11px; }
@@ -276,8 +277,10 @@ dialog::backdrop { background: #1c252180; }
 .archive-preview-warnings { max-height: 110px; padding: 8px 20px; overflow-y: auto; border-top: 1px solid #e5c67f; background: #fff6df; color: #795000; }
 .archive-preview-warnings p { margin: 3px 0; }
 .error-text { color: #a52e21; }
-.instance-dialog { width: min(720px, calc(100vw - 28px)); }
-.instance-form-grid { padding: 18px 20px 8px; }
+.instance-dialog { width: min(820px, calc(100vw - 28px)); }
+.instance-dialog form { max-height: min(90vh, 900px); display: flex; flex-direction: column; }
+.instance-form-grid { min-height: 0; padding: 18px 20px 8px; overflow-y: auto; }
+.form-section-title { margin: 6px 0 -3px; padding-top: 12px; border-top: 1px solid #dfe3df; color: #34483f; font-size: 13px; }
 .instance-help { padding: 0 20px 12px; }
 .checkbox-label { display: flex !important; flex-direction: row !important; align-items: center; gap: 8px; }
 .checkbox-label input { width: 17px; min-height: 17px; margin: 0; accent-color: #176b57; }
