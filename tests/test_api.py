@@ -149,8 +149,8 @@ def test_job_api_control_and_database_backed_chunk_route(
         ):
             assert f'<option value="{content_type}">{content_type}</option>' in home.text
         assert 'id="summaryISlice"' in home.text
-        assert "/static/styles.css?v=0.12.0" in home.text
-        assert "/static/app.js?v=0.12.0" in home.text
+        assert "/static/styles.css?v=0.12.2" in home.text
+        assert "/static/app.js?v=0.12.2" in home.text
         assert 'id="tailRebuildDialog"' in home.text
         assert 'id="tailRebuildConfirmation"' in home.text
         assert "TS 路径或 HTTP 地址" in home.text
