@@ -154,6 +154,9 @@ dialog::backdrop { background: #1c252180; }
 .confirm-dialog-body dd { overflow-wrap: anywhere; }
 .confirm-dialog-body .form-error { margin: 12px 0 0; }
 .confirm-warning { color: #8a5100; }
+.tail-rebuild-dialog { width: min(640px, calc(100vw - 28px)); }
+.destructive-confirm-label { display: flex; flex-direction: column; gap: 7px; color: #4f5751; font-size: 12px; }
+.destructive-confirm-label strong { color: #a52e21; }
 .channels-dialog { width: min(720px, calc(100vw - 28px)); }
 .channel-create-row { padding: 16px 20px; display: flex; align-items: flex-end; gap: 10px; border-bottom: 1px solid #e7eae7; }
 .channel-create-row label { flex: 1; display: flex; flex-direction: column; gap: 6px; color: #4f5751; font-size: 12px; }

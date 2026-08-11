@@ -1,7 +1,8 @@
 const state = {
   jobs: [], channels: [], selectedJobId: null, detail: null, segments: [],
   jobPage: 1, jobPageSize: 20, jobTotal: 0, jobTotalPages: 1,
-  segmentPage: 1, previewUrl: null, resplitTarget: null, segmentEditTarget: null
+  segmentPage: 1, previewUrl: null, resplitTarget: null, tailRebuildTarget: null,
+  segmentEditTarget: null
 };
 const SEGMENTS_PER_PAGE = 10;
 const CONTENT_TYPES = [
@@ -219,7 +220,7 @@ async function loadDetail(jobId, scroll) {
 }
 
 function renderDetail() {
-  const { job, windows, attempts = [] } = state.detail;
+  const { job, windows, attempts = [], rebuild = null } = state.detail;
   $("detailBand").hidden = false;
   $("detailId").textContent = job.id;
   $("detailTitle").textContent = sourceName(job);
@@ -250,7 +251,7 @@ function renderDetail() {
   $("detailError").hidden = !job.error_message;
   $("detailError").textContent = job.error_message || "";
   $("detailWarnings").innerHTML = (job.warnings || []).map((warning) => `<p>${escapeHtml(warning)}</p>`).join("");
-  renderActions(job);
+  renderActions(job, rebuild);
 
   const latestAttempts = new Map();
   attempts.forEach((attempt) => latestAttempts.set(attempt.window_index, attempt));
@@ -269,7 +270,7 @@ function renderDetail() {
       <td class="mono window-submitted-at">${escapeHtml(formatDate(latestAttempts.get(windowItem.window_index)?.submitted_at))}</td>
       <td>${windowItem.handoff_start == null ? "-" : formatSeconds(windowItem.handoff_start)}</td>
       <td>${escapeHtml(windowItem.error_message || "-")}</td>
-      <td>${renderResplitAction(job, windowItem, latestAttempts.get(windowItem.window_index))}</td>
+      <td>${renderWindowActions(job, windowItem, latestAttempts.get(windowItem.window_index), rebuild)}</td>
     </tr>`).join("");
   $("windowsBody").querySelectorAll(".resplit-window").forEach((button) => {
     button.addEventListener("click", () => openResplit({
@@ -283,6 +284,12 @@ function renderDetail() {
       jobId: job.id,
       windowIndex: Number(button.dataset.windowIndex),
       taskId: button.dataset.taskId
+    }));
+  });
+  $("windowsBody").querySelectorAll(".tail-rebuild-window").forEach((button) => {
+    button.addEventListener("click", () => openTailRebuild({
+      jobId: job.id,
+      windowIndex: Number(button.dataset.windowIndex)
     }));
   });
 
@@ -331,6 +338,17 @@ function renderResplitAction(job, windowItem, attempt) {
         title="接纳已保存的重拆结果，不再调用 iSlice">允许重叠并合并</button>`
     : "";
   return `<span class="window-actions">${resplitButton}${overlapButton}</span>`;
+}
+
+function renderWindowActions(job, windowItem, attempt, rebuild) {
+  const resplit = renderResplitAction(job, windowItem, attempt);
+  const jobReady = ["paused", "completed", "failed", "stopped"].includes(job.status);
+  const cleanupActive = ["deleting", "cleanup_failed"].includes(rebuild?.status);
+  const disabled = !(jobReady && !cleanupActive);
+  const rebuildButton = `<button class="button danger small tail-rebuild-window" type="button"
+    data-window-index="${windowItem.window_index}"
+    title="删除此窗口及后续结果，清理旧任务后从这里重新执行" ${disabled ? "disabled" : ""}>从此窗口重跑</button>`;
+  return `<span class="window-actions">${resplit}${rebuildButton}</span>`;
 }
 
 function renderSegments() {
@@ -594,11 +612,17 @@ function resetPreview() {
   });
 }
 
-function renderActions(job) {
+function renderActions(job, rebuild) {
   const actions = [];
-  if (["pending_schedule", "queued", "running"].includes(job.status)) actions.push(`<button class="button warning small" data-action="pause" type="button">暂停</button>`);
-  if (["paused", "failed"].includes(job.status)) actions.push(`<button class="button primary small" data-action="resume" type="button">继续</button>`);
-  if (!["completed", "stopped"].includes(job.status)) actions.push(`<button class="button danger small" data-action="stop" type="button">停止</button>`);
+  const cleanupActive = ["deleting", "cleanup_failed"].includes(rebuild?.status);
+  if (rebuild?.status === "deleting") {
+    actions.push(`<button class="button warning small" type="button" disabled>正在清理旧任务</button>`);
+  } else if (rebuild?.status === "cleanup_failed") {
+    actions.push(`<button class="button danger small" data-action="retry-cleanup" type="button">重试清理并开始</button>`);
+  }
+  if (!cleanupActive && ["pending_schedule", "queued", "running"].includes(job.status)) actions.push(`<button class="button warning small" data-action="pause" type="button">暂停</button>`);
+  if (!cleanupActive && ["paused", "failed"].includes(job.status)) actions.push(`<button class="button primary small" data-action="resume" type="button">继续</button>`);
+  if (!cleanupActive && !["completed", "stopped"].includes(job.status)) actions.push(`<button class="button danger small" data-action="stop" type="button">停止</button>`);
   actions.push(`<a class="button secondary small external-link" href="/api/jobs/${escapeHtml(job.id)}/result?download=true">下载 JSON</a>`);
   $("detailActions").innerHTML = actions.join("");
   $("detailActions").querySelectorAll("button[data-action]").forEach((button) => button.addEventListener("click", () => controlJob(job.id, button.dataset.action)));
@@ -606,8 +630,11 @@ function renderActions(job) {
 
 async function controlJob(jobId, action) {
   try {
-    await api(`/api/jobs/${jobId}/${action}`, { method: "POST" });
-    showToast("作业状态已更新");
+    const path = action === "retry-cleanup"
+      ? `/api/jobs/${jobId}/tail-rebuild/retry-cleanup`
+      : `/api/jobs/${jobId}/${action}`;
+    await api(path, { method: "POST" });
+    showToast(action === "retry-cleanup" ? "已重新开始清理旧任务" : "作业状态已更新");
     await loadJobs();
   } catch (error) { showToast(error.message); }
 }
@@ -729,6 +756,56 @@ async function submitResplit(event) {
   }
 }
 
+async function openTailRebuild(target) {
+  try {
+    const preview = await api(
+      `/api/jobs/${target.jobId}/windows/${target.windowIndex}/tail-rebuild-preview`
+    );
+    state.tailRebuildTarget = { ...target, preview };
+    $("tailRebuildWindow").textContent = String(preview.startWindowNumber);
+    $("tailRebuildKeepCount").textContent = `${preview.keptWindowCount} 个窗口`;
+    $("tailRebuildDeleteCount").textContent = `${preview.deletedWindowCount} 个窗口 / ${preview.deletedAttemptCount} 次 attempt / ${preview.deletedSegmentCount} 条结果`;
+    $("tailRebuildTaskCount").textContent = `${preview.oldTaskCount} 个`;
+    $("tailRebuildSourceStart").textContent = formatSeconds(preview.sourceStart);
+    $("tailRebuildAbsoluteStart").textContent = preview.absoluteStart ? formatDate(preview.absoluteStart) : "-";
+    $("tailRebuildConfirmationLabel").textContent = preview.confirmationText;
+    $("tailRebuildConfirmation").value = "";
+    $("tailRebuildConfirmation").placeholder = preview.confirmationText;
+    $("tailRebuildError").hidden = true;
+    $("tailRebuildDialog").showModal();
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function submitTailRebuild(event) {
+  event.preventDefault();
+  const target = state.tailRebuildTarget;
+  if (!target) return;
+  const submit = $("submitTailRebuildButton");
+  submit.disabled = true;
+  submit.textContent = "正在截断并清理";
+  try {
+    await api(`/api/jobs/${target.jobId}/windows/${target.windowIndex}/tail-rebuild`, {
+      method: "POST",
+      body: JSON.stringify({
+        previewToken: target.preview.previewToken,
+        confirmationText: $("tailRebuildConfirmation").value
+      })
+    });
+    $("tailRebuildDialog").close();
+    state.tailRebuildTarget = null;
+    showToast(`已删除窗口 ${target.windowIndex + 1} 及之后的数据，正在清理旧任务`);
+    await loadJobs();
+  } catch (error) {
+    $("tailRebuildError").textContent = error.message;
+    $("tailRebuildError").hidden = false;
+  } finally {
+    submit.disabled = false;
+    submit.textContent = "确认删除并重跑";
+  }
+}
+
 async function acceptOverlap(target) {
   const confirmed = window.confirm(
     `将接纳任务 ${target.taskId} 已保存的重拆结果，并保留后续窗口现有结果。\n\n` +
@@ -793,6 +870,8 @@ $("closeChannelsButton").addEventListener("click", () => $("channelsDialog").clo
 $("doneChannelsButton").addEventListener("click", () => $("channelsDialog").close());
 $("closeResplitButton").addEventListener("click", () => $("resplitDialog").close());
 $("cancelResplitButton").addEventListener("click", () => $("resplitDialog").close());
+$("closeTailRebuildButton").addEventListener("click", () => $("tailRebuildDialog").close());
+$("cancelTailRebuildButton").addEventListener("click", () => $("tailRebuildDialog").close());
 $("closeSegmentEditButton").addEventListener("click", () => $("segmentEditDialog").close());
 $("cancelSegmentEditButton").addEventListener("click", () => $("segmentEditDialog").close());
 $("restoreSegmentEditButton").addEventListener("click", restoreSegmentEdit);
@@ -850,6 +929,7 @@ $("previewVideo").addEventListener("error", () => {
 $("createForm").addEventListener("submit", submitCreate);
 $("channelCreateForm").addEventListener("submit", submitChannel);
 $("resplitForm").addEventListener("submit", submitResplit);
+$("tailRebuildForm").addEventListener("submit", submitTailRebuild);
 $("segmentEditForm").addEventListener("submit", submitSegmentEdit);
 $("refreshButton").addEventListener("click", () => loadJobs().catch((error) => showToast(error.message)));
 $("saveTimeReferenceButton").addEventListener("click", saveTimeReference);

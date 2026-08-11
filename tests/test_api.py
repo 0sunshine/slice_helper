@@ -149,8 +149,10 @@ def test_job_api_control_and_database_backed_chunk_route(
         ):
             assert f'<option value="{content_type}">{content_type}</option>' in home.text
         assert 'id="summaryISlice"' in home.text
-        assert "/static/styles.css?v=0.11.2" in home.text
-        assert "/static/app.js?v=0.11.2" in home.text
+        assert "/static/styles.css?v=0.11.3" in home.text
+        assert "/static/app.js?v=0.11.3" in home.text
+        assert 'id="tailRebuildDialog"' in home.text
+        assert 'id="tailRebuildConfirmation"' in home.text
         assert "TS 路径或 HTTP 地址" in home.text
         assert 'id="manageChannelsButton"' in home.text
         assert 'id="jobPageInfo"' in home.text
@@ -158,6 +160,8 @@ def test_job_api_control_and_database_backed_chunk_route(
         styles_css = client.get("/static/styles.css")
         assert app_js.status_code == 200
         assert styles_css.status_code == 200
+        assert "从此窗口重跑" in app_js.text
+        assert "重试清理并开始" in app_js.text
         assert "is-latest-submitted" in app_js.text
         assert "is-latest-submitted" in styles_css.text
         assert "width: 48px" in styles_css.text

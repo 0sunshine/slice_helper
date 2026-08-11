@@ -160,6 +160,15 @@ class WindowResplitRequest(BaseModel):
     )
 
 
+class TailRebuildRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    preview_token: str = Field(alias="previewToken", min_length=64, max_length=64)
+    confirmation_text: str = Field(
+        alias="confirmationText", min_length=1, max_length=100
+    )
+
+
 class MediaProbe(BaseModel):
     duration: float
     format_name: str

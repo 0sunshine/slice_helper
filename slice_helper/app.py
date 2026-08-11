@@ -32,9 +32,16 @@ from .models import (
     JobStatus,
     SegmentUpdate,
     TimeReferenceUpdate,
+    TailRebuildRequest,
     WindowResplitRequest,
 )
-from .orchestrator import Orchestrator, ResplitConflictError, ResplitValidationError
+from .orchestrator import (
+    Orchestrator,
+    RebuildConflictError,
+    RebuildValidationError,
+    ResplitConflictError,
+    ResplitValidationError,
+)
 from .processing import calculate_total_windows
 from .source_download import HttpSourceDownloader, SourceDownloadError
 
@@ -387,7 +394,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Job not found")
         windows = await request.app.state.database.get_windows(job_id)
         attempts = await request.app.state.database.get_attempts_for_job(job_id)
-        return {"job": _public_job(job), "windows": windows, "attempts": attempts}
+        rebuild = await request.app.state.database.get_latest_job_rebuild(job_id)
+        return {
+            "job": _public_job(job),
+            "windows": windows,
+            "attempts": attempts,
+            "rebuild": (
+                request.app.state.orchestrator._public_rebuild(rebuild)
+                if rebuild else None
+            ),
+        }
 
     @application.patch("/api/jobs/{job_id}/review")
     async def update_job_review(
@@ -535,6 +551,60 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             status_code = 404 if str(exc) in {"Job not found", "Window not found"} else 400
             raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
+    @application.get(
+        "/api/jobs/{job_id}/windows/{window_index}/tail-rebuild-preview"
+    )
+    async def preview_tail_rebuild(
+        request: Request, job_id: str, window_index: int
+    ):
+        try:
+            return await request.app.state.orchestrator.preview_tail_rebuild(
+                job_id, window_index
+            )
+        except RebuildConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RebuildValidationError as exc:
+            status_code = 404 if str(exc) in {"Job not found", "Window not found"} else 400
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        except ValueError as exc:
+            status_code = 404 if str(exc) == "Window not found" else 400
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+    @application.post(
+        "/api/jobs/{job_id}/windows/{window_index}/tail-rebuild",
+        status_code=202,
+    )
+    async def start_tail_rebuild(
+        request: Request,
+        job_id: str,
+        window_index: int,
+        body: TailRebuildRequest,
+    ):
+        try:
+            return await request.app.state.orchestrator.start_tail_rebuild(
+                job_id,
+                window_index,
+                body.preview_token,
+                body.confirmation_text,
+            )
+        except RebuildConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RebuildValidationError as exc:
+            status_code = 404 if str(exc) in {"Job not found", "Window not found"} else 400
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+    @application.post(
+        "/api/jobs/{job_id}/tail-rebuild/retry-cleanup",
+        status_code=202,
+    )
+    async def retry_tail_rebuild_cleanup(request: Request, job_id: str):
+        try:
+            return await request.app.state.orchestrator.retry_tail_rebuild_cleanup(job_id)
+        except RebuildConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RebuildValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @application.get("/api/jobs/{job_id}/result")
     async def get_result(request: Request, job_id: str, download: bool = Query(default=False)):
         if not await request.app.state.database.get_job(job_id):
@@ -570,6 +640,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.post("/api/jobs/{job_id}/resume")
     async def resume_job(request: Request, job_id: str):
         job = await _require_job(request, job_id)
+        rebuild = await request.app.state.database.get_latest_job_rebuild(job_id)
+        if rebuild and rebuild["status"] in {"deleting", "cleanup_failed"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Old iSlice tasks must be cleaned before this job can resume",
+            )
         if job["status"] not in {JobStatus.PAUSED.value, JobStatus.FAILED.value}:
             raise HTTPException(status_code=409, detail="Only paused or failed jobs can be resumed")
         await request.app.state.database.update_job(
@@ -585,6 +661,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.post("/api/jobs/{job_id}/stop")
     async def stop_job(request: Request, job_id: str):
         job = await _require_job(request, job_id)
+        rebuild = await request.app.state.database.get_latest_job_rebuild(job_id)
+        if rebuild and rebuild["status"] in {"deleting", "cleanup_failed"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Old iSlice task cleanup cannot be stopped; retry cleanup if it failed",
+            )
         if job["status"] in {
             JobStatus.COMPLETED.value,
             JobStatus.STOPPED.value,
@@ -617,6 +699,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             path,
             media_type="video/mp2t",
             filename=f"{job_id}-window-{window_index:03d}.ts",
+        )
+
+    @application.get(
+        "/internal/chunks/{job_id}/{generation}/{window_index}.ts",
+        include_in_schema=False,
+    )
+    async def get_versioned_chunk(
+        request: Request, job_id: str, generation: int, window_index: int
+    ):
+        job = await request.app.state.database.get_job(job_id)
+        if not job or int(job.get("rebuild_revision") or 0) != generation:
+            raise HTTPException(status_code=404, detail="Chunk generation not found")
+        window = await request.app.state.database.get_window(job_id, window_index)
+        if not window or not window.get("chunk_path"):
+            raise HTTPException(status_code=404, detail="Chunk not found")
+        path = Path(window["chunk_path"])
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="Chunk is no longer available")
+        return FileResponse(
+            path,
+            media_type="video/mp2t",
+            filename=f"{job_id}-g{generation}-window-{window_index:03d}.ts",
         )
 
     @application.get("/health/live")
