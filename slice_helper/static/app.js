@@ -1,8 +1,7 @@
 const state = {
   jobs: [], channels: [], selectedJobId: null, detail: null, segments: [],
   jobPage: 1, jobPageSize: 20, jobTotal: 0, jobTotalPages: 1,
-  segmentPage: 1, previewUrl: null, resplitTarget: null, segmentEditTarget: null,
-  selectedWindowIndexes: new Set(), rangeResplitPreview: null
+  segmentPage: 1, previewUrl: null, resplitTarget: null, segmentEditTarget: null
 };
 const SEGMENTS_PER_PAGE = 10;
 const CONTENT_TYPES = [
@@ -204,7 +203,6 @@ async function loadDetail(jobId, scroll) {
   if (state.selectedJobId && state.selectedJobId !== jobId) {
     resetPreview();
     state.segmentPage = 1;
-    state.selectedWindowIndexes.clear();
   }
   state.selectedJobId = jobId;
   const [detail, segments] = await Promise.all([
@@ -221,7 +219,7 @@ async function loadDetail(jobId, scroll) {
 }
 
 function renderDetail() {
-  const { job, windows, attempts = [], rangeResplit = null } = state.detail;
+  const { job, windows, attempts = [] } = state.detail;
   $("detailBand").hidden = false;
   $("detailId").textContent = job.id;
   $("detailTitle").textContent = sourceName(job);
@@ -261,45 +259,18 @@ function renderDetail() {
     return !latest || attempt.submitted_at > latest.submitted_at ? attempt : latest;
   }, null);
   const latestSubmittedWindowIndex = latestSubmittedAttempt?.window_index;
-  const rangeBatch = rangeResplit?.batch || null;
-  const rangeRows = new Map((rangeResplit?.windows || []).map((item) => [item.window_index, item]));
-  const rangeActive = Boolean(rangeBatch && ["queued", "running", "committing"].includes(rangeBatch.status));
-  const jobReady = ["paused", "completed", "failed", "stopped"].includes(job.status);
-  const eligibleIndexes = new Set(windows.filter((windowItem) => {
-    const attempt = latestAttempts.get(windowItem.window_index);
-    return jobReady && !rangeActive && attempt && ["completed", "failed", "discarded"].includes(attempt.status);
-  }).map((item) => item.window_index));
-  state.selectedWindowIndexes = new Set(
-    [...state.selectedWindowIndexes].filter((index) => eligibleIndexes.has(index))
-  );
-  $("windowsBody").innerHTML = windows.map((windowItem) => {
-    const attempt = latestAttempts.get(windowItem.window_index);
-    const selected = state.selectedWindowIndexes.has(windowItem.window_index);
-    const rangeRow = rangeRows.get(windowItem.window_index);
-    const classes = [
-      "window-row",
-      windowItem.window_index === latestSubmittedWindowIndex ? "is-latest-submitted" : "",
-      selected ? "is-range-selected" : ""
-    ].filter(Boolean).join(" ");
-    return `
-      <tr class="${classes}">
-        <td><input class="window-range-checkbox" type="checkbox" data-window-index="${windowItem.window_index}"
-          ${selected ? "checked" : ""} ${eligibleIndexes.has(windowItem.window_index) ? "" : "disabled"}
-          aria-label="选择窗口 ${windowItem.window_index + 1}"></td>
-        <td>${windowItem.window_index + 1}</td>
-        <td>${formatSeconds(windowItem.requested_start)}</td>
-        <td>${formatSeconds(windowItem.nominal_end)}</td>
-        <td><span class="status-pill ${windowItem.status === "completed" ? "ok" : windowItem.status === "failed" ? "bad" : "neutral"}">${escapeHtml(windowItem.status)}</span></td>
-        <td>${renderTaskProgress(attempt)}</td>
-        <td class="mono window-submitted-at">${escapeHtml(formatDate(attempt?.submitted_at))}</td>
-        <td>${windowItem.handoff_start == null ? "-" : formatSeconds(windowItem.handoff_start)}</td>
-        <td>${escapeHtml(windowItem.error_message || "-")}</td>
-        <td>${renderResplitAction(job, windowItem, attempt, rangeActive)}${renderRangeWindowStatus(rangeRow)}</td>
-      </tr>`;
-  }).join("");
-  $("windowsBody").querySelectorAll(".window-range-checkbox").forEach((checkbox) => {
-    checkbox.addEventListener("change", () => toggleRangeWindow(Number(checkbox.dataset.windowIndex), checkbox.checked));
-  });
+  $("windowsBody").innerHTML = windows.map((windowItem) => `
+    <tr class="window-row${windowItem.window_index === latestSubmittedWindowIndex ? " is-latest-submitted" : ""}">
+      <td>${windowItem.window_index + 1}</td>
+      <td>${formatSeconds(windowItem.requested_start)}</td>
+      <td>${formatSeconds(windowItem.nominal_end)}</td>
+      <td><span class="status-pill ${windowItem.status === "completed" ? "ok" : windowItem.status === "failed" ? "bad" : "neutral"}">${escapeHtml(windowItem.status)}</span></td>
+      <td>${renderTaskProgress(latestAttempts.get(windowItem.window_index))}</td>
+      <td class="mono window-submitted-at">${escapeHtml(formatDate(latestAttempts.get(windowItem.window_index)?.submitted_at))}</td>
+      <td>${windowItem.handoff_start == null ? "-" : formatSeconds(windowItem.handoff_start)}</td>
+      <td>${escapeHtml(windowItem.error_message || "-")}</td>
+      <td>${renderResplitAction(job, windowItem, latestAttempts.get(windowItem.window_index))}</td>
+    </tr>`).join("");
   $("windowsBody").querySelectorAll(".resplit-window").forEach((button) => {
     button.addEventListener("click", () => openResplit({
       jobId: job.id,
@@ -315,49 +286,7 @@ function renderDetail() {
     }));
   });
 
-  updateWindowRangeSelection(rangeBatch);
-
   renderSegments();
-}
-
-function renderRangeWindowStatus(rangeRow) {
-  if (!rangeRow) return "";
-  const names = {
-    queued: "批量等待中", cutting: "批量切片中", submitting: "批量下发中",
-    polling: "批量处理中", candidate_ready: "候选结果就绪", failed: "批量失败",
-    not_run: "本批次未执行"
-  };
-  const progress = Math.max(0, Math.min(100, Number(rangeRow.progress || 0)));
-  return `<span class="window-range-status">
-    <span class="muted">${escapeHtml(names[rangeRow.status] || rangeRow.status)}</span>
-    ${rangeRow.candidate_task_id ? `<span class="mono" title="${escapeHtml(rangeRow.candidate_task_id)}">${escapeHtml(rangeRow.candidate_task_id)}</span>` : ""}
-    ${rangeRow.status === "polling" ? `<span>${progress.toFixed(0)}%</span>` : ""}
-  </span>`;
-}
-
-function toggleRangeWindow(windowIndex, checked) {
-  if (checked) state.selectedWindowIndexes.add(windowIndex);
-  else state.selectedWindowIndexes.delete(windowIndex);
-  renderDetail();
-}
-
-function updateWindowRangeSelection(rangeBatch) {
-  const selected = [...state.selectedWindowIndexes].sort((a, b) => a - b);
-  const contiguous = selected.every((value, index) => index === 0 || value === selected[index - 1] + 1);
-  const button = $("previewWindowRangeResplitButton");
-  if (!selected.length) {
-    $("windowRangeSelection").textContent = "未选择窗口";
-  } else if (!contiguous) {
-    $("windowRangeSelection").textContent = `已选择 ${selected.length} 个窗口，所选窗口必须连续`;
-  } else {
-    $("windowRangeSelection").textContent = `窗口 ${selected[0] + 1}–${selected[selected.length - 1] + 1}，共 ${selected.length} 个`;
-  }
-  const active = Boolean(rangeBatch && ["queued", "running", "committing"].includes(rangeBatch.status));
-  button.disabled = !selected.length || !contiguous || active;
-  const batchNames = { queued: "等待开始", running: "处理中", committing: "正在整体采用", completed: "已完成", failed: "失败" };
-  $("windowRangeProgress").textContent = rangeBatch
-    ? `最近批次：${batchNames[rangeBatch.status] || rangeBatch.status} ${rangeBatch.completed_window_count}/${rangeBatch.total_window_count}${rangeBatch.error_message ? ` · ${rangeBatch.error_message}` : ""}`
-    : "";
 }
 
 function renderTaskProgress(attempt) {
@@ -376,11 +305,11 @@ function renderTaskProgress(attempt) {
     </div>`;
 }
 
-function renderResplitAction(job, windowItem, attempt, rangeResplitActive = false) {
+function renderResplitAction(job, windowItem, attempt) {
   if (!attempt) return '<span class="muted">-</span>';
   const jobReady = ["paused", "completed", "failed", "stopped"].includes(job.status);
   const taskReady = ["completed", "failed", "discarded"].includes(attempt.status);
-  const disabled = !(jobReady && taskReady) || rangeResplitActive;
+  const disabled = !(jobReady && taskReady);
   const title = disabled ? "作业及小任务结束后才能重新拆分" : "使用相同任务 ID 重新拆分";
   const resplitButton = `<button class="button secondary small resplit-window" type="button"
     data-window-index="${windowItem.window_index}" data-task-id="${escapeHtml(attempt.task_id)}"
@@ -775,82 +704,6 @@ function openResplit(target) {
   $("resplitDialog").showModal();
 }
 
-async function previewWindowRangeResplit() {
-  if (!state.detail) return;
-  const selected = [...state.selectedWindowIndexes].sort((a, b) => a - b);
-  if (!selected.length || !selected.every((value, index) => index === 0 || value === selected[index - 1] + 1)) {
-    showToast("请选择一段连续窗口");
-    return;
-  }
-  const button = $("previewWindowRangeResplitButton");
-  button.disabled = true;
-  button.textContent = "正在核对";
-  try {
-    const preview = await api(`/api/jobs/${state.detail.job.id}/window-range-resplits/preview`, {
-      method: "POST",
-      body: JSON.stringify({
-        startWindowIndex: selected[0],
-        endWindowIndex: selected[selected.length - 1]
-      })
-    });
-    state.rangeResplitPreview = preview;
-    $("rangeResplitChannelDate").textContent = `${preview.channelName || "-"} / ${preview.broadcastDate || "-"}`;
-    $("rangeResplitWindows").textContent = `${preview.startWindowIndex + 1}–${preview.endWindowIndex + 1}，共 ${preview.windowCount} 个`;
-    $("rangeResplitRealTime").textContent = preview.realStart && preview.realEnd
-      ? `${formatRealTime(preview.realStart)} – ${formatRealTime(preview.realEnd)}`
-      : "未设置节目时间";
-    $("rangeResplitSourceTime").textContent = `${formatSeconds(preview.sourceStart)} – ${formatSeconds(preview.sourceEnd)}（${formatSeconds(preview.durationSeconds)}）`;
-    $("rangeResplitTaskCount").textContent = String(preview.windowCount);
-    $("rangeResplitSegmentCount").textContent = String(preview.affectedSegmentCount);
-    $("rangeResplitTaskIds").textContent = preview.taskIds.map((taskId, index) => `窗口 ${preview.startWindowIndex + index + 1}: ${taskId}`).join("\n");
-    $("rangeResplitConfirmationHint").textContent = preview.confirmationText;
-    $("rangeResplitConfirmationInput").value = "";
-    $("submitWindowRangeResplitButton").disabled = true;
-    $("windowRangeResplitError").hidden = true;
-    $("windowRangeResplitDialog").showModal();
-    $("rangeResplitConfirmationInput").focus();
-  } catch (error) {
-    showToast(error.message);
-  } finally {
-    button.textContent = "重新拆条所选窗口";
-    updateWindowRangeSelection(state.detail?.rangeResplit?.batch || null);
-  }
-}
-
-function validateWindowRangeConfirmation() {
-  const preview = state.rangeResplitPreview;
-  $("submitWindowRangeResplitButton").disabled = !preview
-    || $("rangeResplitConfirmationInput").value !== preview.confirmationText;
-}
-
-async function submitWindowRangeResplit(event) {
-  event.preventDefault();
-  const preview = state.rangeResplitPreview;
-  if (!preview) return;
-  const confirmationText = $("rangeResplitConfirmationInput").value;
-  if (confirmationText !== preview.confirmationText) return;
-  const submit = $("submitWindowRangeResplitButton");
-  submit.disabled = true;
-  submit.textContent = "正在提交";
-  try {
-    await api(`/api/jobs/${preview.jobId}/window-range-resplits`, {
-      method: "POST",
-      body: JSON.stringify({ previewId: preview.previewId, confirmationText })
-    });
-    $("windowRangeResplitDialog").close();
-    state.rangeResplitPreview = null;
-    state.selectedWindowIndexes.clear();
-    showToast(`窗口 ${preview.startWindowIndex + 1}–${preview.endWindowIndex + 1} 已进入批量重新拆条流程`);
-    await Promise.all([loadJobs(), loadDetail(preview.jobId, false)]);
-  } catch (error) {
-    $("windowRangeResplitError").textContent = error.message;
-    $("windowRangeResplitError").hidden = false;
-  } finally {
-    submit.textContent = "确认并开始重新拆条";
-    validateWindowRangeConfirmation();
-  }
-}
-
 async function submitResplit(event) {
   event.preventDefault();
   const target = state.resplitTarget;
@@ -940,8 +793,6 @@ $("closeChannelsButton").addEventListener("click", () => $("channelsDialog").clo
 $("doneChannelsButton").addEventListener("click", () => $("channelsDialog").close());
 $("closeResplitButton").addEventListener("click", () => $("resplitDialog").close());
 $("cancelResplitButton").addEventListener("click", () => $("resplitDialog").close());
-$("closeWindowRangeResplitButton").addEventListener("click", () => $("windowRangeResplitDialog").close());
-$("cancelWindowRangeResplitButton").addEventListener("click", () => $("windowRangeResplitDialog").close());
 $("closeSegmentEditButton").addEventListener("click", () => $("segmentEditDialog").close());
 $("cancelSegmentEditButton").addEventListener("click", () => $("segmentEditDialog").close());
 $("restoreSegmentEditButton").addEventListener("click", restoreSegmentEdit);
@@ -999,9 +850,6 @@ $("previewVideo").addEventListener("error", () => {
 $("createForm").addEventListener("submit", submitCreate);
 $("channelCreateForm").addEventListener("submit", submitChannel);
 $("resplitForm").addEventListener("submit", submitResplit);
-$("windowRangeResplitForm").addEventListener("submit", submitWindowRangeResplit);
-$("previewWindowRangeResplitButton").addEventListener("click", previewWindowRangeResplit);
-$("rangeResplitConfirmationInput").addEventListener("input", validateWindowRangeConfirmation);
 $("segmentEditForm").addEventListener("submit", submitSegmentEdit);
 $("refreshButton").addEventListener("click", () => loadJobs().catch((error) => showToast(error.message)));
 $("saveTimeReferenceButton").addEventListener("click", saveTimeReference);

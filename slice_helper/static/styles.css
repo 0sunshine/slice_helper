@@ -176,21 +176,12 @@ dialog::backdrop { background: #1c252180; }
 .segment-results-panel .segments-heading { min-height: 48px; margin: 0; padding: 8px 12px; border-bottom: 1px solid #dfe3df; }
 .segments-table-scroll { flex: 1; border: 0; }
 .window-timeline-panel { grid-column: 1 / -1; display: flex; flex-direction: column; }
-.window-timeline-heading { min-height: 48px; padding: 10px 12px; border-bottom: 1px solid #dfe3df; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.window-range-toolbar { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 10px; }
-.window-range-checkbox { width: 18px; min-height: 18px; margin: 0; accent-color: #a52e21; }
-.window-range-status { display: flex; flex-direction: column; gap: 3px; min-width: 150px; font-size: 11px; }
-.window-row.is-range-selected, .window-row.is-range-selected:hover { background: #fff1ef; box-shadow: inset 3px 0 #b53a2d; }
+.window-timeline-heading { min-height: 48px; padding: 14px 12px; border-bottom: 1px solid #dfe3df; }
 .window-table-scroll { flex: 1; border: 0; }
 .window-table { min-width: 900px; }
 .window-table th, .window-table td { padding: 7px 8px; }
 .data-table tbody tr.window-row.is-latest-submitted, .data-table tbody tr.window-row.is-latest-submitted:hover { background: #fff4cf; box-shadow: inset 4px 0 #c88a12; }
 .window-row.is-latest-submitted .window-submitted-at { color: #765000; font-weight: 700; }
-.range-resplit-dialog { width: min(680px, calc(100vw - 28px)); }
-.range-resplit-dialog details { margin: 14px 0; }
-.range-resplit-dialog summary { cursor: pointer; color: #4f5751; font-weight: 600; }
-.range-task-ids { max-height: 150px; margin: 8px 0 0; padding: 10px; overflow: auto; border: 1px solid #dfe3df; background: #f5f7f5; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
-.range-confirm-label { display: flex; flex-direction: column; gap: 7px; margin-top: 16px; color: #4f5751; }
 .preview-label { display: block; margin-bottom: 4px; color: #727a74; font-size: 11px; }
 .preview-status { min-height: 22px; padding-top: 9px; color: #d5d9d6; font-size: 12px; }
 .preview-status.ready { color: #9bd6c4; }
@@ -250,8 +241,6 @@ dialog::backdrop { background: #1c252180; }
   .form-grid { grid-template-columns: 1fr; }
   .form-grid label.full { grid-column: auto; }
   .segments-heading { align-items: flex-start; }
-  .window-timeline-heading { align-items: flex-start; flex-direction: column; }
-  .window-range-toolbar { justify-content: flex-start; }
   .section-heading { align-items: flex-start; flex-direction: column; }
   .job-filters { justify-content: flex-start; }
   .jobs-pagination { justify-content: flex-start; flex-wrap: wrap; }
