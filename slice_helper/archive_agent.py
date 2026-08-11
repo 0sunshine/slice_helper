@@ -30,6 +30,7 @@ except ImportError:  # pragma: no cover - the deployed agent runs on Linux
 
 logger = logging.getLogger("islice-archiver")
 TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+SOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 MEDIA_DIRS = ("segments", "covers")
 DELETE_DIRS = ("video", "temp", "output")
 
@@ -57,6 +58,12 @@ def require_task_id(value: str) -> str:
     return value
 
 
+def require_source_id(value: str) -> str:
+    if not SOURCE_ID_PATTERN.fullmatch(value):
+        raise ArchiveError(f"Unsafe source ID: {value!r}")
+    return value
+
+
 def is_within(path: Path, parent: Path) -> bool:
     try:
         path.resolve().relative_to(parent.resolve())
@@ -78,6 +85,10 @@ class ArchiveConfig:
     remote_http_base: str
     ssh_key: Path
     known_hosts: Path
+    source_id: str = "default"
+    source_name: str = ""
+    islice_base_url: str = ""
+    slice_helper_base_url: str = ""
     delete_delay_hours: float = 24.0
     retry_delay_minutes: float = 30.0
     max_tasks_per_run: int = 4
@@ -109,6 +120,10 @@ class ArchiveConfig:
             remote_http_base=required("remote_http_base").rstrip("/"),
             ssh_key=Path(required("ssh_key")),
             known_hosts=Path(required("known_hosts")),
+            source_id=section.get("source_id", "default").strip() or "default",
+            source_name=section.get("source_name", "").strip(),
+            islice_base_url=section.get("islice_base_url", "").strip().rstrip("/"),
+            slice_helper_base_url=section.get("slice_helper_base_url", "").strip().rstrip("/"),
             delete_delay_hours=section.getfloat("delete_delay_hours", 24.0),
             retry_delay_minutes=section.getfloat("retry_delay_minutes", 30.0),
             max_tasks_per_run=section.getint("max_tasks_per_run", 4),
@@ -123,6 +138,13 @@ class ArchiveConfig:
             raise ArchiveError("remote_root must be absolute")
         if not config.remote_http_base.startswith(("http://", "https://")):
             raise ArchiveError("remote_http_base must use HTTP or HTTPS")
+        require_source_id(config.source_id)
+        for name, value in (
+            ("islice_base_url", config.islice_base_url),
+            ("slice_helper_base_url", config.slice_helper_base_url),
+        ):
+            if value and not value.startswith(("http://", "https://")):
+                raise ArchiveError(f"{name} must use HTTP or HTTPS")
         return config
 
 
@@ -148,6 +170,19 @@ class TaskManifest:
         return tuple(
             item for item in self.files if item.path.startswith(("segments/", "covers/"))
         )
+
+    @property
+    def media_paths(self) -> frozenset[str]:
+        return frozenset(item.path for item in self.media_files)
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteSyncResult:
+    published: bool
+    remote_path: str
+    previous_digest: str | None = None
+    previous_remote_path: str | None = None
+    hold_reason: str = ""
 
 
 def file_sha256(path: Path) -> str:
@@ -283,8 +318,9 @@ def write_manifest_files(manifest: TaskManifest, root: Path) -> tuple[Path, Path
 
 
 class StateStore:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, source_id: str = "default"):
         self.path = path
+        self.source_id = require_source_id(source_id)
 
     def connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -327,27 +363,133 @@ class StateStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_archives_state
                     ON archives(state, next_attempt_at, delete_after);
+                CREATE TABLE IF NOT EXISTS archive_revisions (
+                    source_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    manifest_digest TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    remote_path TEXT NOT NULL,
+                    file_count INTEGER NOT NULL DEFAULT 0,
+                    total_bytes INTEGER NOT NULL DEFAULT 0,
+                    warnings_json TEXT NOT NULL DEFAULT '[]',
+                    published_at TEXT,
+                    superseded_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(source_id, task_id, manifest_digest)
+                );
+                CREATE INDEX IF NOT EXISTS idx_archive_revisions_task
+                    ON archive_revisions(source_id, task_id, created_at);
                 """
+            )
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(archives)")
+            }
+            migrations = {
+                "source_id": "TEXT NOT NULL DEFAULT ''",
+                "source_modified_at": "TEXT NOT NULL DEFAULT ''",
+                "published_digest": "TEXT NOT NULL DEFAULT ''",
+                "revision_count": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for name, definition in migrations.items():
+                if name not in columns:
+                    connection.execute(
+                        f"ALTER TABLE archives ADD COLUMN {name} {definition}"
+                    )
+            connection.execute(
+                "UPDATE archives SET source_id=? WHERE source_id=''", (self.source_id,)
             )
             connection.execute(
                 "UPDATE archives SET state='pending', error_message='Recovered after interruption' "
                 "WHERE state IN ('syncing', 'verifying')"
             )
+            now = iso_time()
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO archive_revisions (
+                    source_id, task_id, manifest_digest, state, remote_path,
+                    file_count, total_bytes, warnings_json, published_at,
+                    created_at, updated_at
+                )
+                SELECT source_id, task_id, manifest_digest,
+                       CASE WHEN state='archived_hold' THEN 'published_hold' ELSE 'published' END,
+                       remote_path, file_count, total_bytes, warnings_json,
+                       archived_at, COALESCE(archived_at, discovered_at), ?
+                FROM archives WHERE manifest_digest<>''
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                UPDATE archives SET revision_count=(
+                    SELECT COUNT(*) FROM archive_revisions r
+                    WHERE r.source_id=archives.source_id AND r.task_id=archives.task_id
+                ), published_digest=CASE
+                    WHEN published_digest='' THEN manifest_digest ELSE published_digest END
+                """
+            )
 
-    def discover(self, task_id: str, task_path: Path, output_path: Path, remote_path: str) -> None:
+    def discover(
+        self,
+        task_id: str,
+        task_path: Path,
+        output_path: Path,
+        remote_path: str,
+        source_modified_at: str,
+    ) -> None:
         now = iso_time()
         with self.connect() as connection:
             cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO archives (
                     task_id, state, local_task_path, local_output_path, remote_path,
-                    discovered_at, updated_at
-                ) VALUES (?, 'pending', ?, ?, ?, ?, ?)
+                    discovered_at, updated_at, source_id, source_modified_at
+                ) VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (task_id, str(task_path), str(output_path), remote_path, now, now),
+                (
+                    task_id,
+                    str(task_path),
+                    str(output_path),
+                    remote_path,
+                    now,
+                    now,
+                    self.source_id,
+                    source_modified_at,
+                ),
             )
             if cursor.rowcount:
                 self._event(connection, task_id, "discovered", str(output_path))
+                return
+            row = connection.execute(
+                "SELECT state,source_modified_at FROM archives WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if (
+                row
+                and output_path.is_dir()
+                and str(row["source_modified_at"] or "") != source_modified_at
+            ):
+                connection.execute(
+                    """
+                    UPDATE archives
+                    SET state='pending', local_task_path=?, local_output_path=?, remote_path=?,
+                        source_modified_at=?, error_message='', next_attempt_at=NULL,
+                        updated_at=? WHERE task_id=?
+                    """,
+                    (
+                        str(task_path),
+                        str(output_path),
+                        remote_path,
+                        source_modified_at,
+                        now,
+                        task_id,
+                    ),
+                )
+                self._event(
+                    connection,
+                    task_id,
+                    "source_revision_discovered",
+                    source_modified_at,
+                )
 
     def candidates(self, limit: int) -> list[dict[str, Any]]:
         now = iso_time()
@@ -357,10 +499,11 @@ class StateStore:
                 SELECT * FROM archives
                 WHERE state='pending'
                    OR (state='failed' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+                   OR (state='archived_unpublished' AND next_attempt_at <= ?)
                 ORDER BY discovered_at
                 LIMIT ?
                 """,
-                (now, limit),
+                (now, now, limit),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -386,6 +529,133 @@ class StateStore:
                 "SELECT * FROM archives ORDER BY discovered_at DESC"
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def revisions(self, task_id: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM archive_revisions WHERE source_id=?"
+        params: list[Any] = [self.source_id]
+        if task_id is not None:
+            query += " AND task_id=?"
+            params.append(task_id)
+        query += " ORDER BY created_at DESC"
+        with self.connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_revision(
+        self,
+        task_id: str,
+        manifest: TaskManifest,
+        result: RemoteSyncResult,
+        state: str,
+    ) -> None:
+        now = iso_time()
+        with self.connect() as connection:
+            if result.previous_digest:
+                connection.execute(
+                    """
+                    UPDATE archive_revisions SET state='superseded', superseded_at=?,
+                        remote_path=COALESCE(?,remote_path), updated_at=?
+                    WHERE source_id=? AND task_id=? AND manifest_digest=?
+                    """,
+                    (
+                        now,
+                        result.previous_remote_path,
+                        now,
+                        self.source_id,
+                        task_id,
+                        result.previous_digest,
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO archive_revisions (
+                    source_id,task_id,manifest_digest,state,remote_path,file_count,
+                    total_bytes,warnings_json,published_at,created_at,updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(source_id,task_id,manifest_digest) DO UPDATE SET
+                    state=excluded.state, remote_path=excluded.remote_path,
+                    file_count=excluded.file_count, total_bytes=excluded.total_bytes,
+                    warnings_json=excluded.warnings_json,
+                    published_at=COALESCE(excluded.published_at,archive_revisions.published_at),
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    self.source_id,
+                    task_id,
+                    manifest.digest,
+                    state,
+                    result.remote_path,
+                    len(manifest.files),
+                    manifest.total_bytes,
+                    json.dumps(manifest.warnings, ensure_ascii=False),
+                    now if result.published else None,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE archives SET revision_count=(
+                    SELECT COUNT(*) FROM archive_revisions
+                    WHERE source_id=? AND task_id=?
+                ), published_digest=CASE WHEN ? THEN ? ELSE published_digest END
+                WHERE task_id=?
+                """,
+                (
+                    self.source_id,
+                    task_id,
+                    int(result.published),
+                    manifest.digest,
+                    task_id,
+                ),
+            )
+
+    def catalog(self, config: ArchiveConfig) -> dict[str, Any]:
+        tasks = self.list()
+        revisions = self.revisions()
+        by_task: dict[str, list[dict[str, Any]]] = {}
+        for revision in revisions:
+            by_task.setdefault(str(revision["task_id"]), []).append(revision)
+        counts: dict[str, int] = {}
+        total_bytes = 0
+        for row in tasks:
+            state = str(row["state"])
+            counts[state] = counts.get(state, 0) + 1
+            total_bytes += int(row.get("total_bytes") or 0)
+            row["revisions"] = by_task.get(str(row["task_id"]), [])
+        return {
+            "schemaVersion": 2,
+            "generatedAt": iso_time(),
+            "source": {
+                "id": config.source_id,
+                "name": config.source_name or config.source_id,
+                "isliceBaseUrl": config.islice_base_url,
+            },
+            "summary": {
+                "taskCount": len(tasks),
+                "totalBytes": total_bytes,
+                "states": counts,
+            },
+            "tasks": tasks,
+        }
+
+    def rebase_current_paths(self, remote_root: str) -> None:
+        with self.connect() as connection:
+            rows = connection.execute("SELECT task_id FROM archives").fetchall()
+            for row in rows:
+                task_id = require_task_id(str(row["task_id"]))
+                current = f"{remote_root}/tasks/{task_id}"
+                connection.execute(
+                    "UPDATE archives SET remote_path=? WHERE task_id=?",
+                    (current, task_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE archive_revisions SET remote_path=?
+                    WHERE source_id=? AND task_id=? AND state IN ('published','published_hold')
+                    """,
+                    (current, self.source_id, task_id),
+                )
 
     def transition(self, task_id: str, state: str, event: str, **fields: Any) -> None:
         fields = {**fields, "state": state, "updated_at": iso_time()}
@@ -510,15 +780,31 @@ class RemoteArchive:
         )
         return result.stdout
 
+    def ensure_layout(self) -> None:
+        root = self.config.remote_root
+        download = f"{root}/download"
+        self.ssh(
+            "set -eu; "
+            f"mkdir -p {shlex.quote(f'{root}/incoming')} "
+            f"{shlex.quote(f'{root}/tasks')} {shlex.quote(f'{root}/history')}; "
+            f"if test ! -e {shlex.quote(download)}; then "
+            f"ln -s tasks {shlex.quote(download)}; fi; "
+            f"test \"$(readlink {shlex.quote(download)})\" = tasks"
+        )
+
     def sync(
         self,
         manifest: TaskManifest,
         output_dir: Path,
         manifest_json: Path,
         manifest_checksums: Path,
-    ) -> None:
+        *,
+        publish: bool = True,
+        hold_reason: str = "",
+    ) -> RemoteSyncResult:
+        self.ensure_layout()
         task_id = require_task_id(manifest.task_id)
-        staging = f"{self.config.remote_root}/incoming/{task_id}.partial"
+        staging = f"{self.config.remote_root}/incoming/{task_id}.{manifest.digest}.partial"
         final = f"{self.config.remote_root}/tasks/{task_id}"
         remote_manifest = f"{final}/manifest.json"
         existing = self.ssh(
@@ -529,41 +815,113 @@ class RemoteArchive:
                 existing_digest = json.loads(existing).get("manifestDigest")
             except json.JSONDecodeError as exc:
                 raise ArchiveError(f"Remote manifest is invalid for {task_id}") from exc
-            if existing_digest != manifest.digest:
-                raise ArchiveError(f"Remote archive conflict for {task_id}")
-            self.verify(manifest)
-            return
+            if existing_digest == manifest.digest:
+                self.verify(manifest)
+                return RemoteSyncResult(True, final)
+        else:
+            existing_digest = None
 
-        self.ssh(f"mkdir -p {shlex.quote(staging)}")
-        remote = f"{self.config.remote_user}@{self.config.remote_host}:{staging}/"
-        rsync_ssh = "ssh " + " ".join(shlex.quote(item) for item in self.ssh_options)
-        common = [
-            "rsync",
-            "-a",
-            "--partial",
-            "--partial-dir=.rsync-partial",
-            "--protect-args",
-            "-e",
-            rsync_ssh,
-        ]
-        self._run([*common, f"{output_dir}/", remote])
-        self._run([*common, str(manifest_json), str(manifest_checksums), remote])
-        self.ssh(
-            "set -eu; "
-            f"cd {shlex.quote(staging)}; "
-            "sha256sum -c manifest.sha256 >/dev/null; "
-            f"test ! -e {shlex.quote(final)}; "
-            f"mv {shlex.quote(staging)} {shlex.quote(final)}"
+        stored_revision = f"{self.config.remote_root}/history/{task_id}/{manifest.digest}"
+        stored_manifest = f"{stored_revision}/manifest.json"
+        stored = self.ssh(
+            f"if test -f {shlex.quote(stored_manifest)}; then cat {shlex.quote(stored_manifest)}; fi"
+        ).strip()
+        if stored:
+            try:
+                stored_digest = json.loads(stored).get("manifestDigest")
+            except json.JSONDecodeError as exc:
+                raise ArchiveError(f"Stored revision manifest is invalid for {task_id}") from exc
+            if stored_digest != manifest.digest:
+                raise ArchiveError(f"Stored revision conflict for {task_id}")
+            self.verify(manifest, stored_revision)
+            if not publish:
+                return RemoteSyncResult(
+                    False,
+                    stored_revision,
+                    existing_digest,
+                    None,
+                    hold_reason,
+                )
+            staging = stored_revision
+        else:
+            self.ssh(f"mkdir -p {shlex.quote(staging)}")
+            remote = f"{self.config.remote_user}@{self.config.remote_host}:{staging}/"
+            rsync_ssh = "ssh " + " ".join(shlex.quote(item) for item in self.ssh_options)
+            common = [
+                "rsync",
+                "-a",
+                "--partial",
+                "--partial-dir=.rsync-partial",
+                "--protect-args",
+                "-e",
+                rsync_ssh,
+            ]
+            self._run([*common, f"{output_dir}/", remote])
+            self._run([*common, str(manifest_json), str(manifest_checksums), remote])
+            self.ssh(
+                f"set -eu; cd {shlex.quote(staging)}; sha256sum -c manifest.sha256 >/dev/null"
+            )
+
+        if not publish:
+            history = stored_revision
+            self.ssh(
+                "set -eu; "
+                f"mkdir -p {shlex.quote(f'{self.config.remote_root}/history/{task_id}')}; "
+                f"mv {shlex.quote(staging)} {shlex.quote(history)}"
+            )
+            return RemoteSyncResult(False, history, existing_digest, None, hold_reason)
+
+        history_base = f"{self.config.remote_root}/history/{task_id}"
+        history = (
+            f"{history_base}/{existing_digest}"
+            if existing_digest
+            else ""
         )
+        duplicate_history = f"{history}.{uuid.uuid4().hex[:8]}" if history else ""
+        previous_remote_path = None
+        if existing_digest:
+            history_exists = self.ssh(
+                f"if test -e {shlex.quote(history)}; then echo yes; fi"
+            ).strip()
+            previous_remote_path = duplicate_history if history_exists else history
+            self.ssh(
+                "set -eu; "
+                f"mkdir -p {shlex.quote(history_base)}; "
+                f"old_target={shlex.quote(previous_remote_path)}; "
+                f"mv {shlex.quote(final)} \"$old_target\"; "
+                f"if ! mv {shlex.quote(staging)} {shlex.quote(final)}; then "
+                f"  mv \"$old_target\" {shlex.quote(final)}; exit 1; "
+                "fi"
+            )
+        else:
+            self.ssh(
+                f"set -eu; mkdir -p {shlex.quote(f'{self.config.remote_root}/tasks')}; "
+                f"test ! -e {shlex.quote(final)}; mv {shlex.quote(staging)} {shlex.quote(final)}"
+            )
         self.verify(manifest)
+        return RemoteSyncResult(
+            True, final, existing_digest, previous_remote_path
+        )
 
-    def verify(self, manifest: TaskManifest) -> None:
-        final = f"{self.config.remote_root}/tasks/{require_task_id(manifest.task_id)}"
+    def verify(self, manifest: TaskManifest, remote_path: str | None = None) -> None:
+        final = remote_path or f"{self.config.remote_root}/tasks/{require_task_id(manifest.task_id)}"
         self.ssh(
             f"set -eu; cd {shlex.quote(final)}; sha256sum -c manifest.sha256 >/dev/null"
         )
-        for item in manifest.media_files:
-            self._verify_http(manifest.task_id, item)
+        if remote_path is None:
+            for item in manifest.media_files:
+                self._verify_http(manifest.task_id, item)
+
+    def publish_catalog(self, catalog_path: Path) -> None:
+        remote_partial = f"{self.config.remote_root}/catalog.json.partial"
+        remote_final = f"{self.config.remote_root}/catalog.json"
+        remote = f"{self.config.remote_user}@{self.config.remote_host}:{remote_partial}"
+        rsync_ssh = "ssh " + " ".join(shlex.quote(item) for item in self.ssh_options)
+        self.ensure_layout()
+        self._run(["rsync", "-a", "--protect-args", "-e", rsync_ssh, str(catalog_path), remote])
+        self.ssh(
+            f"set -eu; mv {shlex.quote(remote_partial)} {shlex.quote(remote_final)}"
+        )
 
     def _verify_http(self, task_id: str, item: ManifestFile) -> None:
         encoded_path = "/".join(urllib.parse.quote(part) for part in item.path.split("/"))
@@ -592,7 +950,7 @@ class Archiver:
         remote: RemoteArchive | None = None,
     ):
         self.config = config
-        self.state = state or StateStore(config.state_database)
+        self.state = state or StateStore(config.state_database, config.source_id)
         self.tasks = tasks or ISliceTasks(config.islice_database, config.storage_root)
         self.remote = remote or RemoteArchive(config)
 
@@ -612,12 +970,14 @@ class Archiver:
     def run_once(self) -> None:
         with self.lock():
             self.state.initialize()
+            self.state.rebase_current_paths(self.config.remote_root)
             self.discover()
             self.delete_due()
             candidates = self.state.candidates(self.config.max_tasks_per_run)
             logger.info("Archive scan found %d task(s) ready for processing", len(candidates))
             for row in candidates:
                 self.archive(row)
+            self.publish_catalog()
 
     def discover(self) -> None:
         for task, task_path, output_path in self.tasks.completed():
@@ -627,7 +987,38 @@ class Archiver:
                 task_path,
                 output_path,
                 f"{self.config.remote_root}/tasks/{task_id}",
+                str(task.get("modify_time") or ""),
             )
+
+    def _publication_decision(self, manifest: TaskManifest) -> tuple[bool, str]:
+        if not self.config.slice_helper_base_url:
+            return True, ""
+        url = (
+            f"{self.config.slice_helper_base_url}/internal/archive-references/"
+            f"{urllib.parse.quote(manifest.task_id)}"
+        )
+        if self.config.islice_base_url:
+            url += "?" + urllib.parse.urlencode(
+                {"isliceBaseUrl": self.config.islice_base_url}
+            )
+        try:
+            with urllib.request.urlopen(url, timeout=self.config.http_timeout_seconds) as response:
+                payload = json.load(response)
+        except (urllib.error.URLError, ValueError, json.JSONDecodeError) as exc:
+            raise ArchiveError(
+                f"Cannot verify whether slice_helper accepted {manifest.task_id}: {exc}"
+            ) from exc
+        if not payload.get("found"):
+            return True, ""
+        expected = {str(item) for item in payload.get("mediaPaths") or []}
+        if expected and expected.issubset(manifest.media_paths):
+            return True, ""
+        missing = sorted(expected - manifest.media_paths)
+        return (
+            False,
+            "slice_helper still references another revision"
+            + (f": {', '.join(missing[:5])}" if missing else ""),
+        )
 
     def archive(self, row: dict[str, Any]) -> None:
         task_id = require_task_id(str(row["task_id"]))
@@ -641,6 +1032,7 @@ class Archiver:
             manifest_json, manifest_checksums = write_manifest_files(
                 manifest, self.config.manifest_root
             )
+            publish, hold_reason = self._publication_decision(manifest)
             self.state.transition(
                 task_id,
                 "syncing",
@@ -650,11 +1042,41 @@ class Archiver:
                 total_bytes=manifest.total_bytes,
                 deletion_eligible=int(manifest.deletion_eligible),
                 warnings_json=json.dumps(manifest.warnings, ensure_ascii=False),
+                source_modified_at=str(task.get("modify_time") or ""),
                 error_message="",
             )
-            self.remote.sync(manifest, output_path, manifest_json, manifest_checksums)
+            result = self.remote.sync(
+                manifest,
+                output_path,
+                manifest_json,
+                manifest_checksums,
+                publish=publish,
+                hold_reason=hold_reason,
+            )
+            revision_state = "published" if result.published else "unpublished"
+            self.state.record_revision(
+                task_id, manifest, result, revision_state
+            )
             self.state.transition(task_id, "verifying", "remote_verified")
             archived_at = utc_now()
+            if not result.published:
+                self.state.transition(
+                    task_id,
+                    "archived_unpublished",
+                    "archive_completed_unpublished",
+                    archived_at=iso_time(archived_at),
+                    delete_after=None,
+                    next_attempt_at=iso_time(
+                        archived_at + timedelta(minutes=self.config.retry_delay_minutes)
+                    ),
+                    error_message=hold_reason,
+                )
+                logger.warning(
+                    "Task %s revision was archived but not published: %s",
+                    task_id,
+                    hold_reason,
+                )
+                return
             if manifest.deletion_eligible and is_within(
                 output_path, Path(row["local_task_path"])
             ):
@@ -667,6 +1089,7 @@ class Archiver:
                         archived_at + timedelta(hours=self.config.delete_delay_hours)
                     ),
                     next_attempt_at=None,
+                    error_message="",
                 )
                 logger.info(
                     "Task %s archived; local deletion is scheduled for %s",
@@ -681,6 +1104,7 @@ class Archiver:
                     archived_at=iso_time(archived_at),
                     delete_after=None,
                     next_attempt_at=None,
+                    error_message="",
                 )
                 logger.warning(
                     "Task %s archived with local deletion held: %s",
@@ -714,6 +1138,20 @@ class Archiver:
             except Exception as exc:
                 logger.exception("Task %s delayed deletion failed", task_id)
                 self.state.fail(task_id, str(exc), timedelta(minutes=self.config.retry_delay_minutes))
+
+    def publish_catalog(self) -> None:
+        if not hasattr(self.remote, "publish_catalog"):
+            return
+        payload = self.state.catalog(self.config)
+        path = self.config.manifest_root / "catalog.json"
+        temporary = path.with_suffix(".json.tmp")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+        self.remote.publish_catalog(path)
 
     def _delete_local(self, row: dict[str, Any], manifest: TaskManifest) -> None:
         task_path = Path(row["local_task_path"]).resolve()
@@ -770,7 +1208,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         config = ArchiveConfig.from_file(args.config)
-        state = StateStore(config.state_database)
+        state = StateStore(config.state_database, config.source_id)
         state.initialize()
         if args.command == "run-once":
             Archiver(config, state=state).run_once()

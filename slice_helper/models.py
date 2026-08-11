@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
+import re
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -113,6 +114,51 @@ class ChannelCreate(BaseModel):
 
 class ChannelUpdate(ChannelCreate):
     pass
+
+
+class ISliceInstanceUpsert(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    source_id: str = Field(alias="sourceId", min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=255)
+    base_url: str = Field(alias="baseUrl", min_length=8, max_length=2048)
+    archive_catalog_url: str = Field(
+        default="", alias="archiveCatalogUrl", max_length=2048
+    )
+    schedulable: bool = True
+
+    @field_validator("source_id")
+    @classmethod
+    def validate_source_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", normalized):
+            raise ValueError("sourceId may only contain letters, numbers, dot, underscore and dash")
+        return normalized
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        return " ".join(value.split())
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        parsed = urlsplit(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("baseUrl must be an HTTP URL")
+        return normalized
+
+    @field_validator("archive_catalog_url")
+    @classmethod
+    def validate_catalog_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        if not normalized:
+            return ""
+        parsed = urlsplit(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("archiveCatalogUrl must be an HTTP URL")
+        return normalized
 
 
 class TimeReferenceUpdate(BaseModel):

@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urlsplit
 
 import aiosqlite
 
@@ -114,6 +115,17 @@ class Database:
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
                     normalized_name TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS islice_instances (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    base_url TEXT NOT NULL UNIQUE,
+                    archive_catalog_url TEXT NOT NULL DEFAULT '',
+                    schedulable INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -543,11 +555,257 @@ class Database:
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(18, ?)",
                 (utc_now(),),
             )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(19, ?)",
+                (utc_now(),),
+            )
             await db.commit()
 
     @staticmethod
     def _row(row: aiosqlite.Row | None) -> dict[str, Any] | None:
         return dict(row) if row is not None else None
+
+    async def seed_islice_instances(self, urls: Iterable[str]) -> None:
+        now = utc_now()
+        normalized = tuple(dict.fromkeys(url.rstrip("/") for url in urls if url))
+        async with self.connect() as db:
+            for index, url in enumerate(normalized, start=1):
+                existing = await (
+                    await db.execute(
+                        "SELECT 1 FROM islice_instances WHERE base_url=?", (url,)
+                    )
+                ).fetchone()
+                if existing:
+                    continue
+                host = (urlsplit(url).hostname or "").strip().lower()
+                host_label = re.sub(r"[^a-z0-9._-]+", "-", host).strip("-._")
+                if re.fullmatch(r"\d+(?:\.\d+){3}", host_label):
+                    host_label = host_label.rsplit(".", 1)[-1]
+                source_id = f"islice-{host_label or index}"[:64]
+                base_source_id = source_id
+                suffix = 1
+                while await (
+                    await db.execute(
+                        "SELECT 1 FROM islice_instances WHERE source_id=?", (source_id,)
+                    )
+                ).fetchone():
+                    suffix += 1
+                    suffix_text = f"-{suffix}"
+                    source_id = f"{base_source_id[:64 - len(suffix_text)]}{suffix_text}"
+                await db.execute(
+                    """
+                    INSERT INTO islice_instances(
+                        id,source_id,name,base_url,archive_catalog_url,
+                        schedulable,created_at,updated_at
+                    ) VALUES(?,?,?,?,'',1,?,?)
+                    """,
+                    (
+                        uuid.uuid4().hex,
+                        source_id,
+                        f"iSlice {host or index}",
+                        url,
+                        now,
+                        now,
+                    ),
+                )
+            await db.commit()
+
+    async def list_islice_instances(self) -> list[dict[str, Any]]:
+        async with self.connect() as db:
+            rows = await (
+                await db.execute(
+                    """
+                    SELECT i.*,
+                           COUNT(DISTINCT CASE WHEN j.superseded_at IS NULL THEN j.id END)
+                               AS job_count,
+                           COUNT(DISTINCT CASE WHEN j.superseded_at IS NULL AND j.status IN (
+                               'queued','probing','running','pause_requested','stop_requested'
+                           ) THEN j.id END) AS active_job_count
+                    FROM islice_instances i
+                    LEFT JOIN jobs j ON j.islice_base_url=i.base_url
+                    GROUP BY i.id ORDER BY i.source_id,i.id
+                    """
+                )
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["schedulable"] = bool(item["schedulable"])
+            item["job_count"] = int(item["job_count"] or 0)
+            item["active_job_count"] = int(item["active_job_count"] or 0)
+            result.append(item)
+        return result
+
+    async def get_islice_instance(self, instance_id: str) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            row = await (
+                await db.execute("SELECT * FROM islice_instances WHERE id=?", (instance_id,))
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["schedulable"] = bool(result["schedulable"])
+        return result
+
+    async def create_islice_instance(self, record: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        values = {
+            "id": uuid.uuid4().hex,
+            "source_id": record["source_id"],
+            "name": record["name"],
+            "base_url": record["base_url"].rstrip("/"),
+            "archive_catalog_url": record.get("archive_catalog_url", "").rstrip("/"),
+            "schedulable": int(bool(record.get("schedulable", True))),
+            "created_at": now,
+            "updated_at": now,
+        }
+        async with self.connect() as db:
+            row = await (
+                await db.execute(
+                    """
+                    INSERT INTO islice_instances(
+                        id,source_id,name,base_url,archive_catalog_url,
+                        schedulable,created_at,updated_at
+                    ) VALUES(:id,:source_id,:name,:base_url,:archive_catalog_url,
+                             :schedulable,:created_at,:updated_at) RETURNING *
+                    """,
+                    values,
+                )
+            ).fetchone()
+            await db.commit()
+        result = dict(row)
+        result["schedulable"] = bool(result["schedulable"])
+        return result
+
+    async def update_islice_instance(
+        self, instance_id: str, record: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        current = await self.get_islice_instance(instance_id)
+        if current is None:
+            return None
+        old_url = str(current["base_url"])
+        new_url = str(record["base_url"]).rstrip("/")
+        source_id_changed = str(current["source_id"]) != str(record["source_id"])
+        if old_url != new_url or source_id_changed:
+            async with self.connect() as db:
+                used = await (
+                    await db.execute(
+                        "SELECT 1 FROM jobs WHERE islice_base_url=? LIMIT 1", (old_url,)
+                    )
+                ).fetchone()
+            if used:
+                if old_url != new_url:
+                    raise ValueError(
+                        "Cannot change the address of an instance already used by jobs"
+                    )
+                raise ValueError(
+                    "Cannot change sourceId of an instance already used by jobs"
+                )
+        fields = {
+            "source_id": record["source_id"],
+            "name": record["name"],
+            "base_url": new_url,
+            "archive_catalog_url": record.get("archive_catalog_url", "").rstrip("/"),
+            "schedulable": int(bool(record.get("schedulable", True))),
+            "updated_at": utc_now(),
+            "id": instance_id,
+        }
+        async with self.connect() as db:
+            row = await (
+                await db.execute(
+                    """
+                    UPDATE islice_instances SET source_id=:source_id,name=:name,
+                        base_url=:base_url,archive_catalog_url=:archive_catalog_url,
+                        schedulable=:schedulable,updated_at=:updated_at
+                    WHERE id=:id RETURNING *
+                    """,
+                    fields,
+                )
+            ).fetchone()
+            await db.commit()
+        result = dict(row)
+        result["schedulable"] = bool(result["schedulable"])
+        return result
+
+    async def delete_islice_instance(self, instance_id: str) -> bool:
+        current = await self.get_islice_instance(instance_id)
+        if current is None:
+            return False
+        async with self.connect() as db:
+            used = await (
+                await db.execute(
+                    "SELECT 1 FROM jobs WHERE islice_base_url=? LIMIT 1",
+                    (current["base_url"],),
+                )
+            ).fetchone()
+            if used:
+                raise ValueError("Cannot delete an instance already used by jobs")
+            cursor = await db.execute(
+                "DELETE FROM islice_instances WHERE id=?", (instance_id,)
+            )
+            await db.commit()
+        return bool(cursor.rowcount)
+
+    async def schedulable_islice_urls(self) -> tuple[str, ...]:
+        async with self.connect() as db:
+            rows = await (
+                await db.execute(
+                    "SELECT base_url FROM islice_instances WHERE schedulable=1 ORDER BY source_id,id"
+                )
+            ).fetchall()
+        return tuple(str(row["base_url"]).rstrip("/") for row in rows)
+
+    async def all_islice_urls(self) -> tuple[str, ...]:
+        async with self.connect() as db:
+            rows = await (
+                await db.execute(
+                    "SELECT base_url FROM islice_instances ORDER BY source_id,id"
+                )
+            ).fetchall()
+        return tuple(str(row["base_url"]).rstrip("/") for row in rows)
+
+    async def archive_task_contexts(self) -> dict[tuple[str, str], dict[str, Any]]:
+        async with self.connect() as db:
+            rows = await (
+                await db.execute(
+                    """
+                    SELECT i.source_id,a.task_id,j.id AS job_id,j.channel_name,
+                           j.broadcast_date,j.status AS job_status,j.islice_base_url,
+                           w.window_index,a.status AS attempt_status,
+                           SUM(CASE WHEN s.accepted=1 AND s.ignored=0 THEN 1 ELSE 0 END)
+                               AS accepted_segment_count
+                    FROM attempts a
+                    JOIN windows w ON w.id=a.window_id
+                    JOIN jobs j ON j.id=w.job_id
+                    LEFT JOIN islice_instances i ON i.base_url=j.islice_base_url
+                    LEFT JOIN segments s ON s.attempt_id=a.id
+                    GROUP BY a.id
+                    """
+                )
+            ).fetchall()
+        return {
+            (str(row["source_id"] or ""), str(row["task_id"])): dict(row)
+            for row in rows
+        }
+
+    async def archive_references(self, task_id: str) -> list[dict[str, Any]]:
+        async with self.connect() as db:
+            rows = await (
+                await db.execute(
+                    """
+                    SELECT s.task_id,s.segment_url,s.cover_img_url,w.window_index,
+                           j.id AS job_id,j.islice_base_url,a.status AS attempt_status
+                    FROM segments s
+                    JOIN windows w ON w.id=s.window_id
+                    JOIN jobs j ON j.id=s.job_id
+                    LEFT JOIN attempts a ON a.id=s.attempt_id
+                    WHERE s.task_id=? AND s.accepted=1 AND s.ignored=0
+                    ORDER BY j.id,w.window_index,s.global_start,s.id
+                    """,
+                    (task_id,),
+                )
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     async def create_channel(self, name: str) -> dict[str, Any]:
         now = utc_now()
@@ -700,12 +958,16 @@ class Database:
         self,
         urls: tuple[str, ...],
         limit: int,
+        configured_urls: tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
-        if not urls:
-            raise ValueError("At least one iSlice URL must be configured")
         if limit < 1:
             return []
         normalized_urls = tuple(dict.fromkeys(url.rstrip("/") for url in urls))
+        normalized_configured = tuple(
+            dict.fromkeys(
+                url.rstrip("/") for url in (configured_urls or normalized_urls)
+            )
+        )
         active_statuses = (
             "queued",
             "probing",
@@ -746,7 +1008,7 @@ class Database:
                 candidate = dict(candidate_row)
                 assigned_url = str(candidate.get("islice_base_url") or "").rstrip("/")
                 if assigned_url:
-                    if assigned_url not in normalized_urls:
+                    if assigned_url not in normalized_configured:
                         await db.execute(
                             "UPDATE jobs SET status='paused', error_message=?, updated_at=? WHERE id=?",
                             (
@@ -758,6 +1020,8 @@ class Database:
                         continue
                     selected_url = assigned_url
                 else:
+                    if not normalized_urls:
+                        continue
                     selected_url = min(
                         normalized_urls,
                         key=lambda url: active_counts.get(url, 0),

@@ -118,11 +118,13 @@ class ISliceClient:
 
 
 class ISlicePool:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, urls: tuple[str, ...] | None = None):
+        self.settings = settings
         self.clients = {
             url: ISliceClient(settings, base_url=url)
-            for url in settings.configured_islice_urls
+            for url in (urls or settings.configured_islice_urls)
         }
+        self._lock = asyncio.Lock()
 
     @property
     def urls(self) -> tuple[str, ...]:
@@ -136,6 +138,20 @@ class ISlicePool:
             raise ISliceConfigurationError(
                 f"Job is assigned to unconfigured iSlice instance: {normalized}"
             ) from exc
+
+    async def reconcile(self, urls: tuple[str, ...]) -> None:
+        normalized = tuple(dict.fromkeys(url.rstrip("/") for url in urls if url))
+        async with self._lock:
+            for url in normalized:
+                if url not in self.clients:
+                    self.clients[url] = ISliceClient(self.settings, base_url=url)
+            removed = [
+                self.clients.pop(url)
+                for url in tuple(self.clients)
+                if url not in normalized
+            ]
+        if removed:
+            await asyncio.gather(*(client.close() for client in removed))
 
     async def close(self) -> None:
         await asyncio.gather(*(client.close() for client in self.clients.values()))

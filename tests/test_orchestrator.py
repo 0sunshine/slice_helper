@@ -549,6 +549,7 @@ async def test_multiple_islices_enforce_capacity_and_priority_independently(
     )
     database = Database(configured.database_path)
     await database.initialize()
+    await database.seed_islice_instances(urls)
     stat = source.stat()
     job_ids = [f"multi-job-{index:02d}" for index in range(21)]
     for job_id in job_ids:

@@ -9,6 +9,7 @@ from slice_helper.archive_agent import (
     Archiver,
     StateStore,
     TaskManifest,
+    RemoteSyncResult,
     build_manifest,
 )
 
@@ -116,11 +117,28 @@ class FakeRemote:
         self.synced: list[TaskManifest] = []
         self.verified: list[TaskManifest] = []
 
-    def sync(self, manifest, _output, _manifest_json, _manifest_checksums) -> None:
+    def sync(
+        self,
+        manifest,
+        _output,
+        _manifest_json,
+        _manifest_checksums,
+        *,
+        publish=True,
+        hold_reason="",
+    ) -> RemoteSyncResult:
         self.synced.append(manifest)
+        return RemoteSyncResult(
+            published=publish,
+            remote_path=f"/archive/tasks/{manifest.task_id}",
+            hold_reason=hold_reason,
+        )
 
     def verify(self, manifest) -> None:
         self.verified.append(manifest)
+
+    def publish_catalog(self, _path) -> None:
+        return None
 
 
 def test_manifest_hashes_all_output_and_is_deletion_eligible(tmp_path: Path) -> None:
@@ -196,3 +214,46 @@ def test_incomplete_task_is_archived_without_local_deletion(tmp_path: Path) -> N
     assert archived["state"] == "archived_hold"
     assert output.is_dir()
     assert len(remote.synced) == 1
+
+
+def test_state_store_tracks_new_digest_as_a_revision_without_overwrite(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    state = StateStore(config.state_database, "islice-128")
+    state.initialize()
+    output = make_output(config.storage_root)
+    task_path = config.storage_root / "task-001"
+    state.discover("task-001", task_path, output, "/archive/tasks/task-001", "v1")
+
+    first = build_manifest(task_payload(), output)
+    state.record_revision(
+        "task-001",
+        first,
+        RemoteSyncResult(True, "/archive/tasks/task-001"),
+        "published",
+    )
+    state.transition("task-001", "deleted", "local_deleted")
+
+    (output / "segments" / "one.mp4").write_bytes(b"video-two")
+    second = build_manifest(task_payload(), output)
+    assert second.digest != first.digest
+    state.discover("task-001", task_path, output, "/archive/tasks/task-001", "v2")
+    assert state.get("task-001")["state"] == "pending"
+    state.record_revision(
+        "task-001",
+        second,
+        RemoteSyncResult(
+            True,
+            "/archive/tasks/task-001",
+            first.digest,
+            f"/archive/history/task-001/{first.digest}",
+        ),
+        "published",
+    )
+
+    revisions = {item["manifest_digest"]: item for item in state.revisions("task-001")}
+    assert revisions[first.digest]["state"] == "superseded"
+    assert revisions[first.digest]["remote_path"].startswith("/archive/history/")
+    assert revisions[second.digest]["state"] == "published"
+    assert state.get("task-001")["revision_count"] == 2

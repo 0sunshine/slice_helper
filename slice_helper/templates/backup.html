@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>iSlice 实例与备份</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}?v={{ version }}">
+</head>
+<body>
+  <header class="topbar">
+    <div><h1>iSlice 实例与备份</h1><span class="version">v{{ version }}</span></div>
+    <div class="topbar-actions">
+      <span id="catalogHealth" class="health neutral">检查中</span>
+      <a class="button secondary button-link" href="/">返回作业</a>
+      <button id="refreshBackup" class="button secondary" type="button">刷新</button>
+      <button id="addInstance" class="button primary" type="button">添加 iSlice</button>
+    </div>
+  </header>
+
+  <main class="backup-page">
+    <section class="band">
+      <div class="section-heading"><div><h2>实例与调度</h2><span id="instanceCount" class="count">0</span></div></div>
+      <div id="instanceCards" class="instance-grid"></div>
+      <div id="emptyInstances" class="empty-state" hidden>尚未配置 iSlice 实例</div>
+    </section>
+
+    <section class="band backup-band">
+      <div class="section-heading backup-heading">
+        <div><h2>备份任务</h2><span id="backupCount" class="count">0</span></div>
+        <div class="job-filters">
+          <label class="filter-label">来源<select id="backupSource"><option value="">全部来源</option></select></label>
+          <label class="filter-label">状态<select id="backupState">
+            <option value="">全部状态</option>
+            <option value="pending">等待归档</option>
+            <option value="syncing">同步中</option>
+            <option value="verifying">校验中</option>
+            <option value="delete_pending">等待删除</option>
+            <option value="archived_hold">归档保留</option>
+            <option value="archived_unpublished">已归档未发布</option>
+            <option value="publish_conflict">发布冲突</option>
+            <option value="deleted">本地已清理</option>
+            <option value="failed">失败</option>
+          </select></label>
+          <label class="filter-label">搜索<input id="backupQuery" placeholder="频道、作业或 task ID"></label>
+        </div>
+      </div>
+      <div class="archive-summary" id="archiveSummary"></div>
+      <div class="table-scroll">
+        <table class="data-table backup-table">
+          <thead><tr><th>来源</th><th>频道/业务日期</th><th>窗口</th><th>task ID</th><th>状态</th><th>版本</th><th>文件</th><th>容量</th><th>归档/删除时间</th><th>说明</th></tr></thead>
+          <tbody id="backupBody"></tbody>
+        </table>
+      </div>
+      <div id="emptyBackups" class="empty-state" hidden>没有符合条件的备份任务</div>
+      <div class="jobs-pagination">
+        <span id="backupPageSummary">共 0 条</span>
+        <button id="previousBackupPage" class="icon-button pagination-button" type="button">&lsaquo;</button>
+        <span id="backupPageInfo">1 / 1</span>
+        <button id="nextBackupPage" class="icon-button pagination-button" type="button">&rsaquo;</button>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="instanceDialog" class="instance-dialog">
+    <form id="instanceForm" method="dialog">
+      <div class="dialog-header"><h2 id="instanceDialogTitle">添加 iSlice 实例</h2><button id="closeInstanceDialog" class="icon-button" type="button">×</button></div>
+      <input id="instanceId" type="hidden">
+      <div class="form-grid instance-form-grid">
+        <label>显示名称<input id="instanceName" required maxlength="255" placeholder="iSlice 128"></label>
+        <label>来源标识 sourceId<input id="instanceSourceId" required maxlength="64" placeholder="islice-128"></label>
+        <label class="full">iSlice API 地址<input id="instanceBaseUrl" required placeholder="http://192.168.104.128:8000"></label>
+        <label class="full">归档 catalog 地址<input id="instanceCatalogUrl" placeholder="http://192.168.6.200:18080/sources/islice-128/catalog.json"></label>
+        <label class="checkbox-label full"><input id="instanceSchedulable" type="checkbox" checked>允许调度新作业</label>
+      </div>
+      <p class="muted instance-help">关闭调度只影响后续新作业；已经绑定到该实例的作业不会迁移。</p>
+      <div class="dialog-actions"><button id="cancelInstance" class="button secondary" type="button">取消</button><button class="button primary" type="submit">保存</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="{{ url_for('static', path='/backup.js') }}?v={{ version }}" defer></script>
+</body>
+</html>

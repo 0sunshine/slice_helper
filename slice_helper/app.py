@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from . import __version__
+from .archive_status import ArchiveCatalogReader
 from .config import Settings
 from .database import Database
 from .excel_export import build_channel_workbook, safe_export_filename
@@ -31,6 +32,7 @@ from .models import (
     JobReviewUpdate,
     JobCreate,
     JobStatus,
+    ISliceInstanceUpsert,
     SegmentUpdate,
     SegmentMergeCreate,
     SegmentMergePreviewRequest,
@@ -145,22 +147,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         configured.temp_dir.mkdir(parents=True, exist_ok=True)
         database = Database(configured.database_path)
         await database.initialize()
+        await database.seed_islice_instances(configured.configured_islice_urls)
         media = MediaService(configured)
         source_downloader = HttpSourceDownloader()
         await database.assign_legacy_jobs_with_attempts(configured.islice_base_url)
-        islice = ISlicePool(configured)
+        instances = await database.list_islice_instances()
+        islice = ISlicePool(
+            configured,
+            urls=tuple(str(item["base_url"]) for item in instances),
+        )
+        archive_catalog = ArchiveCatalogReader()
         orchestrator = Orchestrator(configured, database, media, islice)
         app.state.settings = configured
         app.state.database = database
         app.state.media = media
         app.state.source_downloader = source_downloader
         app.state.islice = islice
+        app.state.archive_catalog = archive_catalog
         app.state.orchestrator = orchestrator
         await orchestrator.start()
         try:
             yield
         finally:
             await orchestrator.stop()
+            await archive_catalog.close()
             await islice.close()
 
     application = FastAPI(
@@ -178,6 +188,152 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             name="index.html",
             context={"version": application.version},
         )
+
+    @application.get("/backup", response_class=HTMLResponse, include_in_schema=False)
+    async def backup_page(request: Request):
+        return templates.TemplateResponse(
+            request=request,
+            name="backup.html",
+            context={"version": application.version},
+        )
+
+    @application.get("/api/islice-instances")
+    async def list_islice_instances(request: Request):
+        return await request.app.state.database.list_islice_instances()
+
+    @application.post("/api/islice-instances", status_code=201)
+    async def create_islice_instance(request: Request, body: ISliceInstanceUpsert):
+        try:
+            instance = await request.app.state.database.create_islice_instance(
+                body.model_dump()
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="sourceId 或 iSlice 地址已存在") from exc
+        await request.app.state.islice.reconcile(
+            await request.app.state.database.all_islice_urls()
+        )
+        request.app.state.orchestrator.notify()
+        return instance
+
+    @application.put("/api/islice-instances/{instance_id}")
+    async def update_islice_instance(
+        request: Request, instance_id: str, body: ISliceInstanceUpsert
+    ):
+        try:
+            instance = await request.app.state.database.update_islice_instance(
+                instance_id, body.model_dump()
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="sourceId 或 iSlice 地址已存在") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if instance is None:
+            raise HTTPException(status_code=404, detail="iSlice 实例不存在")
+        await request.app.state.islice.reconcile(
+            await request.app.state.database.all_islice_urls()
+        )
+        request.app.state.orchestrator.notify()
+        return instance
+
+    @application.delete("/api/islice-instances/{instance_id}", status_code=204)
+    async def delete_islice_instance(request: Request, instance_id: str):
+        try:
+            deleted = await request.app.state.database.delete_islice_instance(instance_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not deleted:
+            raise HTTPException(status_code=404, detail="iSlice 实例不存在")
+        await request.app.state.islice.reconcile(
+            await request.app.state.database.all_islice_urls()
+        )
+        request.app.state.orchestrator.notify()
+        return Response(status_code=204)
+
+    @application.get("/api/archive/status")
+    async def archive_status(
+        request: Request,
+        source_id: str | None = Query(default=None, alias="sourceId"),
+        state: str | None = Query(default=None),
+        query: str = Query(default="", max_length=200),
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=20, alias="pageSize", ge=1, le=100),
+    ):
+        instances = await request.app.state.database.list_islice_instances()
+        contexts = await request.app.state.database.archive_task_contexts()
+        catalog = await request.app.state.archive_catalog.read(instances, contexts)
+        needle = query.strip().casefold()
+        tasks = []
+        for task in catalog["tasks"]:
+            if source_id and task.get("source_id") != source_id:
+                continue
+            if state and task.get("state") != state:
+                continue
+            context = task.get("context") or {}
+            haystack = " ".join(
+                str(value or "")
+                for value in (
+                    task.get("task_id"),
+                    task.get("source_name"),
+                    task.get("error_message"),
+                    context.get("job_id"),
+                    context.get("channel_name"),
+                    context.get("broadcast_date"),
+                )
+            ).casefold()
+            if needle and needle not in haystack:
+                continue
+            tasks.append(task)
+        tasks.sort(
+            key=lambda item: str(item.get("updated_at") or item.get("discovered_at") or ""),
+            reverse=True,
+        )
+        total = len(tasks)
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, total_pages)
+        start = (page - 1) * page_size
+        return {
+            "sources": catalog["sources"],
+            "items": tasks[start : start + page_size],
+            "page": page,
+            "pageSize": page_size,
+            "total": total,
+            "totalPages": total_pages,
+        }
+
+    @application.get("/internal/archive-references/{task_id}")
+    async def archive_references(
+        request: Request,
+        task_id: str,
+        islice_base_url: str | None = Query(default=None, alias="isliceBaseUrl"),
+    ):
+        rows = await request.app.state.database.archive_references(task_id)
+        if islice_base_url:
+            normalized = islice_base_url.rstrip("/")
+            rows = [
+                row
+                for row in rows
+                if str(row.get("islice_base_url") or "").rstrip("/") == normalized
+            ]
+        media_paths: set[str] = set()
+        for row in rows:
+            for field in ("segment_url", "cover_img_url"):
+                parts = urlsplit(str(row.get(field) or "")).path.strip("/").split("/")
+                try:
+                    index = parts.index("download")
+                    url_task, directory, filename = parts[index + 1 : index + 4]
+                except (ValueError, IndexError):
+                    continue
+                if url_task == task_id and directory in {"segments", "covers"} and filename:
+                    media_paths.add(f"{directory}/{filename}")
+        return {
+            "taskId": task_id,
+            "found": bool(rows),
+            "isliceBaseUrls": sorted(
+                {str(row["islice_base_url"]) for row in rows if row.get("islice_base_url")}
+            ),
+            "mediaPaths": sorted(media_paths),
+            "references": len(rows),
+        }
 
     @application.get("/api/channels")
     async def list_channels(request: Request):

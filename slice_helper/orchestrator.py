@@ -729,9 +729,21 @@ class Orchestrator:
         while not self._stopping:
             capacity = self.settings.max_active_jobs - len(self._active)
             if capacity > 0:
+                schedulable_urls = await self.database.schedulable_islice_urls()
+                configured_urls = await self.database.all_islice_urls()
+                if isinstance(self.islice, ISlicePool):
+                    await self.islice.reconcile(configured_urls)
+                if not schedulable_urls and not configured_urls:
+                    self._wake.clear()
+                    try:
+                        await asyncio.wait_for(self._wake.wait(), timeout=1.0)
+                    except TimeoutError:
+                        pass
+                    continue
                 for job in await self.database.claim_schedulable_jobs(
-                    self.settings.configured_islice_urls,
+                    schedulable_urls,
                     capacity,
+                    configured_urls,
                 ):
                     job_id = job["id"]
                     if job_id in self._active:

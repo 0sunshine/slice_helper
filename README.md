@@ -31,8 +31,8 @@ cp .env.example .env
 
 必须设置：
 
-- `ISLICE_BASE_URL`：单 iSlice S1 服务地址，例如 `http://192.168.104.128:8000`
-- `ISLICE_BASE_URLS`：多 iSlice 地址，使用英文逗号分隔。新作业先进入“待调度”状态；绑定后，同一作业的全部窗口、重试和恢复都使用该实例。若已绑定实例从配置中移除，作业会暂停，不会自动改派。
+- `ISLICE_BASE_URL`：首次启动时用于播种实例列表的兼容配置，例如 `http://192.168.104.128:8000`
+- `ISLICE_BASE_URLS`：首次启动时可用英文逗号播种多台 iSlice；之后可在“iSlice 与备份”页面直接维护实例、归档 catalog 地址及是否允许调度
 - `PUBLIC_BASE_URL`：iSlice 能访问到的本服务地址，例如 `http://192.168.104.239:8090`
 
 常用可选项：
@@ -46,6 +46,18 @@ cp .env.example .env
 - 每个窗口每次调度只提交一个 iSlice 子任务；子任务失败、提交异常或等待超时后立即暂停作业，不自动创建新的 attempt。手动恢复作业时才会创建下一次 attempt
 
 helper 不限制每台 iSlice 已绑定的长文件作业总数；新作业优先分配给当前活动作业较少的实例。同一实例上一个子任务达到 71% 或终态后，等待创建子任务的作业中总体完成度最高者优先；完成度相同则按进入等待队列的先后顺序。实际执行并发仍由 iSlice 控制。`MAX_ACTIVE_JOBS` 是所有实例合计的全局作业并发上限。
+
+## iSlice 实例与备份
+
+首页右上角的“iSlice 与备份”进入统一管理页。每个实例包含稳定的 `sourceId`、显示名称、iSlice API 地址、归档 `catalog.json` 地址和“允许调度新作业”开关。
+
+- 新作业只分配给允许调度的实例；作业一旦绑定，全部窗口、恢复和重试都继续使用原实例，关闭调度不会迁移历史作业
+- 已产生作业的实例不能修改 API 地址或 `sourceId`，防止归档命名空间与任务来源错配；名称、catalog 地址和调度开关仍可修改
+- 备份页按来源、状态和关键字筛选，逐个 task ID 显示归档状态、版本数、文件数、容量、清理时间和失败原因
+- 多台 iSlice 的归档必须使用不同 `sourceId`，远端目录为 `archive/sources/{sourceId}`；相同 task ID 在不同来源之间互不冲突
+- 重新拆条产生新内容时，归档代理先完整上传并校验新 Digest。只有 helper 当前引用已属于新版本时，旧 `tasks/{taskId}` 才原子改名到 `history/{taskId}/{oldDigest}`，新版本再占用原 task ID；冲突时新版本只存入 history，旧发布版本和本地文件均保留
+
+归档代理和 Nginx 的部署文件位于 `deploy/archive-agent/` 与 `deploy/nginx/`。该功能不调用 iSlice 重新拆条，也不修改 iSlice 业务代码。
 
 ## 启动
 
