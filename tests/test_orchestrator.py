@@ -171,18 +171,6 @@ class BlockingResplitISlice(ResplitISlice):
         return True
 
 
-class FailingCleanupISlice(ResplitISlice):
-    def __init__(self) -> None:
-        super().__init__()
-        self.fail_delete = True
-
-    async def delete_task(self, task_id):
-        self.deleted.append(task_id)
-        if self.fail_delete:
-            raise ISliceError("delete unavailable")
-        return False
-
-
 class OverlappingISlice:
     async def ensure_task(self, _task_id, _request):
         return None
@@ -694,7 +682,7 @@ async def test_pause_is_honored_after_poll_and_resume_reuses_attempt(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_tail_rebuild_cleans_old_tasks_and_uses_new_generation(tmp_path: Path) -> None:
+async def test_tail_rebuild_keeps_old_tasks_and_uses_new_generation(tmp_path: Path) -> None:
     source = tmp_path / "source.ts"
     source.write_bytes(b"source")
     configured = make_settings(tmp_path)
@@ -707,7 +695,14 @@ async def test_tail_rebuild_cleans_old_tasks_and_uses_new_generation(tmp_path: P
         "abc123", islice_base_url="http://islice.test", reviewed=1
     )
     old_windows = await database.get_windows("abc123")
-    old_task = (await database.get_attempts(old_windows[1]["id"]))[0]["task_id"]
+    old_attempt = (await database.get_attempts(old_windows[1]["id"]))[0]
+    old_task = old_attempt["task_id"]
+    old_raw_path = Path(old_attempt["raw_response_path"])
+    old_chunk_path = configured.temp_dir / "abc123" / "retained-old-window.ts"
+    old_chunk_path.write_bytes(b"retained")
+    await database.update_window(
+        old_windows[1]["id"], chunk_path=str(old_chunk_path)
+    )
 
     replacement = ResplitISlice()
     orchestrator.islice = replacement
@@ -715,18 +710,21 @@ async def test_tail_rebuild_cleans_old_tasks_and_uses_new_generation(tmp_path: P
     response = await orchestrator.start_tail_rebuild(
         "abc123", 1, preview["previewToken"], "从窗口 2 重跑"
     )
-    cleanup = orchestrator._rebuild_tasks["abc123"]
-    await asyncio.wait_for(cleanup, timeout=1)
 
     assert response["generation"] == 1
-    assert replacement.deleted == [old_task]
+    assert replacement.deleted == []
+    assert old_raw_path.is_file()
+    assert old_chunk_path.is_file()
     assert [item["window_index"] for item in await database.get_windows("abc123")] == [0]
     truncated = await database.get_job("abc123")
     assert truncated["status"] == "pending_schedule"
     assert truncated["current_window"] == 1
     assert truncated["reviewed"] == 0
     assert truncated["rebuild_revision"] == 1
-    assert Path((await database.get_latest_job_rebuild("abc123"))["snapshot_path"]).is_file()
+    rebuild = await database.get_latest_job_rebuild("abc123")
+    assert Path(rebuild["snapshot_path"]).is_file()
+    snapshot = json.loads(Path(rebuild["snapshot_path"]).read_text(encoding="utf-8"))
+    assert old_task in {attempt["task_id"] for attempt in snapshot["attempts"]}
 
     await database.update_job("abc123", status="queued")
     await orchestrator._process_job("abc123")
@@ -735,40 +733,6 @@ async def test_tail_rebuild_cleans_old_tasks_and_uses_new_generation(tmp_path: P
     assert request["videoPath"].endswith("/internal/chunks/abc123/1/1.ts")
     assert (await database.get_job("abc123"))["status"] == "completed"
     assert (await database.get_latest_job_rebuild("abc123"))["status"] == "completed"
-
-
-@pytest.mark.asyncio
-async def test_tail_rebuild_cleanup_failure_stays_paused_and_can_retry(tmp_path: Path) -> None:
-    source = tmp_path / "source.ts"
-    source.write_bytes(b"source")
-    configured = make_settings(tmp_path)
-    database = Database(configured.database_path)
-    await database.initialize()
-    await create_job(database, source, duration=3600)
-    orchestrator = Orchestrator(configured, database, FakeMedia(), FakeISlice())
-    await orchestrator._process_job("abc123")
-    await database.update_job("abc123", islice_base_url="http://islice.test")
-
-    replacement = FailingCleanupISlice()
-    orchestrator.islice = replacement
-    preview = await orchestrator.preview_tail_rebuild("abc123", 0)
-    await orchestrator.start_tail_rebuild(
-        "abc123", 0, preview["previewToken"], "从窗口 1 重跑"
-    )
-    await asyncio.wait_for(orchestrator._rebuild_tasks["abc123"], timeout=1)
-    failed = await database.get_latest_job_rebuild("abc123")
-    assert failed["status"] == "cleanup_failed"
-    assert (await database.get_job("abc123"))["status"] == "paused"
-    assert replacement.created == []
-
-    replacement.fail_delete = False
-    await asyncio.sleep(0)
-    await orchestrator.retry_tail_rebuild_cleanup("abc123")
-    await asyncio.wait_for(orchestrator._rebuild_tasks["abc123"], timeout=1)
-    assert (await database.get_latest_job_rebuild("abc123"))["status"] == "queued"
-    assert (await database.get_job("abc123"))["status"] == "pending_schedule"
-
-
 @pytest.mark.asyncio
 async def test_tail_rebuild_snapshot_failure_does_not_change_database(
     tmp_path: Path, monkeypatch

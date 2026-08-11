@@ -230,16 +230,16 @@
         <button id="closeTailRebuildButton" class="icon-button" type="button" aria-label="关闭">×</button>
       </div>
       <div class="confirm-dialog-body">
-        <p>系统会先永久删除指定窗口及之后的旧窗口、attempt 和拆条结果，再清理对应的旧 iSlice 任务与临时文件。只有清理全部成功后，作业才会重新进入队列。</p>
+        <p>系统会永久删除指定窗口及之后的旧窗口、attempt 和拆条结果，然后使用新的 generation 任务 ID 从该窗口重新进入队列。旧 iSlice 任务和临时文件不会删除。</p>
         <dl>
           <div><dt>起始窗口</dt><dd id="tailRebuildWindow"></dd></div>
           <div><dt>保留</dt><dd id="tailRebuildKeepCount"></dd></div>
           <div><dt>删除数据</dt><dd id="tailRebuildDeleteCount"></dd></div>
-          <div><dt>旧任务</dt><dd id="tailRebuildTaskCount"></dd></div>
+          <div><dt>旧 iSlice 任务</dt><dd id="tailRebuildTaskCount"></dd></div>
           <div><dt>源时间</dt><dd id="tailRebuildSourceStart" class="mono"></dd></div>
           <div><dt>真实时间</dt><dd id="tailRebuildAbsoluteStart" class="mono"></dd></div>
         </dl>
-        <p class="confirm-warning">此操作不可在界面中撤销。清理失败时作业会保持暂停，可重试清理。</p>
+        <p class="confirm-warning">数据库中的旧窗口及拆条结果会被删除，此操作不可在界面中撤销。</p>
         <label class="destructive-confirm-label"><span>请输入“<strong id="tailRebuildConfirmationLabel"></strong>”确认</span>
           <input id="tailRebuildConfirmation" autocomplete="off" required>
         </label>

@@ -593,18 +593,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             status_code = 404 if str(exc) in {"Job not found", "Window not found"} else 400
             raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
-    @application.post(
-        "/api/jobs/{job_id}/tail-rebuild/retry-cleanup",
-        status_code=202,
-    )
-    async def retry_tail_rebuild_cleanup(request: Request, job_id: str):
-        try:
-            return await request.app.state.orchestrator.retry_tail_rebuild_cleanup(job_id)
-        except RebuildConflictError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except RebuildValidationError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
     @application.get("/api/jobs/{job_id}/result")
     async def get_result(request: Request, job_id: str, download: bool = Query(default=False)):
         if not await request.app.state.database.get_job(job_id):
@@ -640,12 +628,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.post("/api/jobs/{job_id}/resume")
     async def resume_job(request: Request, job_id: str):
         job = await _require_job(request, job_id)
-        rebuild = await request.app.state.database.get_latest_job_rebuild(job_id)
-        if rebuild and rebuild["status"] in {"deleting", "cleanup_failed"}:
-            raise HTTPException(
-                status_code=409,
-                detail="Old iSlice tasks must be cleaned before this job can resume",
-            )
         if job["status"] not in {JobStatus.PAUSED.value, JobStatus.FAILED.value}:
             raise HTTPException(status_code=409, detail="Only paused or failed jobs can be resumed")
         await request.app.state.database.update_job(
@@ -661,12 +643,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.post("/api/jobs/{job_id}/stop")
     async def stop_job(request: Request, job_id: str):
         job = await _require_job(request, job_id)
-        rebuild = await request.app.state.database.get_latest_job_rebuild(job_id)
-        if rebuild and rebuild["status"] in {"deleting", "cleanup_failed"}:
-            raise HTTPException(
-                status_code=409,
-                detail="Old iSlice task cleanup cannot be stopped; retry cleanup if it failed",
-            )
         if job["status"] in {
             JobStatus.COMPLETED.value,
             JobStatus.STOPPED.value,

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -36,7 +35,7 @@ async def test_database_persists_and_recovers_jobs(tmp_path: Path) -> None:
 
     async with database.connect() as db:
         versions = await (await db.execute("SELECT version FROM schema_version ORDER BY version")).fetchall()
-    assert [row["version"] for row in versions] == list(range(1, 17))
+    assert [row["version"] for row in versions] == list(range(1, 18))
     async with database.connect() as db:
         segment_columns = {
             row["name"]
@@ -154,12 +153,12 @@ async def test_tail_rebuild_truncates_atomically_and_cascades_results(tmp_path: 
     assert [item["task_id"] for item in await database.get_attempts_for_job("tail-job")] == ["old-0"]
     assert [item["title"] for item in await database.get_segments("tail-job")] == ["segment-0"]
     job = await database.get_job("tail-job")
-    assert job["status"] == "paused"
+    assert job["status"] == "pending_schedule"
     assert job["current_window"] == 1
     assert job["next_window_start"] == 3600
     assert job["reviewed"] == 0
     assert job["rebuild_revision"] == 1
-    assert set(json.loads(rebuild["task_ids_json"])) == {"old-1", "old-2"}
+    assert rebuild["status"] == "queued"
 
 
 @pytest.mark.asyncio

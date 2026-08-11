@@ -123,7 +123,6 @@ class Orchestrator:
         self._gate_monitors: dict[str, asyncio.Task[None]] = {}
         self._resplit_tasks: dict[tuple[str, int], asyncio.Task[None]] = {}
         self._resplit_lock = asyncio.Lock()
-        self._rebuild_tasks: dict[str, asyncio.Task[None]] = {}
         self._rebuild_lock = asyncio.Lock()
         self._wake = asyncio.Event()
         self._stopping = False
@@ -132,8 +131,6 @@ class Orchestrator:
         await self.database.recover_interrupted_resplits()
         await self.database.recover_jobs()
         self._stopping = False
-        for rebuild in await self.database.list_rebuilds_for_recovery():
-            self._start_rebuild_cleanup(rebuild)
         self._scheduler_task = asyncio.create_task(self._scheduler_loop(), name="job-scheduler")
 
     async def stop(self) -> None:
@@ -153,11 +150,6 @@ class Orchestrator:
         if self._resplit_tasks:
             await asyncio.gather(*self._resplit_tasks.values(), return_exceptions=True)
         self._resplit_tasks.clear()
-        for task in self._rebuild_tasks.values():
-            task.cancel()
-        if self._rebuild_tasks:
-            await asyncio.gather(*self._rebuild_tasks.values(), return_exceptions=True)
-        self._rebuild_tasks.clear()
         for task in self._gate_monitors.values():
             task.cancel()
         if self._gate_monitors:
@@ -271,20 +263,10 @@ class Orchestrator:
             except ValueError as exc:
                 snapshot_path.unlink(missing_ok=True)
                 message = str(exc)
-                if "changed after preview" in message or "already has" in message:
+                if "changed after preview" in message:
                     raise RebuildConflictError(message) from exc
                 raise RebuildValidationError(message) from exc
-            self._start_rebuild_cleanup(rebuild)
-            return self._public_rebuild(rebuild)
-
-    async def retry_tail_rebuild_cleanup(self, job_id: str) -> dict[str, Any]:
-        async with self._rebuild_lock:
-            if job_id in self._rebuild_tasks:
-                raise RebuildConflictError("Old task cleanup is already running")
-            rebuild = await self.database.retry_rebuild_cleanup(job_id)
-            if rebuild is None:
-                raise RebuildValidationError("No failed tail rebuild cleanup is available")
-            self._start_rebuild_cleanup(rebuild)
+            self.notify()
             return self._public_rebuild(rebuild)
 
     def _validate_tail_rebuild_job(
@@ -303,78 +285,10 @@ class Orchestrator:
             )
         if any(active_job_id == job_id for active_job_id, _ in self._resplit_tasks):
             raise RebuildConflictError("This job has a manual resplit in progress")
-        if job_id in self._rebuild_tasks:
-            raise RebuildConflictError("Old task cleanup is already running")
         if not job.get("islice_base_url"):
             raise RebuildValidationError("The job has not been assigned to an iSlice instance")
         if not self._source_unchanged(job):
             raise RebuildValidationError("Source file size or modification time changed")
-
-    def _start_rebuild_cleanup(self, rebuild: dict[str, Any]) -> None:
-        job_id = str(rebuild["job_id"])
-        task = asyncio.create_task(
-            self._run_rebuild_cleanup(str(rebuild["id"])),
-            name=f"tail-rebuild-cleanup-{rebuild['id']}",
-        )
-        self._rebuild_tasks[job_id] = task
-        task.add_done_callback(
-            lambda done, key=job_id: self._rebuild_cleanup_finished(key, done)
-        )
-
-    def _rebuild_cleanup_finished(
-        self, job_id: str, task: asyncio.Task[None]
-    ) -> None:
-        if self._rebuild_tasks.get(job_id) is task:
-            self._rebuild_tasks.pop(job_id, None)
-        if not task.cancelled() and task.exception() is not None:
-            logger.error("Tail rebuild cleanup failed unexpectedly: %s", task.exception())
-
-    async def _run_rebuild_cleanup(self, rebuild_id: str) -> None:
-        rebuild = await self.database.get_rebuild(rebuild_id)
-        if not rebuild or rebuild["status"] != "deleting":
-            return
-        job_id = str(rebuild["job_id"])
-        try:
-            job = await self.database.get_job(job_id)
-            if not job:
-                raise RebuildValidationError("Job not found")
-            islice_client = self._islice_client(job)
-            for task_id in dict.fromkeys(json.loads(rebuild["task_ids_json"] or "[]")):
-                await islice_client.delete_task(str(task_id))
-            await asyncio.to_thread(
-                self._delete_rebuild_files,
-                job_id,
-                json.loads(rebuild["chunk_paths_json"] or "[]"),
-                json.loads(rebuild["raw_paths_json"] or "[]"),
-            )
-            if await self.database.finish_rebuild_cleanup(rebuild_id):
-                with contextlib.suppress(Exception):
-                    await self.write_manifest(job_id)
-                self.notify()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            message = str(exc) or exc.__class__.__name__
-            logger.exception("Job %s tail rebuild cleanup failed", job_id)
-            await self.database.mark_rebuild_cleanup_failed(rebuild_id, message)
-
-    def _delete_rebuild_files(
-        self, job_id: str, chunk_paths: list[str], raw_paths: list[str]
-    ) -> None:
-        allowed = (
-            (chunk_paths, (self.settings.temp_dir / job_id).resolve()),
-            (raw_paths, (self.settings.data_dir / "jobs" / job_id / "raw").resolve()),
-        )
-        for paths, root in allowed:
-            for raw_path in dict.fromkeys(paths):
-                path = Path(raw_path).resolve()
-                try:
-                    path.relative_to(root)
-                except ValueError as exc:
-                    raise RebuildValidationError(
-                        f"Refusing to delete a file outside the job directory: {path}"
-                    ) from exc
-                path.unlink(missing_ok=True)
 
     @staticmethod
     def _public_rebuild(rebuild: dict[str, Any]) -> dict[str, Any]:
@@ -395,13 +309,6 @@ class Orchestrator:
     ) -> dict[str, Any]:
         key = (job_id, window_index)
         async with self._resplit_lock:
-            rebuild = await self.database.get_latest_job_rebuild(job_id)
-            if job_id in self._rebuild_tasks or (
-                rebuild and rebuild["status"] in {"deleting", "cleanup_failed"}
-            ):
-                raise ResplitConflictError(
-                    "Old iSlice tasks must be cleaned before manually resplitting"
-                )
             if any(active_job_id == job_id for active_job_id, _index in self._resplit_tasks):
                 raise ResplitConflictError("This job already has a resplit in progress")
             job = await self.database.get_job(job_id)
@@ -469,13 +376,6 @@ class Orchestrator:
         boundary guard.
         """
         async with self._resplit_lock:
-            rebuild = await self.database.get_latest_job_rebuild(job_id)
-            if job_id in self._rebuild_tasks or (
-                rebuild and rebuild["status"] in {"deleting", "cleanup_failed"}
-            ):
-                raise ResplitConflictError(
-                    "Old iSlice tasks must be cleaned before accepting overlap"
-                )
             if any(active_job_id == job_id for active_job_id, _ in self._resplit_tasks):
                 raise ResplitConflictError("This job already has a resplit in progress")
 

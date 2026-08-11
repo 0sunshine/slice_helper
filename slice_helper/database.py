@@ -228,9 +228,6 @@ class Database:
                     start_window_index INTEGER NOT NULL,
                     generation INTEGER NOT NULL,
                     status TEXT NOT NULL,
-                    task_ids_json TEXT NOT NULL DEFAULT '[]',
-                    chunk_paths_json TEXT NOT NULL DEFAULT '[]',
-                    raw_paths_json TEXT NOT NULL DEFAULT '[]',
                     snapshot_path TEXT NOT NULL,
                     error_message TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
@@ -479,6 +476,32 @@ class Database:
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(16, ?)",
                 (utc_now(),),
             )
+            version_17 = await (
+                await db.execute("SELECT 1 FROM schema_version WHERE version=17")
+            ).fetchone()
+            if version_17 is None:
+                now = utc_now()
+                interrupted = await (
+                    await db.execute(
+                        "SELECT DISTINCT job_id FROM job_rebuilds "
+                        "WHERE status IN ('deleting', 'cleanup_failed')"
+                    )
+                ).fetchall()
+                await db.execute(
+                    "UPDATE job_rebuilds SET status='queued', error_message='', updated_at=? "
+                    "WHERE status IN ('deleting', 'cleanup_failed')",
+                    (now,),
+                )
+                for row in interrupted:
+                    await db.execute(
+                        "UPDATE jobs SET status='pending_schedule', error_message='', "
+                        "updated_at=? WHERE id=?",
+                        (now, row["job_id"]),
+                    )
+                await db.execute(
+                    "INSERT INTO schema_version(version, applied_at) VALUES(17, ?)",
+                    (now,),
+                )
             await db.commit()
 
     @staticmethod
@@ -1064,16 +1087,6 @@ class Database:
         rebuild_id = uuid.uuid4().hex
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
-            active = await (
-                await db.execute(
-                    "SELECT id FROM job_rebuilds WHERE job_id=? "
-                    "AND status IN ('deleting', 'cleanup_failed') LIMIT 1",
-                    (job_id,),
-                )
-            ).fetchone()
-            if active is not None:
-                await db.rollback()
-                raise ValueError("This job already has a tail rebuild cleanup in progress")
             state = await self._tail_state(db, job_id, start_window_index)
             if state is None:
                 await db.rollback()
@@ -1100,28 +1113,15 @@ class Database:
                     if previous["handoff_start"] is not None
                     else previous["nominal_end"]
                 )
-            task_ids = [str(row["task_id"]) for row in state["attempts"]]
-            chunk_paths = [
-                str(row["chunk_path"])
-                for row in state["windows"]
-                if row.get("chunk_path")
-            ]
-            raw_paths = [
-                str(row["raw_response_path"])
-                for row in state["attempts"]
-                if row.get("raw_response_path")
-            ]
             await db.execute(
                 """
                 INSERT INTO job_rebuilds(
                     id, job_id, start_window_index, generation, status,
-                    task_ids_json, chunk_paths_json, raw_paths_json, snapshot_path,
-                    error_message, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, 'deleting', ?, ?, ?, ?, '', ?, ?)
+                    snapshot_path, error_message, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, 'queued', ?, '', ?, ?)
                 """,
                 (
                     rebuild_id, job_id, start_window_index, generation,
-                    json.dumps(task_ids), json.dumps(chunk_paths), json.dumps(raw_paths),
                     snapshot_path, now, now,
                 ),
             )
@@ -1131,7 +1131,7 @@ class Database:
             )
             await db.execute(
                 """
-                UPDATE jobs SET status='paused', current_window=?, next_window_start=?,
+                UPDATE jobs SET status='pending_schedule', current_window=?, next_window_start=?,
                     progress=?, pause_requested=0, stop_requested=0, reviewed=0,
                     error_message='', completed_at=NULL, rebuild_revision=?, updated_at=?
                 WHERE id=?
@@ -1161,98 +1161,6 @@ class Database:
                 )
             ).fetchone()
         return self._row(row)
-
-    async def get_rebuild(self, rebuild_id: str) -> dict[str, Any] | None:
-        async with self.connect() as db:
-            row = await (
-                await db.execute("SELECT * FROM job_rebuilds WHERE id=?", (rebuild_id,))
-            ).fetchone()
-        return self._row(row)
-
-    async def list_rebuilds_for_recovery(self) -> list[dict[str, Any]]:
-        async with self.connect() as db:
-            rows = await (
-                await db.execute(
-                    "SELECT * FROM job_rebuilds WHERE status='deleting' ORDER BY created_at"
-                )
-            ).fetchall()
-        return [dict(row) for row in rows]
-
-    async def mark_rebuild_cleanup_failed(self, rebuild_id: str, message: str) -> None:
-        now = utc_now()
-        async with self.connect() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            row = await (
-                await db.execute(
-                    "SELECT job_id FROM job_rebuilds WHERE id=?", (rebuild_id,)
-                )
-            ).fetchone()
-            if row is not None:
-                await db.execute(
-                    "UPDATE job_rebuilds SET status='cleanup_failed', error_message=?, "
-                    "updated_at=? WHERE id=?",
-                    (message, now, rebuild_id),
-                )
-                await db.execute(
-                    "UPDATE jobs SET status='paused', error_message=?, updated_at=? WHERE id=?",
-                    (f"Old task cleanup failed: {message}", now, row["job_id"]),
-                )
-            await db.commit()
-
-    async def retry_rebuild_cleanup(self, job_id: str) -> dict[str, Any] | None:
-        now = utc_now()
-        async with self.connect() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            row = await (
-                await db.execute(
-                    "SELECT * FROM job_rebuilds WHERE job_id=? AND status='cleanup_failed' "
-                    "ORDER BY created_at DESC, id DESC LIMIT 1",
-                    (job_id,),
-                )
-            ).fetchone()
-            if row is None:
-                await db.rollback()
-                return None
-            await db.execute(
-                "UPDATE job_rebuilds SET status='deleting', error_message='', updated_at=? "
-                "WHERE id=?",
-                (now, row["id"]),
-            )
-            await db.execute(
-                "UPDATE jobs SET status='paused', error_message='', updated_at=? WHERE id=?",
-                (now, job_id),
-            )
-            updated = await (
-                await db.execute("SELECT * FROM job_rebuilds WHERE id=?", (row["id"],))
-            ).fetchone()
-            await db.commit()
-        return dict(updated)
-
-    async def finish_rebuild_cleanup(self, rebuild_id: str) -> bool:
-        now = utc_now()
-        async with self.connect() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            row = await (
-                await db.execute(
-                    "SELECT job_id FROM job_rebuilds WHERE id=? AND status='deleting'",
-                    (rebuild_id,),
-                )
-            ).fetchone()
-            if row is None:
-                await db.rollback()
-                return False
-            await db.execute(
-                "UPDATE job_rebuilds SET status='queued', error_message='', updated_at=? "
-                "WHERE id=?",
-                (now, rebuild_id),
-            )
-            await db.execute(
-                "UPDATE jobs SET status='pending_schedule', error_message='', updated_at=? "
-                "WHERE id=?",
-                (now, row["job_id"]),
-            )
-            await db.commit()
-        return True
 
     async def mark_latest_rebuild_completed(self, job_id: str) -> None:
         now = utc_now()
