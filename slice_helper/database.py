@@ -961,7 +961,17 @@ class Database:
             await db.commit()
 
     async def update_time_reference(
-        self, job_id: str, program_start_time: str
+        self,
+        job_id: str,
+        program_start_time: str,
+        *,
+        source: str = "manual_override",
+        reference_text: str | None = None,
+        reference_confidence: float | None = None,
+        reference_frame_path: str | None = None,
+        reference_frame_offset: float | None = None,
+        reference_error: str | None = None,
+        warning: str | None = None,
     ) -> tuple[dict[str, Any] | None, int]:
         """Update the base time and all derived segment timestamps atomically."""
         now = utc_now()
@@ -977,14 +987,29 @@ class Database:
             warnings = json.loads(job["warnings_json"] or "[]")
             previous = job["program_start_time"] or "unavailable"
             warnings.append(
-                f"Time reference manually changed from {previous} to {program_start_time}"
+                warning
+                or f"Time reference manually changed from {previous} to {program_start_time}"
             )
             fields: dict[str, Any] = {
                 "program_start_time": program_start_time,
-                "time_reference_source": "manual_override",
+                "time_reference_source": source,
                 "warnings_json": json.dumps(warnings, ensure_ascii=False),
                 "updated_at": now,
             }
+            optional_fields = {
+                "time_reference_text": reference_text,
+                "time_reference_confidence": reference_confidence,
+                "time_reference_frame_path": reference_frame_path,
+                "time_reference_frame_offset": reference_frame_offset,
+                "time_reference_error": reference_error,
+            }
+            fields.update(
+                {
+                    key: value
+                    for key, value in optional_fields.items()
+                    if value is not None
+                }
+            )
             # A creation-time stop caused by a missing reference becomes
             # resumable as soon as the operator supplies the missing value.
             if (

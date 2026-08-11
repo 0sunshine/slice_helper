@@ -2,7 +2,8 @@ const state = {
   jobs: [], channels: [], selectedJobId: null, detail: null, segments: [],
   jobPage: 1, jobPageSize: 20, jobTotal: 0, jobTotalPages: 1,
   segmentPage: 1, previewUrl: null, resplitTarget: null, tailRebuildTarget: null,
-  segmentEditTarget: null, selectedSegmentIds: new Set(), mergePreview: null
+  segmentEditTarget: null, selectedSegmentIds: new Set(), mergePreview: null,
+  timeRefreshTarget: null
 };
 const SEGMENTS_PER_PAGE = 10;
 const CONTENT_TYPES = [
@@ -134,15 +135,20 @@ function renderJobs() {
       <td>${escapeHtml(job.channel_name || "-")}</td>
       <td>${escapeHtml(job.broadcast_date || "-")}</td>
       <td><span class="filename" title="${escapeHtml(sourceDisplay(job))}">${escapeHtml(sourceName(job))}</span><span class="muted mono">${escapeHtml(job.id.slice(0, 12))}</span></td>
+      <td class="mono job-first-frame-time">${escapeHtml(formatRealTime(job.program_start_time))}</td>
       <td><span class="status-pill ${statusClass(job.status)}">${escapeHtml(statusNames[job.status] || job.status)}</span></td>
       <td><span class="mini-progress"><span style="width:${Math.max(0, Math.min(100, job.progress || 0))}%"></span></span>${Number(job.progress || 0).toFixed(1)}%</td>
       <td>${job.current_window}/${job.total_windows}</td>
       <td>${job.accepted_segment_count}</td>
       <td class="reviewed-cell"><input class="review-checkbox" data-job-id="${escapeHtml(job.id)}" type="checkbox" ${job.reviewed ? "checked" : ""} aria-label="${job.reviewed ? "取消" : "标记"}${escapeHtml(job.channel_name || sourceName(job))}已审核"></td>
       <td>${escapeHtml(formatDate(job.created_at))}</td>
-      <td><button class="button secondary small view-job" data-job-id="${escapeHtml(job.id)}" type="button">查看</button></td>
+      <td><span class="job-row-actions">
+        <button class="button secondary small view-job" data-job-id="${escapeHtml(job.id)}" type="button">查看</button>
+        <button class="button secondary small refresh-job-time" data-job-id="${escapeHtml(job.id)}" type="button">重新取时</button>
+      </span></td>
     </tr>`).join("");
   body.querySelectorAll(".view-job").forEach((button) => button.addEventListener("click", () => loadDetail(button.dataset.jobId, true)));
+  body.querySelectorAll(".refresh-job-time").forEach((button) => button.addEventListener("click", () => openTimeRefresh(button.dataset.jobId)));
   body.querySelectorAll(".review-checkbox").forEach((checkbox) => checkbox.addEventListener("change", () => updateJobReview(checkbox)));
   $("jobPageSummary").textContent = `共 ${state.jobTotal} 条`;
   $("jobPageInfo").textContent = `${state.jobPage} / ${state.jobTotalPages}`;
@@ -169,6 +175,47 @@ async function updateJobReview(checkbox) {
     showToast(error.message);
   } finally {
     checkbox.disabled = false;
+  }
+}
+
+function openTimeRefresh(jobId) {
+  const job = state.jobs.find((item) => item.id === jobId);
+  if (!job) return;
+  state.timeRefreshTarget = job;
+  $("timeRefreshChannel").textContent = job.channel_name || "-";
+  $("timeRefreshSource").textContent = sourceDisplay(job);
+  $("timeRefreshCurrent").textContent = formatRealTime(job.program_start_time);
+  $("timeRefreshError").hidden = true;
+  $("timeRefreshError").textContent = "";
+  $("timeRefreshDialog").showModal();
+}
+
+function closeTimeRefresh() {
+  $("timeRefreshDialog").close();
+  state.timeRefreshTarget = null;
+}
+
+async function submitTimeRefresh(event) {
+  event.preventDefault();
+  const job = state.timeRefreshTarget;
+  if (!job) return;
+  const submit = $("submitTimeRefreshButton");
+  submit.disabled = true;
+  submit.textContent = "识别中";
+  $("timeRefreshError").hidden = true;
+  try {
+    const result = await api(`/api/jobs/${job.id}/refresh-time-reference`, {
+      method: "POST"
+    });
+    closeTimeRefresh();
+    showToast(`首帧时间已更新，尝试 ${result.attemptCount} 次，同步 ${result.updatedSegmentCount} 个片段`);
+    await loadJobs();
+  } catch (error) {
+    $("timeRefreshError").textContent = error.message;
+    $("timeRefreshError").hidden = false;
+  } finally {
+    submit.disabled = false;
+    submit.textContent = "确认重新识别";
   }
 }
 
@@ -1024,6 +1071,8 @@ $("closeCreateButton").addEventListener("click", () => $("createDialog").close()
 $("cancelCreateButton").addEventListener("click", () => $("createDialog").close());
 $("closeChannelsButton").addEventListener("click", () => $("channelsDialog").close());
 $("doneChannelsButton").addEventListener("click", () => $("channelsDialog").close());
+$("closeTimeRefreshButton").addEventListener("click", closeTimeRefresh);
+$("cancelTimeRefreshButton").addEventListener("click", closeTimeRefresh);
 $("closeResplitButton").addEventListener("click", () => $("resplitDialog").close());
 $("cancelResplitButton").addEventListener("click", () => $("resplitDialog").close());
 $("closeTailRebuildButton").addEventListener("click", () => $("tailRebuildDialog").close());
@@ -1100,6 +1149,7 @@ $("previewVideo").addEventListener("error", () => {
 });
 $("createForm").addEventListener("submit", submitCreate);
 $("channelCreateForm").addEventListener("submit", submitChannel);
+$("timeRefreshForm").addEventListener("submit", submitTimeRefresh);
 $("resplitForm").addEventListener("submit", submitResplit);
 $("tailRebuildForm").addEventListener("submit", submitTailRebuild);
 $("segmentMergeForm").addEventListener("submit", submitSegmentMerge);

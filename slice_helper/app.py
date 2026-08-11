@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import shutil
 import sqlite3
 import uuid
@@ -47,6 +48,7 @@ from .orchestrator import (
 )
 from .processing import calculate_total_windows
 from .source_download import HttpSourceDownloader, SourceDownloadError
+from .time_ocr import TimeReference
 
 
 logging.basicConfig(
@@ -55,7 +57,53 @@ logging.basicConfig(
 )
 
 PACKAGE_DIR = Path(__file__).resolve().parent
-OCR_FRAME_OFFSETS = tuple(float(minutes * 60) for minutes in range(6))
+OCR_SAMPLE_COUNT = 10
+
+
+def _random_ocr_frame_offsets(
+    duration_seconds: float,
+    *,
+    sample_count: int = OCR_SAMPLE_COUNT,
+    rng: random.Random | None = None,
+) -> tuple[float, ...]:
+    """Pick one random whole-second offset from each equal-duration region."""
+    if sample_count < 1:
+        raise ValueError("OCR sample count must be positive")
+    generator = rng or random.SystemRandom()
+    max_offset = max(0, int(duration_seconds) - 1)
+    span = max_offset + 1
+    offsets: list[float] = []
+    for index in range(sample_count):
+        region_start = index * span // sample_count
+        region_end = ((index + 1) * span // sample_count) - 1
+        if region_end < region_start:
+            region_start = min(region_start, max_offset)
+            region_end = region_start
+        offsets.append(float(generator.randint(region_start, region_end)))
+    generator.shuffle(offsets)
+    return tuple(offsets)
+
+
+async def _detect_random_time_reference(
+    media: MediaService,
+    source: Path,
+    frame_path: Path,
+    duration_seconds: float,
+) -> tuple[TimeReference | None, str, tuple[float, ...]]:
+    errors: list[str] = []
+    attempted_offsets: list[float] = []
+    for frame_offset in _random_ocr_frame_offsets(duration_seconds):
+        attempted_offsets.append(frame_offset)
+        try:
+            reference = await media.detect_time_reference(
+                source,
+                frame_path,
+                frame_offset_seconds=frame_offset,
+            )
+            return reference, "", tuple(attempted_offsets)
+        except MediaError as exc:
+            errors.append(f"{int(frame_offset)}s: {exc}")
+    return None, "; ".join(errors), tuple(attempted_offsets)
 
 
 def _public_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -245,19 +293,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         warnings: list[str] = []
         frame_path = configured.data_dir / "jobs" / job_id / "time-reference.png"
-        time_reference = None
-        time_reference_errors: list[str] = []
-        for frame_offset in OCR_FRAME_OFFSETS:
-            try:
-                time_reference = await request.app.state.media.detect_time_reference(
-                    source,
-                    frame_path,
-                    frame_offset_seconds=frame_offset,
-                )
-                break
-            except MediaError as exc:
-                time_reference_errors.append(f"{int(frame_offset)}s: {exc}")
-        time_reference_error = "; ".join(time_reference_errors)
+        time_reference, time_reference_error, attempted_offsets = (
+            await _detect_random_time_reference(
+                request.app.state.media,
+                source,
+                frame_path,
+                probe.duration,
+            )
+        )
 
         if time_reference is not None:
             resolved_start_time = time_reference.source_start_time
@@ -267,7 +310,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 warnings.append(
                     "Time OCR succeeded at source offset "
                     f"{int(time_reference.frame_offset_seconds)}s after "
-                    f"{len(time_reference_errors) + 1} attempts"
+                    f"{len(attempted_offsets)} attempts"
                 )
             if body.program_start_time is not None:
                 try:
@@ -288,11 +331,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         else:
             resolved_start_time = None
             time_reference_source = "unavailable"
-            warnings.append(f"Time OCR failed after 6 attempts: {time_reference_error}")
+            warnings.append(
+                f"Time OCR failed after {len(attempted_offsets)} attempts: "
+                f"{time_reference_error}"
+            )
 
         stopped_for_missing_time = resolved_start_time is None
         missing_time_message = (
-            "Time OCR failed after 6 attempts and programStartTime was not supplied; "
+            f"Time OCR failed after {len(attempted_offsets)} attempts and "
+            "programStartTime was not supplied; "
             "job stopped"
         )
 
@@ -632,6 +679,76 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "job": _public_job(updated),
             "updatedSegmentCount": segment_count,
         }
+
+    @application.post("/api/jobs/{job_id}/refresh-time-reference")
+    async def refresh_job_time_reference(request: Request, job_id: str):
+        job = await _require_job(request, job_id)
+        source = Path(job["source_path"])
+        try:
+            stat = source.stat()
+        except OSError as exc:
+            raise HTTPException(status_code=409, detail="原始 TS 文件不存在或无法读取") from exc
+        if (
+            stat.st_size != int(job["source_size"])
+            or stat.st_mtime_ns != int(job["source_mtime_ns"])
+        ):
+            raise HTTPException(status_code=409, detail="原始 TS 文件已经发生变化，无法重新识别")
+
+        job_dir = configured.data_dir / "jobs" / job_id
+        frame_path = job_dir / "time-reference.png"
+        refresh_frame_path = job_dir / "time-reference-refresh.png"
+        refresh_frame_path.unlink(missing_ok=True)
+        try:
+            reference, error, attempted_offsets = await _detect_random_time_reference(
+                request.app.state.media,
+                source,
+                refresh_frame_path,
+                float(job["source_duration"]),
+            )
+            if reference is None:
+                await request.app.state.database.update_job(
+                    job_id, time_reference_error=error
+                )
+                await request.app.state.orchestrator.write_manifest(job_id)
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "time_ocr_failed",
+                        "message": f"全片随机 OCR {len(attempted_offsets)} 次均未识别到时间",
+                    },
+                )
+
+            refresh_frame_path.replace(frame_path)
+            resolved_start_time = reference.source_start_time.isoformat()
+            updated, segment_count = (
+                await request.app.state.database.update_time_reference(
+                    job_id,
+                    resolved_start_time,
+                    source="ocr",
+                    reference_text=reference.matched_text,
+                    reference_confidence=reference.confidence,
+                    reference_frame_path=str(frame_path),
+                    reference_frame_offset=reference.frame_offset_seconds,
+                    reference_error="",
+                    warning=(
+                        "Time reference refreshed by OCR at source offset "
+                        f"{int(reference.frame_offset_seconds)}s after "
+                        f"{len(attempted_offsets)} attempts: {resolved_start_time}"
+                    ),
+                )
+            )
+            if updated is None:
+                raise HTTPException(status_code=404, detail="Job not found")
+            await request.app.state.orchestrator.write_manifest(job_id)
+            request.app.state.orchestrator.notify()
+            return {
+                "job": _public_job(updated),
+                "updatedSegmentCount": segment_count,
+                "attemptCount": len(attempted_offsets),
+                "frameOffset": reference.frame_offset_seconds,
+            }
+        finally:
+            refresh_frame_path.unlink(missing_ok=True)
 
     @application.post(
         "/api/jobs/{job_id}/windows/{window_index}/resplit",

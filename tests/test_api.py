@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import random
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 import openpyxl
 from fastapi.testclient import TestClient
 
-from slice_helper.app import create_app
+from slice_helper.app import _random_ocr_frame_offsets, create_app
 from slice_helper.config import Settings
 from slice_helper.database import Database
 from slice_helper.excel_export import HEADERS, TEMPLATE_PATH
@@ -152,6 +153,10 @@ def test_job_api_control_and_database_backed_chunk_route(
         assert "/static/styles.css?v=0.12.2" in home.text
         assert "/static/app.js?v=0.12.2" in home.text
         assert 'id="tailRebuildDialog"' in home.text
+        assert 'id="timeRefreshDialog"' in home.text
+        assert 'id="timeRefreshForm"' in home.text
+        assert "确认从原片重新获取时间" in home.text
+        assert "<th>首帧时间</th>" in home.text
         assert 'id="tailRebuildConfirmation"' in home.text
         assert "TS 路径或 HTTP 地址" in home.text
         assert 'id="manageChannelsButton"' in home.text
@@ -370,10 +375,20 @@ def test_create_job_cleans_failed_http_download(tmp_path: Path, monkeypatch) -> 
     assert not jobs_dir.exists() or not list(jobs_dir.iterdir())
 
 
+def test_random_ocr_offsets_cover_the_full_source_duration() -> None:
+    offsets = _random_ocr_frame_offsets(1000.0, rng=random.Random(20260811))
+
+    assert len(offsets) == 10
+    assert len(set(offsets)) == 10
+    for index, offset in enumerate(sorted(offsets)):
+        assert index * 100 <= offset <= index * 100 + 99
+
+
 def test_create_job_uses_manual_time_only_when_ocr_fails(
     tmp_path: Path, monkeypatch
 ) -> None:
     attempted_offsets: list[float] = []
+    expected_offsets = (5.0, 17.0, 29.0, 41.0, 53.0, 65.0, 77.0, 89.0, 101.0, 113.0)
 
     async def fake_probe(_self, _path):
         return MediaProbe(
@@ -397,6 +412,10 @@ def test_create_job_uses_manual_time_only_when_ocr_fails(
     monkeypatch.setattr(
         "slice_helper.media.MediaService.detect_time_reference", failed_time_reference
     )
+    monkeypatch.setattr(
+        "slice_helper.app._random_ocr_frame_offsets",
+        lambda _duration: expected_offsets,
+    )
     monkeypatch.setattr(Orchestrator, "start", no_start)
     monkeypatch.setattr(Orchestrator, "stop", no_stop)
 
@@ -418,9 +437,9 @@ def test_create_job_uses_manual_time_only_when_ocr_fails(
     job = response.json()
     assert job["program_start_time"] == "2026-06-20T12:30:00+08:00"
     assert job["time_reference_source"] == "manual_fallback"
-    assert attempted_offsets == [0.0, 60.0, 120.0, 180.0, 240.0, 300.0]
-    assert job["time_reference_error"].startswith("0s: timestamp not found")
-    assert job["time_reference_error"].endswith("300s: timestamp not found")
+    assert attempted_offsets == list(expected_offsets)
+    assert job["time_reference_error"].startswith("5s: timestamp not found")
+    assert job["time_reference_error"].endswith("113s: timestamp not found")
     assert "fallback" in job["warnings"][0].lower()
 
 
@@ -428,6 +447,7 @@ def test_create_job_retries_ocr_and_back_calculates_first_frame_time(
     tmp_path: Path, monkeypatch
 ) -> None:
     attempted_offsets: list[float] = []
+    sampled_offsets = (420.0, 37.0, 512.0, 185.0, 301.0, 59.0, 479.0, 243.0, 118.0, 359.0)
 
     async def fake_probe(_self, _path):
         return MediaProbe(
@@ -440,18 +460,18 @@ def test_create_job_retries_ocr_and_back_calculates_first_frame_time(
     async def retrying_time_reference(_self, _source, frame_path, **kwargs):
         offset = kwargs["frame_offset_seconds"]
         attempted_offsets.append(offset)
-        if offset < 120:
+        if len(attempted_offsets) < 3:
             raise MediaError("timestamp not found")
         frame_path.parent.mkdir(parents=True, exist_ok=True)
         frame_path.write_bytes(b"png")
-        observed = datetime.fromisoformat("2026-06-20T12:32:00")
+        observed = datetime.fromisoformat("2026-06-20T12:38:32")
         return TimeReference(
             source_start_time=observed - timedelta(seconds=offset),
             observed_time=observed,
             frame_offset_seconds=offset,
-            matched_text="2026-06-20 12:32:00",
+            matched_text="2026-06-20 12:38:32",
             confidence=0.98,
-            ocr_texts=(OcrText("2026-06-20 12:32:00", 0.98),),
+            ocr_texts=(OcrText("2026-06-20 12:38:32", 0.98),),
         )
 
     async def no_start(_self):
@@ -464,6 +484,10 @@ def test_create_job_retries_ocr_and_back_calculates_first_frame_time(
     monkeypatch.setattr(
         "slice_helper.media.MediaService.detect_time_reference",
         retrying_time_reference,
+    )
+    monkeypatch.setattr(
+        "slice_helper.app._random_ocr_frame_offsets",
+        lambda _duration: sampled_offsets,
     )
     monkeypatch.setattr(Orchestrator, "start", no_start)
     monkeypatch.setattr(Orchestrator, "stop", no_stop)
@@ -483,11 +507,134 @@ def test_create_job_retries_ocr_and_back_calculates_first_frame_time(
 
     assert response.status_code == 201
     job = response.json()
-    assert attempted_offsets == [0.0, 60.0, 120.0]
+    assert attempted_offsets == [420.0, 37.0, 512.0]
     assert job["program_start_time"] == "2026-06-20T12:30:00"
-    assert job["time_reference_frame_offset"] == 120.0
+    assert job["time_reference_frame_offset"] == 512.0
     assert job["status"] == "pending_schedule"
-    assert "120s" in job["warnings"][0]
+    assert "512s" in job["warnings"][0]
+
+
+def test_refresh_time_reference_from_source_updates_results_and_preserves_on_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    mode = {"fail": False}
+    successful_calls = 0
+    sampled_offsets = (100.0, 25.0, 175.0, 225.0, 275.0, 325.0, 375.0, 425.0, 475.0, 525.0)
+
+    async def fake_probe(_self, _path):
+        return MediaProbe(
+            duration=600.0,
+            format_name="mpegts",
+            video_codec="h264",
+            audio_codec="aac",
+        )
+
+    async def fake_time_reference(_self, _source, frame_path, **kwargs):
+        nonlocal successful_calls
+        if mode["fail"]:
+            raise MediaError("timestamp not found")
+        successful_calls += 1
+        offset = kwargs["frame_offset_seconds"]
+        source_start = datetime.fromisoformat(
+            "2026-06-20T12:00:00" if successful_calls == 1 else "2026-06-20T13:00:00"
+        )
+        observed = source_start + timedelta(seconds=offset)
+        frame_path.parent.mkdir(parents=True, exist_ok=True)
+        frame_path.write_bytes(f"frame-{successful_calls}".encode())
+        matched = observed.strftime("%Y-%m-%d %H:%M:%S")
+        return TimeReference(
+            source_start_time=source_start,
+            observed_time=observed,
+            frame_offset_seconds=offset,
+            matched_text=matched,
+            confidence=0.97,
+            ocr_texts=(OcrText(matched, 0.97),),
+        )
+
+    async def no_start(_self):
+        return None
+
+    async def no_stop(_self):
+        return None
+
+    monkeypatch.setattr("slice_helper.media.MediaService.probe", fake_probe)
+    monkeypatch.setattr(
+        "slice_helper.media.MediaService.detect_time_reference", fake_time_reference
+    )
+    monkeypatch.setattr(
+        "slice_helper.app._random_ocr_frame_offsets",
+        lambda _duration: sampled_offsets,
+    )
+    monkeypatch.setattr(Orchestrator, "start", no_start)
+    monkeypatch.setattr(Orchestrator, "stop", no_stop)
+
+    source = tmp_path / "source.ts"
+    source.write_bytes(b"source")
+    configured = make_settings(tmp_path)
+    with TestClient(create_app(configured)) as client:
+        channel_id = create_channel(client)
+        created = client.post(
+            "/api/jobs",
+            json={
+                "sourcePath": str(source.resolve()),
+                "channelId": channel_id,
+                "broadcastDate": "2026-06-20",
+            },
+        )
+        assert created.status_code == 201
+        job_id = created.json()["id"]
+
+        async def add_existing_result() -> None:
+            database = Database(configured.database_path)
+            window = await database.upsert_window(job_id, 0, 0.0, 600.0)
+            await database.replace_window_segments(
+                job_id,
+                window["id"],
+                [
+                    {
+                        "source_index": 0,
+                        "accepted": 1,
+                        "reason": "",
+                        "local_start": 70.0,
+                        "local_end": 80.0,
+                        "global_start": 70.0,
+                        "global_end": 80.0,
+                        "absolute_start": None,
+                        "absolute_end": None,
+                        "title": "测试片段",
+                        "content_type": "新闻",
+                        "news_event_type": "",
+                        "topic": "",
+                        "keywords_json": "[]",
+                        "summary": "",
+                        "segment_url": "",
+                        "cover_img_url": "",
+                        "raw_json": "{}",
+                    }
+                ],
+            )
+
+        asyncio.run(add_existing_result())
+        refreshed = client.post(f"/api/jobs/{job_id}/refresh-time-reference")
+        assert refreshed.status_code == 200
+        payload = refreshed.json()
+        assert payload["job"]["program_start_time"] == "2026-06-20T13:00:00"
+        assert payload["job"]["time_reference_source"] == "ocr"
+        assert payload["job"]["time_reference_frame_offset"] == 100.0
+        assert payload["updatedSegmentCount"] == 1
+        assert payload["attemptCount"] == 1
+        segment = client.get(f"/api/jobs/{job_id}/segments").json()[0]
+        assert segment["absolute_start"] == "2026-06-20T13:01:10"
+        assert segment["absolute_end"] == "2026-06-20T13:01:20"
+        frame_path = Path(payload["job"]["time_reference_frame_path"])
+        assert frame_path.read_bytes() == b"frame-2"
+
+        mode["fail"] = True
+        failed = client.post(f"/api/jobs/{job_id}/refresh-time-reference")
+        assert failed.status_code == 422
+        unchanged = client.get(f"/api/jobs/{job_id}").json()["job"]
+        assert unchanged["program_start_time"] == "2026-06-20T13:00:00"
+        assert frame_path.read_bytes() == b"frame-2"
 
 
 def test_missing_time_stops_until_page_correction_and_resyncs_real_times(

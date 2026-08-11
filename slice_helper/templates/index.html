@@ -47,12 +47,13 @@
         </div>
       </div>
       <div class="table-scroll">
-        <table class="data-table">
+        <table class="data-table jobs-table">
           <thead>
             <tr>
               <th>频道</th>
               <th>业务日期</th>
               <th>源文件</th>
+              <th>首帧时间</th>
               <th>状态</th>
               <th>进度</th>
               <th>窗口</th>
@@ -204,6 +205,29 @@
       <p id="channelError" class="form-error" hidden></p>
       <div id="channelsList" class="channels-list"></div>
       <div class="dialog-actions"><button id="doneChannelsButton" class="button secondary" type="button">完成</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="timeRefreshDialog" class="confirm-dialog">
+    <form id="timeRefreshForm" method="dialog">
+      <div class="dialog-header">
+        <h2>确认从原片重新获取时间</h2>
+        <button id="closeTimeRefreshButton" class="icon-button" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="confirm-dialog-body">
+        <p>系统将在完整原始 TS 内随机抽取 10 个位置进行 OCR，并反推出首帧时间。</p>
+        <dl>
+          <div><dt>频道</dt><dd id="timeRefreshChannel"></dd></div>
+          <div><dt>原片</dt><dd id="timeRefreshSource"></dd></div>
+          <div><dt>当前时间</dt><dd id="timeRefreshCurrent" class="mono"></dd></div>
+        </dl>
+        <p class="confirm-warning">识别成功后会替换当前时间基准，并同步修正所有任务和片段的真实时间；识别失败则保留当前时间。</p>
+        <p id="timeRefreshError" class="form-error" hidden></p>
+      </div>
+      <div class="dialog-actions">
+        <button id="cancelTimeRefreshButton" class="button secondary" type="button">取消</button>
+        <button id="submitTimeRefreshButton" class="button primary" type="submit">确认重新识别</button>
+      </div>
     </form>
   </dialog>
 
