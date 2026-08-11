@@ -83,6 +83,7 @@ class Database:
         "submitted_at",
         "finished_at",
     }
+    MERGE_FIELDS = {"title", "content_type", "ignored"}
 
     def __init__(self, path: Path):
         self.path = path
@@ -221,6 +222,42 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_segments_job_time
                     ON segments(job_id, accepted, global_start);
+
+                CREATE TABLE IF NOT EXISTS segment_merges (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                    primary_segment_id INTEGER REFERENCES segments(id) ON DELETE SET NULL,
+                    status TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    content_type TEXT NOT NULL DEFAULT '',
+                    news_event_type TEXT NOT NULL DEFAULT '',
+                    topic TEXT NOT NULL DEFAULT '',
+                    keywords_json TEXT NOT NULL DEFAULT '[]',
+                    summary TEXT NOT NULL DEFAULT '',
+                    global_start REAL NOT NULL,
+                    global_end REAL NOT NULL,
+                    ignored INTEGER NOT NULL DEFAULT 0,
+                    member_count INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    cancelled_at TEXT,
+                    cancellation_reason TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_segment_merges_job_status
+                    ON segment_merges(job_id, status, global_start);
+
+                CREATE TABLE IF NOT EXISTS segment_merge_members (
+                    merge_id TEXT NOT NULL REFERENCES segment_merges(id) ON DELETE CASCADE,
+                    segment_id INTEGER REFERENCES segments(id) ON DELETE SET NULL,
+                    member_order INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY(merge_id, member_order)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_segment_merge_member_active
+                    ON segment_merge_members(segment_id)
+                    WHERE active=1 AND segment_id IS NOT NULL;
 
                 CREATE TABLE IF NOT EXISTS job_rebuilds (
                     id TEXT PRIMARY KEY,
@@ -502,6 +539,10 @@ class Database:
                     "INSERT INTO schema_version(version, applied_at) VALUES(17, ?)",
                     (now,),
                 )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(18, ?)",
+                (utc_now(),),
+            )
             await db.commit()
 
     @staticmethod
@@ -745,7 +786,14 @@ class Database:
         query = """
             SELECT j.*,
                    COUNT(DISTINCT w.id) AS window_count,
-                   COUNT(DISTINCT CASE WHEN s.accepted=1 THEN s.id END) AS accepted_segment_count
+                   COUNT(DISTINCT CASE WHEN s.accepted=1 AND s.ignored=0
+                         AND NOT EXISTS(
+                             SELECT 1 FROM segment_merge_members mm
+                             WHERE mm.segment_id=s.id AND mm.active=1
+                         ) THEN s.id END)
+                   + (SELECT COUNT(*) FROM segment_merges sm
+                      WHERE sm.job_id=j.id AND sm.status='active' AND sm.ignored=0)
+                     AS accepted_segment_count
             FROM jobs j
             LEFT JOIN windows w ON w.job_id=j.id
             LEFT JOIN segments s ON s.job_id=j.id
@@ -795,7 +843,14 @@ class Database:
                            c.name AS channel_name,
                            (SELECT COUNT(*) FROM windows w WHERE w.job_id=j.id) AS window_count,
                            (SELECT COUNT(*) FROM segments s
-                            WHERE s.job_id=j.id AND s.accepted=1) AS accepted_segment_count
+                            WHERE s.job_id=j.id AND s.accepted=1 AND s.ignored=0
+                              AND NOT EXISTS(
+                                  SELECT 1 FROM segment_merge_members mm
+                                  WHERE mm.segment_id=s.id AND mm.active=1
+                              ))
+                           + (SELECT COUNT(*) FROM segment_merges sm
+                              WHERE sm.job_id=j.id AND sm.status='active' AND sm.ignored=0)
+                             AS accepted_segment_count
                     FROM jobs j
                     LEFT JOIN channels c ON c.id=j.channel_id
                     WHERE {where_sql}
@@ -829,6 +884,10 @@ class Database:
                     JOIN jobs j ON j.id=s.job_id
                     WHERE j.channel_id=? AND j.superseded_at IS NULL
                       AND j.broadcast_date IS NOT NULL AND s.accepted=1 AND s.ignored=0
+                      AND NOT EXISTS(
+                          SELECT 1 FROM segment_merge_members mm
+                          WHERE mm.segment_id=s.id AND mm.active=1
+                      )
                     ORDER BY j.broadcast_date,
                              CASE WHEN s.absolute_start IS NULL THEN 1 ELSE 0 END,
                              s.absolute_start, s.global_start, s.id
@@ -836,10 +895,54 @@ class Database:
                     (channel_id,),
                 )
             ).fetchall()
+            merge_rows = await (
+                await db.execute(
+                    """
+                    SELECT sm.*, j.broadcast_date, j.source_path, j.source_url,
+                           j.created_at AS job_created_at, j.program_start_time
+                    FROM segment_merges sm
+                    JOIN jobs j ON j.id=sm.job_id
+                    WHERE j.channel_id=? AND j.superseded_at IS NULL
+                      AND j.broadcast_date IS NOT NULL
+                      AND sm.status='active' AND sm.ignored=0
+                    """,
+                    (channel_id,),
+                )
+            ).fetchall()
+        effective_segments = [
+            {**dict(row), "manual_merge": 0, "merge_id": None}
+            for row in segments
+        ]
+        for stored in merge_rows:
+            merge = dict(stored)
+            effective_segments.append(
+                {
+                    **merge,
+                    "id": f"merge:{merge['id']}",
+                    "absolute_start": absolute_time(
+                        merge["program_start_time"], float(merge["global_start"])
+                    ),
+                    "absolute_end": absolute_time(
+                        merge["program_start_time"], float(merge["global_end"])
+                    ),
+                    "accepted": 1,
+                    "manual_merge": 1,
+                    "merge_id": merge["id"],
+                }
+            )
+        effective_segments.sort(
+            key=lambda row: (
+                str(row["broadcast_date"]),
+                1 if row.get("absolute_start") is None else 0,
+                str(row.get("absolute_start") or ""),
+                float(row["global_start"]),
+                str(row["id"]),
+            )
+        )
         return {
             "channel": channel,
             "jobs": [dict(row) for row in jobs],
-            "segments": [dict(row) for row in segments],
+            "segments": effective_segments,
         }
 
     async def update_job(self, job_id: str, **fields: Any) -> None:
@@ -996,6 +1099,8 @@ class Database:
         windows: list[dict[str, Any]],
         attempts: list[dict[str, Any]],
         segments: list[dict[str, Any]],
+        merges: list[dict[str, Any]],
+        merge_members: list[dict[str, Any]],
     ) -> str:
         payload = {
             "job": {
@@ -1009,6 +1114,8 @@ class Database:
             "windows": windows,
             "attempts": attempts,
             "segments": segments,
+            "merges": merges,
+            "merge_members": merge_members,
         }
         encoded = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -1049,6 +1156,34 @@ class Database:
                 window_ids,
             )
         ).fetchall()
+        merge_rows = await (
+            await db.execute(
+                f"""
+                SELECT DISTINCT sm.*
+                FROM segment_merges sm
+                JOIN segment_merge_members mm ON mm.merge_id=sm.id
+                JOIN segments s ON s.id=mm.segment_id
+                WHERE s.window_id IN ({placeholders})
+                  AND sm.status='active' AND mm.active=1
+                ORDER BY sm.created_at, sm.id
+                """,
+                window_ids,
+            )
+        ).fetchall()
+        merges = [dict(row) for row in merge_rows]
+        merge_members: list[dict[str, Any]] = []
+        if merges:
+            merge_ids = [row["id"] for row in merges]
+            merge_placeholders = ", ".join("?" for _ in merge_ids)
+            member_rows = await (
+                await db.execute(
+                    f"SELECT * FROM segment_merge_members "
+                    f"WHERE merge_id IN ({merge_placeholders}) "
+                    "ORDER BY merge_id, member_order",
+                    merge_ids,
+                )
+            ).fetchall()
+            merge_members = [dict(row) for row in member_rows]
         job = dict(job_row)
         attempts = [dict(row) for row in attempt_rows]
         segments = [dict(row) for row in segment_rows]
@@ -1066,8 +1201,12 @@ class Database:
             "windows": windows,
             "attempts": attempts,
             "segments": segments,
+            "merges": merges,
+            "merge_members": merge_members,
             "previous_window": previous,
-            "preview_token": self._tail_token(job, windows, attempts, segments),
+            "preview_token": self._tail_token(
+                job, windows, attempts, segments, merges, merge_members
+            ),
         }
 
     async def get_rebuild_preview(
@@ -1125,6 +1264,17 @@ class Database:
                     snapshot_path, now, now,
                 ),
             )
+            for merge in state["merges"]:
+                await db.execute(
+                    "UPDATE segment_merges SET status='invalidated', cancelled_at=?, "
+                    "updated_at=?, cancellation_reason='tail rebuild removed a member' "
+                    "WHERE id=? AND status='active'",
+                    (now, now, merge["id"]),
+                )
+                await db.execute(
+                    "UPDATE segment_merge_members SET active=0 WHERE merge_id=?",
+                    (merge["id"],),
+                )
             await db.execute(
                 "DELETE FROM windows WHERE job_id=? AND window_index>=?",
                 (job_id, start_window_index),
@@ -1328,6 +1478,35 @@ class Database:
                     (window_id,),
                 )
             ).fetchone()
+            affected_merges = await (
+                await db.execute(
+                    """
+                    SELECT DISTINCT mm.merge_id
+                    FROM segment_merge_members mm
+                    JOIN segments s ON s.id=mm.segment_id
+                    JOIN segment_merges sm ON sm.id=mm.merge_id
+                    WHERE s.window_id=? AND mm.active=1 AND sm.status='active'
+                    """,
+                    (window_id,),
+                )
+            ).fetchall()
+            now = utc_now()
+            for merge in affected_merges:
+                await db.execute(
+                    "UPDATE segment_merges SET status='invalidated', cancelled_at=?, "
+                    "updated_at=?, cancellation_reason='window resplit replaced a member' "
+                    "WHERE id=?",
+                    (now, now, merge["merge_id"]),
+                )
+                await db.execute(
+                    "UPDATE segment_merge_members SET active=0 WHERE merge_id=?",
+                    (merge["merge_id"],),
+                )
+            if affected_merges:
+                await db.execute(
+                    "UPDATE jobs SET reviewed=0, updated_at=? WHERE id=?",
+                    (now, job_id),
+                )
             await db.execute("DELETE FROM segments WHERE window_id=?", (window_id,))
             for segment in segments:
                 row = {
@@ -1353,24 +1532,143 @@ class Database:
         self, job_id: str, accepted_only: bool = False
     ) -> list[dict[str, Any]]:
         query = """
-            SELECT s.*, w.window_index
-            FROM segments s JOIN windows w ON w.id=s.window_id
+            SELECT s.*, w.window_index,
+                   mm.merge_id AS active_merge_id,
+                   mm.member_order AS merge_member_order,
+                   mm.role AS merge_role,
+                   sm.primary_segment_id AS merge_primary_segment_id,
+                   sm.title AS active_merge_title,
+                   sm.member_count AS active_merge_member_count,
+                   sm.global_start AS active_merge_global_start
+            FROM segments s
+            JOIN windows w ON w.id=s.window_id
+            LEFT JOIN segment_merge_members mm
+              ON mm.segment_id=s.id AND mm.active=1
+            LEFT JOIN segment_merges sm
+              ON sm.id=mm.merge_id AND sm.status='active'
             WHERE s.job_id=?
         """
         params: list[Any] = [job_id]
         if accepted_only:
             query += " AND s.accepted=1"
-        query += " ORDER BY s.global_start, s.global_end, s.id"
         async with self.connect() as db:
             rows = await (await db.execute(query, params)).fetchall()
-        return [dict(row) for row in rows]
+            merge_rows = await (
+                await db.execute(
+                    "SELECT * FROM segment_merges WHERE job_id=? AND status='active' "
+                    "ORDER BY global_start, id",
+                    (job_id,),
+                )
+            ).fetchall()
+            job = await (
+                await db.execute(
+                    "SELECT program_start_time FROM jobs WHERE id=?", (job_id,)
+                )
+            ).fetchone()
+
+        raw = []
+        members_by_merge: dict[str, list[dict[str, Any]]] = {}
+        for stored in rows:
+            row = dict(stored)
+            row["record_kind"] = "segment"
+            row["manual_merge"] = 0
+            raw.append(row)
+            if row.get("active_merge_id"):
+                members_by_merge.setdefault(str(row["active_merge_id"]), []).append(row)
+
+        program_start_time = job["program_start_time"] if job else None
+        merges: list[dict[str, Any]] = []
+        merge_starts: dict[str, float] = {}
+        for stored in merge_rows:
+            merge = dict(stored)
+            merge_id = str(merge["id"])
+            members = sorted(
+                members_by_merge.get(merge_id, []),
+                key=lambda item: int(item["merge_member_order"]),
+            )
+            merge_starts[merge_id] = float(merge["global_start"])
+            merges.append(
+                {
+                    "id": f"merge:{merge_id}",
+                    "merge_id": merge_id,
+                    "job_id": job_id,
+                    "window_id": members[0]["window_id"] if members else None,
+                    "window_index": min(
+                        (int(item["window_index"]) for item in members), default=0
+                    ),
+                    "source_index": -1,
+                    "accepted": 1,
+                    "ignored": int(merge["ignored"]),
+                    "reason": "manual merge",
+                    "local_start": 0.0,
+                    "local_end": float(merge["global_end"]) - float(merge["global_start"]),
+                    "global_start": float(merge["global_start"]),
+                    "global_end": float(merge["global_end"]),
+                    "absolute_start": absolute_time(
+                        program_start_time, float(merge["global_start"])
+                    ),
+                    "absolute_end": absolute_time(
+                        program_start_time, float(merge["global_end"])
+                    ),
+                    "title": merge["title"],
+                    "content_type": merge["content_type"],
+                    "news_event_type": merge["news_event_type"],
+                    "topic": merge["topic"],
+                    "keywords_json": merge["keywords_json"],
+                    "summary": merge["summary"],
+                    "segment_url": "",
+                    "cover_img_url": "",
+                    "attempt_id": None,
+                    "task_id": "",
+                    "raw_json": "{}",
+                    "record_kind": "merge",
+                    "manual_merge": 1,
+                    "primary_segment_id": merge["primary_segment_id"],
+                    "member_count": int(merge["member_count"]),
+                    "merge_status": merge["status"],
+                    "created_at": merge["created_at"],
+                    "updated_at": merge["updated_at"],
+                    "merge_members": [
+                        {
+                            "id": item["id"],
+                            "title": item["title"],
+                            "window_index": item["window_index"],
+                            "global_start": item["global_start"],
+                            "global_end": item["global_end"],
+                            "absolute_start": item["absolute_start"],
+                            "absolute_end": item["absolute_end"],
+                            "role": item["merge_role"],
+                            "member_order": item["merge_member_order"],
+                        }
+                        for item in members
+                    ],
+                }
+            )
+
+        combined = raw + merges
+
+        def display_key(item: dict[str, Any]) -> tuple[float, int, int]:
+            if item["record_kind"] == "merge":
+                return float(item["global_start"]), 0, 0
+            merge_id = item.get("active_merge_id")
+            if merge_id:
+                return (
+                    merge_starts.get(str(merge_id), float(item["global_start"])),
+                    1,
+                    int(item.get("merge_member_order") or 0),
+                )
+            return float(item["global_start"]), 0, 1
+
+        return sorted(combined, key=display_key)
 
     async def get_segment(self, job_id: str, segment_id: int) -> dict[str, Any] | None:
         async with self.connect() as db:
             row = await (
                 await db.execute(
-                    "SELECT s.*, w.window_index FROM segments s "
-                    "JOIN windows w ON w.id=s.window_id "
+                    "SELECT s.*, w.window_index, mm.merge_id AS active_merge_id "
+                    "FROM segments s JOIN windows w ON w.id=s.window_id "
+                    "LEFT JOIN segment_merge_members mm "
+                    "ON mm.segment_id=s.id AND mm.active=1 "
                     "WHERE s.id=? AND s.job_id=?",
                     (segment_id, job_id),
                 )
@@ -1389,6 +1687,16 @@ class Database:
         assignments = ", ".join(f"{key}=?" for key in fields)
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
+            membership = await (
+                await db.execute(
+                    "SELECT merge_id FROM segment_merge_members "
+                    "WHERE segment_id=? AND active=1",
+                    (segment_id,),
+                )
+            ).fetchone()
+            if membership is not None:
+                await db.rollback()
+                raise ValueError("Cancel the manual merge before editing a member")
             cursor = await db.execute(
                 f"UPDATE segments SET {assignments} WHERE id=? AND job_id=?",
                 (*fields.values(), segment_id, job_id),
@@ -1405,6 +1713,272 @@ class Database:
             ).fetchone()
             await db.commit()
         return self._row(updated)
+
+    async def _segment_merge_preview_state(
+        self,
+        db: aiosqlite.Connection,
+        job_id: str,
+        segment_ids: list[int],
+        primary_segment_id: int,
+    ) -> dict[str, Any]:
+        unique_ids = list(dict.fromkeys(segment_ids))
+        if len(unique_ids) < 2:
+            raise ValueError("Select at least two segments")
+        if primary_segment_id not in unique_ids:
+            raise ValueError("The primary segment must be in the selection")
+        placeholders = ", ".join("?" for _ in unique_ids)
+        rows = await (
+            await db.execute(
+                f"""
+                SELECT s.*, w.window_index
+                FROM segments s JOIN windows w ON w.id=s.window_id
+                WHERE s.job_id=? AND s.id IN ({placeholders})
+                ORDER BY s.global_start, s.global_end, s.id
+                """,
+                (job_id, *unique_ids),
+            )
+        ).fetchall()
+        segments = [dict(row) for row in rows]
+        if len(segments) != len(unique_ids):
+            raise ValueError("One or more selected segments no longer exist")
+        if any(not int(row["accepted"]) or int(row["ignored"]) for row in segments):
+            raise ValueError("Only final adopted, non-ignored segments can be merged")
+        membership = await (
+            await db.execute(
+                f"SELECT segment_id FROM segment_merge_members "
+                f"WHERE active=1 AND segment_id IN ({placeholders})",
+                unique_ids,
+            )
+        ).fetchone()
+        if membership is not None:
+            raise ValueError("A selected segment already belongs to a manual merge")
+
+        eligible_rows = await (
+            await db.execute(
+                """
+                SELECT s.id
+                FROM segments s
+                WHERE s.job_id=? AND s.accepted=1 AND s.ignored=0
+                  AND NOT EXISTS(
+                      SELECT 1 FROM segment_merge_members mm
+                      WHERE mm.segment_id=s.id AND mm.active=1
+                  )
+                ORDER BY s.global_start, s.global_end, s.id
+                """,
+                (job_id,),
+            )
+        ).fetchall()
+        positions = {
+            int(row["id"]): index for index, row in enumerate(eligible_rows)
+        }
+        selected_positions = sorted(positions[int(row["id"])] for row in segments)
+        if selected_positions != list(
+            range(selected_positions[0], selected_positions[0] + len(segments))
+        ):
+            raise ValueError("Only consecutive final adopted segments can be merged")
+
+        start = min(float(row["global_start"]) for row in segments)
+        end = max(float(row["global_end"]) for row in segments)
+        overlapping_merge = await (
+            await db.execute(
+                "SELECT id FROM segment_merges WHERE job_id=? AND status='active' "
+                "AND global_start<? AND global_end>? LIMIT 1",
+                (job_id, end, start),
+            )
+        ).fetchone()
+        if overlapping_merge is not None:
+            raise ValueError("The selected range crosses an existing manual merge")
+
+        gap_seconds = 0.0
+        overlap_seconds = 0.0
+        for previous, current in zip(segments, segments[1:]):
+            delta = float(current["global_start"]) - float(previous["global_end"])
+            if delta > 0:
+                gap_seconds += delta
+            elif delta < 0:
+                overlap_seconds += -delta
+        primary = next(
+            row for row in segments if int(row["id"]) == primary_segment_id
+        )
+        token_payload = {
+            "job_id": job_id,
+            "primary_segment_id": primary_segment_id,
+            "segments": segments,
+        }
+        token = hashlib.sha256(
+            json.dumps(
+                token_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return {
+            "segments": segments,
+            "primary": primary,
+            "global_start": start,
+            "global_end": end,
+            "gap_seconds": gap_seconds,
+            "overlap_seconds": overlap_seconds,
+            "preview_token": token,
+        }
+
+    async def preview_segment_merge(
+        self, job_id: str, segment_ids: list[int], primary_segment_id: int
+    ) -> dict[str, Any]:
+        async with self.connect() as db:
+            return await self._segment_merge_preview_state(
+                db, job_id, segment_ids, primary_segment_id
+            )
+
+    async def create_segment_merge(
+        self,
+        job_id: str,
+        segment_ids: list[int],
+        primary_segment_id: int,
+        expected_token: str,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        merge_id = uuid.uuid4().hex
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            state = await self._segment_merge_preview_state(
+                db, job_id, segment_ids, primary_segment_id
+            )
+            if state["preview_token"] != expected_token:
+                await db.rollback()
+                raise ValueError("The selected segments changed after preview")
+            primary = state["primary"]
+            segments = state["segments"]
+            await db.execute(
+                """
+                INSERT INTO segment_merges(
+                    id, job_id, primary_segment_id, status, title, content_type,
+                    news_event_type, topic, keywords_json, summary,
+                    global_start, global_end, ignored, member_count,
+                    created_at, updated_at
+                ) VALUES(?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                """,
+                (
+                    merge_id,
+                    job_id,
+                    primary_segment_id,
+                    primary["title"],
+                    primary["content_type"],
+                    primary["news_event_type"],
+                    primary["topic"],
+                    primary["keywords_json"],
+                    primary["summary"],
+                    state["global_start"],
+                    state["global_end"],
+                    len(segments),
+                    now,
+                    now,
+                ),
+            )
+            for index, segment in enumerate(segments):
+                await db.execute(
+                    """
+                    INSERT INTO segment_merge_members(
+                        merge_id, segment_id, member_order, role, snapshot_json, active
+                    ) VALUES(?, ?, ?, ?, ?, 1)
+                    """,
+                    (
+                        merge_id,
+                        segment["id"],
+                        index,
+                        "primary" if int(segment["id"]) == primary_segment_id else "member",
+                        json.dumps(segment, ensure_ascii=False, sort_keys=True),
+                    ),
+                )
+            await db.execute(
+                "UPDATE jobs SET reviewed=0, updated_at=? WHERE id=?",
+                (now, job_id),
+            )
+            row = await (
+                await db.execute("SELECT * FROM segment_merges WHERE id=?", (merge_id,))
+            ).fetchone()
+            await db.commit()
+        return dict(row)
+
+    async def update_segment_merge(
+        self, job_id: str, merge_id: str, **fields: Any
+    ) -> dict[str, Any] | None:
+        unknown = set(fields) - self.MERGE_FIELDS
+        if unknown:
+            raise ValueError(f"Unknown merge fields: {sorted(unknown)}")
+        if not fields:
+            return None
+        now = utc_now()
+        fields["updated_at"] = now
+        assignments = ", ".join(f"{key}=?" for key in fields)
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                f"UPDATE segment_merges SET {assignments} "
+                "WHERE id=? AND job_id=? AND status='active'",
+                (*fields.values(), merge_id, job_id),
+            )
+            if cursor.rowcount == 0:
+                await db.rollback()
+                return None
+            await db.execute(
+                "UPDATE jobs SET reviewed=0, updated_at=? WHERE id=?",
+                (now, job_id),
+            )
+            row = await (
+                await db.execute("SELECT * FROM segment_merges WHERE id=?", (merge_id,))
+            ).fetchone()
+            await db.commit()
+        return dict(row)
+
+    async def cancel_segment_merge(self, job_id: str, merge_id: str) -> bool:
+        now = utc_now()
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "UPDATE segment_merges SET status='cancelled', cancelled_at=?, "
+                "updated_at=?, cancellation_reason='cancelled manually' "
+                "WHERE id=? AND job_id=? AND status='active'",
+                (now, now, merge_id, job_id),
+            )
+            if cursor.rowcount == 0:
+                await db.rollback()
+                return False
+            await db.execute(
+                "UPDATE segment_merge_members SET active=0 WHERE merge_id=?",
+                (merge_id,),
+            )
+            await db.execute(
+                "UPDATE jobs SET reviewed=0, updated_at=? WHERE id=?",
+                (now, job_id),
+            )
+            await db.commit()
+        return True
+
+    async def get_job_merges(
+        self, job_id: str, include_inactive: bool = True
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM segment_merges WHERE job_id=?"
+        params: list[Any] = [job_id]
+        if not include_inactive:
+            query += " AND status='active'"
+        query += " ORDER BY created_at, id"
+        async with self.connect() as db:
+            merges = await (await db.execute(query, params)).fetchall()
+            result = []
+            for merge_row in merges:
+                merge = dict(merge_row)
+                members = await (
+                    await db.execute(
+                        "SELECT * FROM segment_merge_members WHERE merge_id=? "
+                        "ORDER BY member_order",
+                        (merge["id"],),
+                    )
+                ).fetchall()
+                merge["members"] = [dict(row) for row in members]
+                result.append(merge)
+        return result
 
     async def get_attempts_for_job(self, job_id: str) -> list[dict[str, Any]]:
         async with self.connect() as db:

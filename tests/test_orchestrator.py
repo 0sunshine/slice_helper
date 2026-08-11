@@ -465,7 +465,7 @@ async def test_two_window_job_hands_tail_to_next_window(tmp_path: Path) -> None:
     manifest = json.loads(
         (configured.data_dir / "jobs" / "abc123" / "result.json").read_text(encoding="utf-8")
     )
-    assert manifest["schemaVersion"] == 5
+    assert manifest["schemaVersion"] == 6
     assert manifest["job"]["status"] == "completed"
     assert len(manifest["segments"]) == 4
     assert manifest["segments"][0]["content_type"] == "新闻"

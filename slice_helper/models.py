@@ -152,6 +152,50 @@ class SegmentUpdate(BaseModel):
         return self
 
 
+class SegmentMergePreviewRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    segment_ids: list[int] = Field(alias="segmentIds", min_length=2)
+    primary_segment_id: int = Field(alias="primarySegmentId", ge=1)
+
+    @field_validator("segment_ids")
+    @classmethod
+    def unique_segment_ids(cls, value: list[int]) -> list[int]:
+        if any(item < 1 for item in value):
+            raise ValueError("segmentIds must contain positive IDs")
+        if len(set(value)) != len(value):
+            raise ValueError("segmentIds must not contain duplicates")
+        return value
+
+
+class SegmentMergeCreate(SegmentMergePreviewRequest):
+    preview_token: str = Field(alias="previewToken", min_length=64, max_length=64)
+
+
+class SegmentMergeUpdate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    title: str | None = Field(default=None, max_length=500)
+    content_type: str | None = Field(default=None, alias="contentType", max_length=100)
+    ignored: bool | None = None
+
+    @field_validator("title", "content_type")
+    @classmethod
+    def normalize_merge_text(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
+
+    @model_validator(mode="after")
+    def require_merge_update(self):
+        if not self.model_fields_set.intersection({"title", "content_type", "ignored"}):
+            raise ValueError("At least one merge field must be supplied")
+        if (
+            "content_type" in self.model_fields_set
+            and self.content_type not in CONTENT_TYPES
+        ):
+            raise ValueError("节目类型必须从预设选项中选择")
+        return self
+
+
 class WindowResplitRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 

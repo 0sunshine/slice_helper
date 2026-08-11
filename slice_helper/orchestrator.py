@@ -199,6 +199,7 @@ class Orchestrator:
                 "deletedAttemptCount": len(state["attempts"]),
                 "deletedSegmentCount": len(state["segments"]),
                 "oldTaskCount": len({row["task_id"] for row in state["attempts"]}),
+                "invalidatedMergeCount": len(state["merges"]),
                 "sourceStart": start,
                 "absoluteStart": (
                     (base_time + timedelta(seconds=start)).isoformat()
@@ -246,6 +247,8 @@ class Orchestrator:
                 "windows": state["windows"],
                 "attempts": state["attempts"],
                 "segments": state["segments"],
+                "merges": state["merges"],
+                "mergeMembers": state["merge_members"],
             }
             try:
                 await asyncio.to_thread(self._atomic_json, snapshot_path, snapshot)
@@ -1390,13 +1393,14 @@ class Orchestrator:
         windows = await self.database.get_windows(job_id)
         attempts = await self.database.get_attempts_for_job(job_id)
         segments = await self.database.get_segments(job_id)
+        merges = await self.database.get_job_merges(job_id, include_inactive=True)
         for segment in segments:
             segment["accepted"] = bool(segment["accepted"])
             segment["ignored"] = bool(segment["ignored"])
             segment["keywords"] = json.loads(segment.pop("keywords_json"))
             segment["raw"] = json.loads(segment.pop("raw_json"))
         manifest = {
-            "schemaVersion": 5,
+            "schemaVersion": 6,
             "generatedAt": utc_now(),
             "externalMediaMayExpire": True,
             "job": {
@@ -1405,6 +1409,7 @@ class Orchestrator:
             "windows": windows,
             "attempts": attempts,
             "segments": segments,
+            "manualMerges": merges,
         }
         path = self.settings.data_dir / "jobs" / job_id / "result.json"
         await asyncio.to_thread(self._atomic_json, path, manifest)

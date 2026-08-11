@@ -31,6 +31,9 @@ from .models import (
     JobCreate,
     JobStatus,
     SegmentUpdate,
+    SegmentMergeCreate,
+    SegmentMergePreviewRequest,
+    SegmentMergeUpdate,
     TimeReferenceUpdate,
     TailRebuildRequest,
     WindowResplitRequest,
@@ -71,6 +74,17 @@ def _public_channel(channel: dict[str, Any]) -> dict[str, Any]:
     if "job_count" in result:
         result["job_count"] = int(result["job_count"] or 0)
     result.pop("normalized_name", None)
+    return result
+
+
+def _public_segment(row: dict[str, Any]) -> dict[str, Any]:
+    result = dict(row)
+    result.setdefault("record_kind", "segment")
+    result["accepted"] = bool(result.get("accepted"))
+    result["ignored"] = bool(result.get("ignored"))
+    result["manual_merge"] = bool(result.get("manual_merge"))
+    result["keywords"] = json.loads(result.pop("keywords_json", "[]") or "[]")
+    result["raw"] = json.loads(result.pop("raw_json", "{}") or "{}")
     return result
 
 
@@ -427,12 +441,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not await request.app.state.database.get_job(job_id):
             raise HTTPException(status_code=404, detail="Job not found")
         rows = await request.app.state.database.get_segments(job_id, accepted_only=accepted_only)
-        for row in rows:
-            row["accepted"] = bool(row["accepted"])
-            row["ignored"] = bool(row["ignored"])
-            row["keywords"] = json.loads(row.pop("keywords_json"))
-            row["raw"] = json.loads(row.pop("raw_json"))
-        return rows
+        return [_public_segment(row) for row in rows]
 
     @application.patch("/api/jobs/{job_id}/segments/{segment_id}")
     async def update_segment(
@@ -464,17 +473,129 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             fields["content_type"] = body.content_type or ""
         if "ignored" in body.model_fields_set:
             fields["ignored"] = int(bool(body.ignored))
-        updated = await request.app.state.database.update_segment(
-            job_id, segment_id, **fields
-        )
+        try:
+            updated = await request.app.state.database.update_segment(
+                job_id, segment_id, **fields
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if updated is None:
             raise HTTPException(status_code=404, detail="Segment not found")
         await request.app.state.orchestrator.write_manifest(job_id)
-        updated["accepted"] = bool(updated["accepted"])
-        updated["ignored"] = bool(updated["ignored"])
-        updated["keywords"] = json.loads(updated.pop("keywords_json"))
-        updated["raw"] = json.loads(updated.pop("raw_json"))
-        return updated
+        return _public_segment(updated)
+
+    @application.post("/api/jobs/{job_id}/segment-merges/preview")
+    async def preview_segment_merge(
+        request: Request, job_id: str, body: SegmentMergePreviewRequest
+    ):
+        if not await request.app.state.database.get_job(job_id):
+            raise HTTPException(status_code=404, detail="Job not found")
+        try:
+            preview = await request.app.state.database.preview_segment_merge(
+                job_id, body.segment_ids, body.primary_segment_id
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "jobId": job_id,
+            "segmentIds": [int(row["id"]) for row in preview["segments"]],
+            "primarySegmentId": int(preview["primary"]["id"]),
+            "members": [
+                {
+                    "id": int(row["id"]),
+                    "windowIndex": int(row["window_index"]),
+                    "title": row["title"],
+                    "contentType": row["content_type"],
+                    "newsEventType": row["news_event_type"],
+                    "globalStart": float(row["global_start"]),
+                    "globalEnd": float(row["global_end"]),
+                    "absoluteStart": row["absolute_start"],
+                    "absoluteEnd": row["absolute_end"],
+                    "primary": int(row["id"]) == body.primary_segment_id,
+                }
+                for row in preview["segments"]
+            ],
+            "result": {
+                "title": preview["primary"]["title"],
+                "contentType": preview["primary"]["content_type"],
+                "newsEventType": preview["primary"]["news_event_type"],
+                "globalStart": preview["global_start"],
+                "globalEnd": preview["global_end"],
+                "absoluteStart": min(
+                    row["absolute_start"]
+                    for row in preview["segments"]
+                    if row["absolute_start"] is not None
+                ) if any(row["absolute_start"] for row in preview["segments"]) else None,
+                "absoluteEnd": max(
+                    row["absolute_end"]
+                    for row in preview["segments"]
+                    if row["absolute_end"] is not None
+                ) if any(row["absolute_end"] for row in preview["segments"]) else None,
+            },
+            "gapSeconds": preview["gap_seconds"],
+            "overlapSeconds": preview["overlap_seconds"],
+            "previewToken": preview["preview_token"],
+        }
+
+    @application.post("/api/jobs/{job_id}/segment-merges", status_code=201)
+    async def create_segment_merge(
+        request: Request, job_id: str, body: SegmentMergeCreate
+    ):
+        if not await request.app.state.database.get_job(job_id):
+            raise HTTPException(status_code=404, detail="Job not found")
+        try:
+            merge = await request.app.state.database.create_segment_merge(
+                job_id,
+                body.segment_ids,
+                body.primary_segment_id,
+                body.preview_token,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await request.app.state.orchestrator.write_manifest(job_id)
+        return {
+            "id": merge["id"],
+            "status": merge["status"],
+            "memberCount": int(merge["member_count"]),
+        }
+
+    @application.patch("/api/jobs/{job_id}/segment-merges/{merge_id}")
+    async def update_segment_merge(
+        request: Request,
+        job_id: str,
+        merge_id: str,
+        body: SegmentMergeUpdate,
+    ):
+        fields: dict[str, Any] = {}
+        if "title" in body.model_fields_set:
+            fields["title"] = body.title or ""
+        if "content_type" in body.model_fields_set:
+            fields["content_type"] = body.content_type or ""
+        if "ignored" in body.model_fields_set:
+            fields["ignored"] = int(bool(body.ignored))
+        updated = await request.app.state.database.update_segment_merge(
+            job_id, merge_id, **fields
+        )
+        if updated is None:
+            raise HTTPException(status_code=404, detail="Active manual merge not found")
+        await request.app.state.orchestrator.write_manifest(job_id)
+        segments = await request.app.state.database.get_segments(job_id, accepted_only=False)
+        row = next(
+            (item for item in segments if item.get("merge_id") == merge_id), None
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="Active manual merge not found")
+        return _public_segment(row)
+
+    @application.delete("/api/jobs/{job_id}/segment-merges/{merge_id}")
+    async def cancel_segment_merge(request: Request, job_id: str, merge_id: str):
+        cancelled = await request.app.state.database.cancel_segment_merge(
+            job_id, merge_id
+        )
+        if not cancelled:
+            raise HTTPException(status_code=404, detail="Active manual merge not found")
+        await request.app.state.orchestrator.write_manifest(job_id)
+        return Response(status_code=204)
 
     @application.get("/api/jobs/{job_id}/segments/{segment_id}/task-values")
     async def get_segment_task_values(

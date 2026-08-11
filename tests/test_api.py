@@ -149,8 +149,8 @@ def test_job_api_control_and_database_backed_chunk_route(
         ):
             assert f'<option value="{content_type}">{content_type}</option>' in home.text
         assert 'id="summaryISlice"' in home.text
-        assert "/static/styles.css?v=0.11.4" in home.text
-        assert "/static/app.js?v=0.11.4" in home.text
+        assert "/static/styles.css?v=0.12.0" in home.text
+        assert "/static/app.js?v=0.12.0" in home.text
         assert 'id="tailRebuildDialog"' in home.text
         assert 'id="tailRebuildConfirmation"' in home.text
         assert "TS 路径或 HTTP 地址" in home.text
@@ -788,7 +788,7 @@ def test_channel_date_overwrite_pagination_and_excel_export(
         manifest_segment = next(
             item for item in manifest["segments"] if item["id"] == accepted_segment["id"]
         )
-        assert manifest["schemaVersion"] == 5
+        assert manifest["schemaVersion"] == 6
         assert manifest_segment["title"] == "手工修改标题"
         assert manifest_segment["content_type"] == "纪录片"
         assert manifest_segment["ignored"] is True
@@ -892,3 +892,131 @@ def test_channel_date_overwrite_pagination_and_excel_export(
         assert renamed.status_code == 200
         assert renamed.json()["name"] == "测试频道（新）"
         assert client.delete(f"/api/channels/{channel_id}").status_code == 409
+
+
+def test_manual_segment_merge_api_manifest_and_excel(tmp_path: Path, monkeypatch) -> None:
+    async def no_start(_self):
+        return None
+
+    async def no_stop(_self):
+        return None
+
+    monkeypatch.setattr(Orchestrator, "start", no_start)
+    monkeypatch.setattr(Orchestrator, "stop", no_stop)
+    configured = make_settings(tmp_path)
+
+    with TestClient(create_app(configured)) as client:
+        database = Database(configured.database_path)
+
+        async def add_results() -> tuple[str, str]:
+            channel = await database.create_channel("接口合并频道")
+            job_id = "merge-api-job"
+            await database.create_job(
+                {
+                    "id": job_id,
+                    "source_path": str(tmp_path / "source.ts"),
+                    "source_size": 10,
+                    "source_mtime_ns": 20,
+                    "source_duration": 60.0,
+                    "template_id": "general",
+                    "language": "zh",
+                    "channel_id": channel["id"],
+                    "channel_name": channel["name"],
+                    "broadcast_date": "2026-08-11",
+                    "program_start_time": "2026-08-11T08:00:00+08:00",
+                    "cut_mode": "copy",
+                    "total_windows": 1,
+                    "status": "completed",
+                }
+            )
+            window = await database.upsert_window(job_id, 0, 0, 60)
+            await database.replace_window_segments(
+                job_id,
+                window["id"],
+                [
+                    {
+                        "source_index": index,
+                        "accepted": 1,
+                        "reason": "",
+                        "local_start": index * 10.0,
+                        "local_end": (index + 1) * 10.0,
+                        "global_start": index * 10.0,
+                        "global_end": (index + 1) * 10.0,
+                        "title": title,
+                        "content_type": "新闻",
+                        "news_event_type": "时政要闻",
+                        "topic": "主题",
+                        "keywords_json": '["关键词"]',
+                        "summary": f"{title}摘要",
+                        "segment_url": "",
+                        "cover_img_url": "",
+                        "raw_json": "{}",
+                    }
+                    for index, title in enumerate(("第一条", "第二条", "第三条"))
+                ],
+            )
+            return job_id, str(channel["id"])
+
+        job_id, channel_id = asyncio.run(add_results())
+        segments = client.get(f"/api/jobs/{job_id}/segments").json()
+        first, primary = segments[:2]
+        preview_response = client.post(
+            f"/api/jobs/{job_id}/segment-merges/preview",
+            json={
+                "segmentIds": [first["id"], primary["id"]],
+                "primarySegmentId": primary["id"],
+            },
+        )
+        assert preview_response.status_code == 200
+        preview = preview_response.json()
+        assert preview["result"]["title"] == "第二条"
+        assert preview["result"]["globalStart"] == 0
+        assert preview["result"]["globalEnd"] == 20
+
+        created = client.post(
+            f"/api/jobs/{job_id}/segment-merges",
+            json={
+                "segmentIds": preview["segmentIds"],
+                "primarySegmentId": preview["primarySegmentId"],
+                "previewToken": preview["previewToken"],
+            },
+        )
+        assert created.status_code == 201
+        merge_id = created.json()["id"]
+        merged_segments = client.get(f"/api/jobs/{job_id}/segments").json()
+        merge_result = next(item for item in merged_segments if item["record_kind"] == "merge")
+        assert merge_result["manual_merge"] is True
+        assert merge_result["member_count"] == 2
+        assert len([item for item in merged_segments if item.get("active_merge_id")]) == 2
+
+        locked_member = client.patch(
+            f"/api/jobs/{job_id}/segments/{first['id']}", json={"title": "不应保存"}
+        )
+        assert locked_member.status_code == 409
+        edited = client.patch(
+            f"/api/jobs/{job_id}/segment-merges/{merge_id}",
+            json={"title": "合并后的标题", "contentType": "纪录片"},
+        )
+        assert edited.status_code == 200
+        assert edited.json()["title"] == "合并后的标题"
+        assert edited.json()["record_kind"] == "merge"
+
+        manifest = client.get(f"/api/jobs/{job_id}/result").json()
+        assert manifest["schemaVersion"] == 6
+        assert manifest["manualMerges"][0]["status"] == "active"
+        assert any(item["record_kind"] == "merge" for item in manifest["segments"])
+
+        exported = client.get(f"/api/channels/{channel_id}/export.xlsx")
+        workbook = openpyxl.load_workbook(io.BytesIO(exported.content))
+        sheet = workbook["2026-08-11"]
+        assert sheet.max_row == 3
+        assert sheet["B2"].value == "合并后的标题"
+        assert sheet["AM2"].value == "是"
+        exported_titles = {sheet["B2"].value, sheet["B3"].value}
+        assert exported_titles == {"合并后的标题", "第三条"}
+
+        cancelled = client.delete(f"/api/jobs/{job_id}/segment-merges/{merge_id}")
+        assert cancelled.status_code == 204
+        restored = client.get(f"/api/jobs/{job_id}/segments").json()
+        assert not any(item["record_kind"] == "merge" for item in restored)
+        assert not any(item.get("active_merge_id") for item in restored)

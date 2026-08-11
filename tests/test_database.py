@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 
+import openpyxl
 import pytest
 
 from slice_helper.database import Database
+from slice_helper.excel_export import build_channel_workbook
 
 
 @pytest.mark.asyncio
@@ -35,7 +38,7 @@ async def test_database_persists_and_recovers_jobs(tmp_path: Path) -> None:
 
     async with database.connect() as db:
         versions = await (await db.execute("SELECT version FROM schema_version ORDER BY version")).fetchall()
-    assert [row["version"] for row in versions] == list(range(1, 18))
+    assert [row["version"] for row in versions] == list(range(1, 19))
     async with database.connect() as db:
         segment_columns = {
             row["name"]
@@ -260,3 +263,253 @@ async def test_paused_job_keeps_assignment_without_reserving_islice(tmp_path: Pa
     assert (await database.get_job("bound-job"))["islice_base_url"] == (
         "http://islice-a.test"
     )
+
+
+def merge_segment(
+    source_index: int,
+    start: float,
+    end: float,
+    title: str,
+    *,
+    accepted: int = 1,
+    ignored: int = 0,
+) -> dict:
+    return {
+        "source_index": source_index,
+        "accepted": accepted,
+        "ignored": ignored,
+        "reason": "" if accepted else "discarded",
+        "local_start": start,
+        "local_end": end,
+        "global_start": start,
+        "global_end": end,
+        "title": title,
+        "content_type": "新闻",
+        "news_event_type": f"事件-{title}",
+        "topic": f"主题-{title}",
+        "keywords_json": f'["关键词-{title}"]',
+        "summary": f"摘要-{title}",
+        "segment_url": "",
+        "cover_img_url": "",
+        "raw_json": "{}",
+    }
+
+
+async def prepare_merge_job(database: Database, tmp_path: Path) -> tuple[str, str, int]:
+    channel = await database.create_channel("合并测试频道")
+    job_id = "merge-job"
+    await database.create_job(
+        {
+            "id": job_id,
+            "source_path": str(tmp_path / "source.ts"),
+            "source_size": 10,
+            "source_mtime_ns": 20,
+            "source_duration": 120.0,
+            "template_id": "general",
+            "language": "zh",
+            "channel_id": channel["id"],
+            "channel_name": channel["name"],
+            "broadcast_date": "2026-08-11",
+            "program_start_time": "2026-08-11T08:00:00+08:00",
+            "cut_mode": "copy",
+            "total_windows": 1,
+            "status": "completed",
+        }
+    )
+    window = await database.upsert_window(job_id, 0, 0, 120)
+    await database.update_window(window["id"], status="completed", handoff_start=120)
+    attempt = await database.create_attempt(window["id"], 1, "merge-task")
+    await database.update_attempt(attempt["id"], status="completed")
+    await database.replace_window_segments(
+        job_id,
+        window["id"],
+        [
+            merge_segment(0, 0, 10, "第一条"),
+            merge_segment(1, 10, 20, "主条目"),
+            merge_segment(2, 20, 30, "第三条"),
+            merge_segment(3, 30, 40, "舍弃条目", accepted=0),
+        ],
+    )
+    return job_id, str(channel["id"]), int(window["id"])
+
+
+@pytest.mark.asyncio
+async def test_manual_segment_merge_lifecycle_and_effective_export(tmp_path: Path) -> None:
+    database = Database(tmp_path / "state.db")
+    await database.initialize()
+    job_id, channel_id, window_id = await prepare_merge_job(database, tmp_path)
+    raw = await database.get_segments(job_id)
+    first, primary, third, discarded = [
+        next(item for item in raw if item["title"] == title)
+        for title in ("第一条", "主条目", "第三条", "舍弃条目")
+    ]
+
+    with pytest.raises(ValueError, match="consecutive"):
+        await database.preview_segment_merge(
+            job_id, [first["id"], third["id"]], first["id"]
+        )
+    with pytest.raises(ValueError, match="final adopted"):
+        await database.preview_segment_merge(
+            job_id, [third["id"], discarded["id"]], third["id"]
+        )
+
+    stale = await database.preview_segment_merge(
+        job_id, [first["id"], primary["id"]], primary["id"]
+    )
+    await database.update_segment(job_id, primary["id"], title="更新后的主条目")
+    with pytest.raises(ValueError, match="changed after preview"):
+        await database.create_segment_merge(
+            job_id,
+            [first["id"], primary["id"]],
+            primary["id"],
+            stale["preview_token"],
+        )
+
+    preview = await database.preview_segment_merge(
+        job_id, [first["id"], primary["id"]], primary["id"]
+    )
+    assert preview["global_start"] == 0
+    assert preview["global_end"] == 20
+    assert preview["gap_seconds"] == 0
+    assert preview["primary"]["title"] == "更新后的主条目"
+    merge = await database.create_segment_merge(
+        job_id,
+        [first["id"], primary["id"]],
+        primary["id"],
+        preview["preview_token"],
+    )
+    assert (await database.get_job(job_id))["reviewed"] == 0
+
+    displayed = await database.get_segments(job_id)
+    merged = next(item for item in displayed if item["record_kind"] == "merge")
+    assert merged["title"] == "更新后的主条目"
+    assert merged["news_event_type"] == "事件-主条目"
+    assert merged["topic"] == "主题-主条目"
+    assert merged["keywords_json"] == '["关键词-主条目"]'
+    assert merged["summary"] == "摘要-主条目"
+    assert merged["member_count"] == 2
+    assert len([item for item in displayed if item.get("active_merge_id")]) == 2
+    with pytest.raises(ValueError, match="Cancel the manual merge"):
+        await database.update_segment(job_id, first["id"], title="不允许")
+    with pytest.raises(ValueError, match="already belongs"):
+        await database.preview_segment_merge(
+            job_id, [first["id"], primary["id"]], first["id"]
+        )
+
+    exported = await database.get_channel_export(channel_id)
+    assert [item["title"] for item in exported["segments"]] == [
+        "更新后的主条目",
+        "第三条",
+    ]
+    assert exported["segments"][0]["manual_merge"] == 1
+    workbook = openpyxl.load_workbook(io.BytesIO(build_channel_workbook(exported)))
+    sheet = workbook["2026-08-11"]
+    assert sheet.max_row == 3
+    assert sheet["B2"].value == "更新后的主条目"
+    assert sheet["AM2"].value == "是"
+    assert sheet["V2"].value is None
+    assert {sheet["B2"].value, sheet["B3"].value} == {
+        "更新后的主条目",
+        "第三条",
+    }
+
+    await database.update_job(job_id, reviewed=1)
+    updated = await database.update_segment_merge(
+        job_id, merge["id"], title="手工合并标题", ignored=1
+    )
+    assert updated["title"] == "手工合并标题"
+    assert (await database.get_job(job_id))["reviewed"] == 0
+    ignored_export = await database.get_channel_export(channel_id)
+    assert [item["title"] for item in ignored_export["segments"]] == ["第三条"]
+
+    await database.update_segment_merge(job_id, merge["id"], ignored=0)
+    await database.update_job(job_id, reviewed=1)
+    assert await database.cancel_segment_merge(job_id, merge["id"])
+    assert (await database.get_job(job_id))["reviewed"] == 0
+    restored_export = await database.get_channel_export(channel_id)
+    assert [item["title"] for item in restored_export["segments"]] == [
+        "第一条",
+        "更新后的主条目",
+        "第三条",
+    ]
+
+    second_preview = await database.preview_segment_merge(
+        job_id, [first["id"], primary["id"]], first["id"]
+    )
+    second_merge = await database.create_segment_merge(
+        job_id,
+        [first["id"], primary["id"]],
+        first["id"],
+        second_preview["preview_token"],
+    )
+    await database.update_job(job_id, reviewed=1)
+    await database.replace_window_segments(
+        job_id, window_id, [merge_segment(0, 0, 15, "重拆结果")]
+    )
+    history = await database.get_job_merges(job_id)
+    invalidated = next(item for item in history if item["id"] == second_merge["id"])
+    assert invalidated["status"] == "invalidated"
+    assert invalidated["cancellation_reason"] == "window resplit replaced a member"
+    assert all(member["active"] == 0 for member in invalidated["members"])
+    assert all(member["snapshot_json"] for member in invalidated["members"])
+    assert (await database.get_job(job_id))["reviewed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_tail_rebuild_invalidates_cross_window_manual_merge(tmp_path: Path) -> None:
+    database = Database(tmp_path / "state.db")
+    await database.initialize()
+    await database.create_job(
+        {
+            "id": "cross-window-job",
+            "source_path": str(tmp_path / "source.ts"),
+            "source_size": 10,
+            "source_mtime_ns": 20,
+            "source_duration": 120.0,
+            "islice_base_url": "http://islice.test",
+            "template_id": "general",
+            "language": "zh",
+            "channel_name": "",
+            "program_start_time": "2026-08-11T08:00:00+08:00",
+            "cut_mode": "copy",
+            "total_windows": 2,
+            "status": "completed",
+        }
+    )
+    for index in range(2):
+        window = await database.upsert_window(
+            "cross-window-job", index, index * 60, (index + 1) * 60
+        )
+        await database.update_window(
+            window["id"], status="completed", handoff_start=(index + 1) * 60
+        )
+        await database.replace_window_segments(
+            "cross-window-job",
+            window["id"],
+            [merge_segment(index, index * 60, index * 60 + 10, f"窗口{index + 1}")],
+        )
+    segments = await database.get_segments("cross-window-job")
+    preview = await database.preview_segment_merge(
+        "cross-window-job",
+        [segments[0]["id"], segments[1]["id"]],
+        segments[0]["id"],
+    )
+    merge = await database.create_segment_merge(
+        "cross-window-job",
+        [segments[0]["id"], segments[1]["id"]],
+        segments[0]["id"],
+        preview["preview_token"],
+    )
+    rebuild_preview = await database.get_rebuild_preview("cross-window-job", 1)
+    assert len(rebuild_preview["merges"]) == 1
+    await database.truncate_job_for_rebuild(
+        "cross-window-job",
+        1,
+        rebuild_preview["preview_token"],
+        str(tmp_path / "snapshot.json"),
+    )
+    history = await database.get_job_merges("cross-window-job")
+    invalidated = next(item for item in history if item["id"] == merge["id"])
+    assert invalidated["status"] == "invalidated"
+    assert invalidated["cancellation_reason"] == "tail rebuild removed a member"
+    assert not any(item["record_kind"] == "merge" for item in await database.get_segments("cross-window-job"))

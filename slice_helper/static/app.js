@@ -2,7 +2,7 @@ const state = {
   jobs: [], channels: [], selectedJobId: null, detail: null, segments: [],
   jobPage: 1, jobPageSize: 20, jobTotal: 0, jobTotalPages: 1,
   segmentPage: 1, previewUrl: null, resplitTarget: null, tailRebuildTarget: null,
-  segmentEditTarget: null
+  segmentEditTarget: null, selectedSegmentIds: new Set(), mergePreview: null
 };
 const SEGMENTS_PER_PAGE = 10;
 const CONTENT_TYPES = [
@@ -204,6 +204,7 @@ async function loadDetail(jobId, scroll) {
   if (state.selectedJobId && state.selectedJobId !== jobId) {
     resetPreview();
     state.segmentPage = 1;
+    state.selectedSegmentIds.clear();
   }
   state.selectedJobId = jobId;
   const [detail, segments] = await Promise.all([
@@ -359,33 +360,87 @@ function renderSegments() {
   $("previousSegmentPage").disabled = state.segmentPage <= 1;
   $("nextSegmentPage").disabled = state.segmentPage >= pageCount;
 
+  const availableIds = new Set(state.segments.filter(isMergeSelectable).map((segment) => Number(segment.id)));
+  [...state.selectedSegmentIds].forEach((id) => { if (!availableIds.has(id)) state.selectedSegmentIds.delete(id); });
   $("segmentsBody").innerHTML = pageSegments.map((segment, pageIndex) => {
     const segmentIndex = startIndex + pageIndex;
     const previewable = Boolean(segment.segment_url);
     const active = previewable && segment.segment_url === state.previewUrl;
     const title = segment.title || `片段 ${segmentIndex + 1}`;
     const keywords = (segment.keywords || []).join(", ") || "-";
+    const isMerge = segment.record_kind === "merge";
+    const isMember = Boolean(segment.active_merge_id);
+    const selectable = isMergeSelectable(segment);
+    const selected = selectable && state.selectedSegmentIds.has(Number(segment.id));
+    const titleMarkup = isMerge
+      ? `<span class="manual-merge-badge">手工合并 · ${segment.member_count} 条</span><span class="segment-title" title="${escapeHtml(title)}">${escapeHtml(title)}</span>`
+      : `<span class="segment-title" title="${escapeHtml(title)}">${escapeHtml(title)}</span>`;
+    let statusMarkup = segment.ignored
+      ? '<span class="status-pill neutral">忽略</span>'
+      : segment.accepted
+        ? '<span class="status-pill ok">采用</span>'
+        : `<span class="status-pill warn">${escapeHtml(segment.reason || "舍弃")}</span>`;
+    if (isMember) statusMarkup = `<span class="status-pill merged">已并入手工合并</span>`;
+    if (isMerge) statusMarkup = `<span class="status-pill merged">手工合并${segment.ignored ? " · 忽略" : ""}</span>`;
+    let actions = `<button class="button secondary small segment-detail" data-segment-index="${segmentIndex}" type="button">详情</button>`;
+    if (isMerge) {
+      actions += `<button class="button secondary small edit-segment" data-segment-index="${segmentIndex}" type="button">编辑</button><button class="button danger small cancel-merge" data-merge-id="${escapeHtml(segment.merge_id)}" type="button">取消合并</button>`;
+    } else if (!isMember) {
+      actions += `<button class="button secondary small edit-segment" data-segment-index="${segmentIndex}" type="button">编辑</button>`;
+    }
     return `
-    <tr class="segment-row${previewable ? " is-previewable" : ""}${active ? " is-active" : ""}${segment.ignored ? " is-ignored" : ""}"
+    <tr class="segment-row${previewable ? " is-previewable" : ""}${active ? " is-active" : ""}${segment.ignored ? " is-ignored" : ""}${isMerge ? " is-manual-merge" : ""}${isMember ? " is-merge-member" : ""}${selected ? " is-selected" : ""}"
         ${previewable ? `data-segment-index="${segmentIndex}" tabindex="0" aria-label="播放 ${escapeHtml(title)}"` : ""}
         ${active ? 'aria-current="true"' : ""}>
+      <td class="merge-select-cell">${selectable ? `<input class="merge-segment-checkbox" type="checkbox" data-segment-id="${segment.id}" aria-label="选择 ${escapeHtml(title)}用于合并" ${selected ? "checked" : ""}>` : ""}</td>
       <td>${segment.window_index + 1}</td>
       <td class="mono"><span class="segment-time-stack"><span>${formatRealTime(segment.absolute_start)}</span><span>${formatRealTime(segment.absolute_end)}</span></span></td>
-      <td><span class="segment-title" title="${escapeHtml(title)}">${escapeHtml(title)}</span></td>
+      <td>${titleMarkup}</td>
       <td class="segment-content-type">${escapeHtml(segment.content_type || "-")}</td>
       <td class="segment-news-event-type">${escapeHtml(segment.news_event_type || "-")}</td>
       <td class="segment-topic">${escapeHtml(segment.topic || "-")}</td>
       <td><span class="segment-keywords" title="${escapeHtml(keywords)}">${escapeHtml(keywords)}</span></td>
-      <td><span class="status-pill ${segment.ignored ? "neutral" : segment.accepted ? "ok" : "warn"}">${segment.ignored ? "忽略" : segment.accepted ? "采用" : escapeHtml(segment.reason || "舍弃")}</span></td>
-      <td><span class="segment-actions"><button class="button secondary small segment-detail" data-segment-index="${segmentIndex}" type="button">详情</button><button class="button secondary small edit-segment" data-segment-index="${segmentIndex}" type="button">编辑</button></span></td>
+      <td>${statusMarkup}</td>
+      <td><span class="segment-actions">${actions}</span></td>
      </tr>`;
-  }).join("") || '<tr><td class="empty-table-row" colspan="9">暂无拆条结果</td></tr>';
+  }).join("") || '<tr><td class="empty-table-row" colspan="10">暂无拆条结果</td></tr>';
+  renderMergeSelectionBar();
+}
+
+function isMergeSelectable(segment) {
+  return segment.record_kind !== "merge"
+    && !segment.active_merge_id
+    && Boolean(segment.accepted)
+    && !segment.ignored;
+}
+
+function renderMergeSelectionBar() {
+  const selected = state.segments.filter((segment) => state.selectedSegmentIds.has(Number(segment.id)) && isMergeSelectable(segment));
+  $("mergeSelectionBar").hidden = selected.length === 0;
+  $("mergeSelectionSummary").textContent = `已选择 ${selected.length} 条`;
+  $("openMergeDialogButton").disabled = selected.length < 2;
+  if (!selected.length) {
+    $("mergeSelectionTime").textContent = "";
+    return;
+  }
+  const start = Math.min(...selected.map((segment) => Number(segment.global_start)));
+  const end = Math.max(...selected.map((segment) => Number(segment.global_end)));
+  $("mergeSelectionTime").textContent = `${formatSeconds(start)} – ${formatSeconds(end)}`;
 }
 
 function openSegmentEdit(segmentIndex) {
   const segment = state.segments[segmentIndex];
   if (!segment) return;
-  state.segmentEditTarget = { id: segment.id, index: segmentIndex, restoredFromTask: false };
+  const isMerge = segment.record_kind === "merge";
+  state.segmentEditTarget = {
+    id: segment.id,
+    mergeId: segment.merge_id,
+    kind: isMerge ? "merge" : "segment",
+    index: segmentIndex,
+    restoredFromTask: false
+  };
+  $("segmentEditDialog").querySelector("h2").textContent = isMerge ? "编辑手工合并结果" : "编辑拆条结果";
+  $("restoreSegmentEditButton").hidden = isMerge;
   $("segmentEditTitle").value = segment.title || "";
   const currentType = segment.content_type || "";
   const currentOption = $("segmentEditContentTypeCurrent");
@@ -406,7 +461,7 @@ function openSegmentEdit(segmentIndex) {
 async function restoreSegmentEdit() {
   const target = state.segmentEditTarget;
   const jobId = state.selectedJobId;
-  if (!target || !jobId) return;
+  if (!target || !jobId || target.kind === "merge") return;
   const button = $("restoreSegmentEditButton");
   button.disabled = true;
   button.textContent = "读取中";
@@ -454,11 +509,16 @@ async function submitSegmentEdit(event) {
     if ($("segmentEditContentType").value || target.restoredFromTask) {
       payload.contentType = $("segmentEditContentType").value;
     }
-    const updated = await api(`/api/jobs/${jobId}/segments/${target.id}`, {
+    const path = target.kind === "merge"
+      ? `/api/jobs/${jobId}/segment-merges/${target.mergeId}`
+      : `/api/jobs/${jobId}/segments/${target.id}`;
+    const updated = await api(path, {
       method: "PATCH",
       body: JSON.stringify(payload)
     });
-    const index = state.segments.findIndex((segment) => segment.id === updated.id);
+    const index = state.segments.findIndex((segment) => target.kind === "merge"
+      ? segment.merge_id === updated.merge_id
+      : segment.id === updated.id);
     if (index >= 0) state.segments[index] = updated;
     if (state.previewUrl && updated.segment_url === state.previewUrl) {
       $("previewTitle").textContent = updated.title || `片段 ${index + 1}`;
@@ -466,13 +526,97 @@ async function submitSegmentEdit(event) {
     $("segmentEditDialog").close();
     state.segmentEditTarget = null;
     renderSegments();
-    showToast(updated.ignored ? "拆条结果已标记为忽略" : "拆条结果已保存");
+    showToast(updated.ignored ? "结果已标记为忽略" : "结果已保存");
   } catch (error) {
     $("segmentEditError").textContent = error.message;
     $("segmentEditError").hidden = false;
   } finally {
     submit.disabled = false;
     submit.textContent = "保存";
+  }
+}
+
+async function openSegmentMerge() {
+  const ids = state.segments
+    .filter((segment) => state.selectedSegmentIds.has(Number(segment.id)) && isMergeSelectable(segment))
+    .sort((left, right) => Number(left.global_start) - Number(right.global_start))
+    .map((segment) => Number(segment.id));
+  if (ids.length < 2 || !state.selectedJobId) return;
+  await loadSegmentMergePreview(ids, ids[0], true);
+}
+
+async function loadSegmentMergePreview(segmentIds, primarySegmentId, openDialog = false) {
+  $("segmentMergeError").hidden = true;
+  try {
+    const preview = await api(`/api/jobs/${state.selectedJobId}/segment-merges/preview`, {
+      method: "POST",
+      body: JSON.stringify({ segmentIds, primarySegmentId })
+    });
+    state.mergePreview = preview;
+    $("segmentMergeMembers").innerHTML = preview.members.map((member) => `
+      <label class="merge-member-option${member.primary ? " is-primary" : ""}">
+        <input type="radio" name="mergePrimarySegment" value="${member.id}" ${member.primary ? "checked" : ""}>
+        <span class="merge-member-order">窗口 ${member.windowIndex + 1}</span>
+        <strong>${escapeHtml(member.title || "未命名片段")}</strong>
+        <span>${escapeHtml(member.contentType || "未分类")}</span>
+        <span class="mono">${escapeHtml(formatRealTime(member.absoluteStart))} – ${escapeHtml(formatRealTime(member.absoluteEnd))}</span>
+      </label>`).join("");
+    $("segmentMergeResultTitle").textContent = preview.result.title || "-";
+    $("segmentMergeResultType").textContent = preview.result.contentType || "-";
+    $("segmentMergeResultEvent").textContent = preview.result.newsEventType || "-";
+    $("segmentMergeResultTime").textContent = `${formatRealTime(preview.result.absoluteStart)} – ${formatRealTime(preview.result.absoluteEnd)}`;
+    $("segmentMergeResultDuration").textContent = formatSeconds(preview.result.globalEnd - preview.result.globalStart);
+    $("segmentMergeResultBoundary").textContent = `${Number(preview.gapSeconds).toFixed(2)}s / ${Number(preview.overlapSeconds).toFixed(2)}s`;
+    if (openDialog) $("segmentMergeDialog").showModal();
+  } catch (error) {
+    if (openDialog) {
+      showToast(error.message);
+    } else {
+      $("segmentMergeError").textContent = error.message;
+      $("segmentMergeError").hidden = false;
+    }
+  }
+}
+
+async function submitSegmentMerge(event) {
+  event.preventDefault();
+  const preview = state.mergePreview;
+  if (!preview || !state.selectedJobId) return;
+  const submit = $("submitSegmentMergeButton");
+  submit.disabled = true;
+  submit.textContent = "合并中";
+  try {
+    await api(`/api/jobs/${state.selectedJobId}/segment-merges`, {
+      method: "POST",
+      body: JSON.stringify({
+        segmentIds: preview.segmentIds,
+        primarySegmentId: preview.primarySegmentId,
+        previewToken: preview.previewToken
+      })
+    });
+    $("segmentMergeDialog").close();
+    state.mergePreview = null;
+    state.selectedSegmentIds.clear();
+    showToast(`已手工合并 ${preview.segmentIds.length} 条结果`);
+    await loadJobs();
+  } catch (error) {
+    $("segmentMergeError").textContent = error.message;
+    $("segmentMergeError").hidden = false;
+  } finally {
+    submit.disabled = false;
+    submit.textContent = "确认手工合并";
+  }
+}
+
+async function cancelSegmentMerge(mergeId) {
+  if (!state.selectedJobId) return;
+  if (!window.confirm("取消这次手工合并？原始拆条结果将恢复为独立结果并重新参与 Excel 导出。")) return;
+  try {
+    await api(`/api/jobs/${state.selectedJobId}/segment-merges/${mergeId}`, { method: "DELETE" });
+    showToast("已取消手工合并，原始结果已恢复");
+    await loadJobs();
+  } catch (error) {
+    showToast(error.message);
   }
 }
 
@@ -490,6 +634,8 @@ function openSegmentDetail(segmentIndex) {
   const job = state.detail?.job;
   if (!segment || !job) return;
   const keywords = (segment.keywords || []).join(", ");
+  const isMerge = segment.record_kind === "merge";
+  const isMember = Boolean(segment.active_merge_id);
   const exportDate = String(segment.absolute_start || "").match(/^(\d{4}-\d{2}-\d{2})/)?.[1] || job.broadcast_date || "";
   const unmapped = "无映射（留空）";
   const fields = [
@@ -531,15 +677,17 @@ function openSegmentDetail(segmentIndex) {
     ["改后是否国产", unmapped, ""],
     ["改后是否收官", unmapped, ""],
     ["改后标签", unmapped, ""],
-    ["是否合并", unmapped, ""],
+    ["是否合并", isMerge ? "手工合并标记" : unmapped, isMerge ? "是" : ""],
     ["是否拆条", unmapped, ""],
     ["改后节目曾用名", unmapped, ""],
     ["是否立即", unmapped, ""]
   ];
-  const eligible = Boolean(segment.accepted && !segment.ignored && job.channel_id && job.broadcast_date);
+  const eligible = Boolean(segment.accepted && !segment.ignored && !isMember && job.channel_id && job.broadcast_date);
   let eligibilityText = "该片段会随频道 Excel 导出。";
+  if (isMerge) eligibilityText = "该手工合并结果会作为一条记录随频道 Excel 导出，原始成员不再单独导出。";
   if (!segment.accepted) eligibilityText = "该片段不是最终采用结果，不会导出。";
   else if (segment.ignored) eligibilityText = "该片段已标记为忽略，不会导出。";
+  else if (isMember) eligibilityText = `该片段已并入手工合并“${segment.active_merge_title || "未命名"}”，不会单独导出。`;
   else if (!job.channel_id || !job.broadcast_date) eligibilityText = "作业缺少频道或业务日期，不会导出。";
   $("segmentDetailTitle").textContent = segment.title || `片段 ${segmentIndex + 1}`;
   $("segmentExportEligibility").textContent = eligibilityText;
@@ -550,6 +698,20 @@ function openSegmentDetail(segmentIndex) {
       <td class="mapping-source${systemField === unmapped ? " is-unmapped" : ""}">${escapeHtml(systemField)}</td>
       <td class="${kind === "mono" ? "mono" : ""}">${exportDetailValue(value, kind)}</td>
     </tr>`).join("");
+  const mergeDetail = $("manualMergeDetail");
+  if (isMerge) {
+    const members = segment.merge_members || [];
+    mergeDetail.innerHTML = `
+      <div class="manual-merge-heading"><strong>手工合并 · ${segment.member_count} 条</strong><span>主条目提供内容字段，时间覆盖全部成员</span></div>
+      <ol>${members.map((member) => `<li class="${member.role === "primary" ? "is-primary" : ""}"><span>${member.role === "primary" ? "主条目" : "成员"}</span><strong>${escapeHtml(member.title || "未命名片段")}</strong><span class="mono">${escapeHtml(formatRealTime(member.absolute_start))} – ${escapeHtml(formatRealTime(member.absolute_end))}</span></li>`).join("")}</ol>`;
+    mergeDetail.hidden = false;
+  } else if (isMember) {
+    mergeDetail.innerHTML = `<div class="manual-merge-heading"><strong>已并入手工合并</strong><span>${escapeHtml(segment.active_merge_title || "未命名合并结果")} · 共 ${segment.active_merge_member_count || 0} 条</span></div>`;
+    mergeDetail.hidden = false;
+  } else {
+    mergeDetail.innerHTML = "";
+    mergeDetail.hidden = true;
+  }
   $("segmentDetailDialog").showModal();
 }
 
@@ -756,6 +918,10 @@ async function openTailRebuild(target) {
     $("tailRebuildKeepCount").textContent = `${preview.keptWindowCount} 个窗口`;
     $("tailRebuildDeleteCount").textContent = `${preview.deletedWindowCount} 个窗口 / ${preview.deletedAttemptCount} 次 attempt / ${preview.deletedSegmentCount} 条结果`;
     $("tailRebuildTaskCount").textContent = `${preview.oldTaskCount} 个（保留，不删除）`;
+    $("tailRebuildMergeImpactRow").hidden = !preview.invalidatedMergeCount;
+    $("tailRebuildMergeImpact").textContent = preview.invalidatedMergeCount
+      ? `${preview.invalidatedMergeCount} 组将因成员被删除而自动失效`
+      : "";
     $("tailRebuildSourceStart").textContent = formatSeconds(preview.sourceStart);
     $("tailRebuildAbsoluteStart").textContent = preview.absoluteStart ? formatDate(preview.absoluteStart) : "-";
     $("tailRebuildConfirmationLabel").textContent = preview.confirmationText;
@@ -862,6 +1028,8 @@ $("closeResplitButton").addEventListener("click", () => $("resplitDialog").close
 $("cancelResplitButton").addEventListener("click", () => $("resplitDialog").close());
 $("closeTailRebuildButton").addEventListener("click", () => $("tailRebuildDialog").close());
 $("cancelTailRebuildButton").addEventListener("click", () => $("tailRebuildDialog").close());
+$("closeSegmentMergeButton").addEventListener("click", () => $("segmentMergeDialog").close());
+$("cancelSegmentMergeButton").addEventListener("click", () => $("segmentMergeDialog").close());
 $("closeSegmentEditButton").addEventListener("click", () => $("segmentEditDialog").close());
 $("cancelSegmentEditButton").addEventListener("click", () => $("segmentEditDialog").close());
 $("restoreSegmentEditButton").addEventListener("click", restoreSegmentEdit);
@@ -869,6 +1037,12 @@ $("closeSegmentDetailButton").addEventListener("click", () => $("segmentDetailDi
 $("doneSegmentDetailButton").addEventListener("click", () => $("segmentDetailDialog").close());
 $("closePreviewButton").addEventListener("click", resetPreview);
 $("segmentsBody").addEventListener("click", (event) => {
+  if (event.target.closest(".merge-segment-checkbox")) return;
+  const cancelMergeButton = event.target.closest(".cancel-merge");
+  if (cancelMergeButton) {
+    cancelSegmentMerge(cancelMergeButton.dataset.mergeId);
+    return;
+  }
   const detailButton = event.target.closest(".segment-detail");
   if (detailButton) {
     openSegmentDetail(Number(detailButton.dataset.segmentIndex));
@@ -881,6 +1055,14 @@ $("segmentsBody").addEventListener("click", (event) => {
   }
   const row = event.target.closest(".segment-row.is-previewable");
   if (row) previewSegment(Number(row.dataset.segmentIndex));
+});
+$("segmentsBody").addEventListener("change", (event) => {
+  const checkbox = event.target.closest(".merge-segment-checkbox");
+  if (!checkbox) return;
+  const segmentId = Number(checkbox.dataset.segmentId);
+  if (checkbox.checked) state.selectedSegmentIds.add(segmentId);
+  else state.selectedSegmentIds.delete(segmentId);
+  renderSegments();
 });
 $("segmentsBody").addEventListener("keydown", (event) => {
   if (event.target.closest("button")) return;
@@ -920,7 +1102,22 @@ $("createForm").addEventListener("submit", submitCreate);
 $("channelCreateForm").addEventListener("submit", submitChannel);
 $("resplitForm").addEventListener("submit", submitResplit);
 $("tailRebuildForm").addEventListener("submit", submitTailRebuild);
+$("segmentMergeForm").addEventListener("submit", submitSegmentMerge);
 $("segmentEditForm").addEventListener("submit", submitSegmentEdit);
+$("openMergeDialogButton").addEventListener("click", openSegmentMerge);
+$("clearMergeSelectionButton").addEventListener("click", () => {
+  state.selectedSegmentIds.clear();
+  renderSegments();
+});
+$("segmentMergeMembers").addEventListener("change", (event) => {
+  const radio = event.target.closest('input[name="mergePrimarySegment"]');
+  if (!radio || !state.mergePreview) return;
+  loadSegmentMergePreview(
+    state.mergePreview.segmentIds,
+    Number(radio.value),
+    false
+  );
+});
 $("refreshButton").addEventListener("click", () => loadJobs().catch((error) => showToast(error.message)));
 $("saveTimeReferenceButton").addEventListener("click", saveTimeReference);
 $("summaryRealTime").addEventListener("keydown", (event) => {

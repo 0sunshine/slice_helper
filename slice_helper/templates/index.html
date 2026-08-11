@@ -141,9 +141,15 @@
           </div>
           <div class="table-scroll segments-table-scroll">
             <table class="data-table compact segments-table">
-              <thead><tr><th>窗口</th><th>真实时间</th><th>标题</th><th>节目类型</th><th>新闻事件</th><th>主题</th><th>关键词</th><th>状态</th><th>操作</th></tr></thead>
+              <thead><tr><th class="merge-select-column">选择</th><th>窗口</th><th>真实时间</th><th>标题</th><th>节目类型</th><th>新闻事件</th><th>主题</th><th>关键词</th><th>状态</th><th>操作</th></tr></thead>
               <tbody id="segmentsBody"></tbody>
             </table>
+          </div>
+          <div id="mergeSelectionBar" class="merge-selection-bar" hidden>
+            <strong id="mergeSelectionSummary"></strong>
+            <span id="mergeSelectionTime" class="mono"></span>
+            <button id="clearMergeSelectionButton" class="button secondary small" type="button">清空</button>
+            <button id="openMergeDialogButton" class="button primary small" type="button">合并所选结果</button>
           </div>
         </section>
 
@@ -236,6 +242,7 @@
           <div><dt>保留</dt><dd id="tailRebuildKeepCount"></dd></div>
           <div><dt>删除数据</dt><dd id="tailRebuildDeleteCount"></dd></div>
           <div><dt>旧 iSlice 任务</dt><dd id="tailRebuildTaskCount"></dd></div>
+          <div id="tailRebuildMergeImpactRow" hidden><dt>手工合并</dt><dd id="tailRebuildMergeImpact"></dd></div>
           <div><dt>源时间</dt><dd id="tailRebuildSourceStart" class="mono"></dd></div>
           <div><dt>真实时间</dt><dd id="tailRebuildAbsoluteStart" class="mono"></dd></div>
         </dl>
@@ -248,6 +255,35 @@
       <div class="dialog-actions">
         <button id="cancelTailRebuildButton" class="button secondary" type="button">取消</button>
         <button id="submitTailRebuildButton" class="button danger" type="submit">确认删除并重跑</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="segmentMergeDialog" class="segment-merge-dialog">
+    <form id="segmentMergeForm" method="dialog">
+      <div class="dialog-header">
+        <div><span class="preview-label">手工合并</span><h2>选择主条目并确认</h2></div>
+        <button id="closeSegmentMergeButton" class="icon-button" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="segment-merge-body">
+        <p>标题、节目类型等内容取自主条目；开始和结束时间覆盖全部成员。原始拆条结果会保留，但不再单独导出。</p>
+        <div id="segmentMergeMembers" class="segment-merge-members"></div>
+        <section class="merge-result-preview">
+          <h3>合并结果预览</h3>
+          <dl>
+            <div><dt>标题</dt><dd id="segmentMergeResultTitle"></dd></div>
+            <div><dt>节目类型</dt><dd id="segmentMergeResultType"></dd></div>
+            <div><dt>新闻事件</dt><dd id="segmentMergeResultEvent"></dd></div>
+            <div><dt>时间范围</dt><dd id="segmentMergeResultTime" class="mono"></dd></div>
+            <div><dt>总时长</dt><dd id="segmentMergeResultDuration" class="mono"></dd></div>
+            <div><dt>空隙 / 重叠</dt><dd id="segmentMergeResultBoundary" class="mono"></dd></div>
+          </dl>
+        </section>
+        <p id="segmentMergeError" class="form-error" hidden></p>
+      </div>
+      <div class="dialog-actions">
+        <button id="cancelSegmentMergeButton" class="button secondary" type="button">取消</button>
+        <button id="submitSegmentMergeButton" class="button primary" type="submit">确认手工合并</button>
       </div>
     </form>
   </dialog>
@@ -301,6 +337,7 @@
     </div>
     <div class="segment-detail-body">
       <p id="segmentExportEligibility" class="export-eligibility"></p>
+      <section id="manualMergeDetail" class="manual-merge-detail" hidden></section>
       <div class="table-scroll export-mapping-scroll">
         <table class="data-table compact export-mapping-table">
           <thead><tr><th>Excel 字段</th><th>对应系统字段</th><th>本条导出值</th></tr></thead>

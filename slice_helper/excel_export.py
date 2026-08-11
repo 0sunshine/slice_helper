@@ -129,6 +129,8 @@ def _write_date_sheet(
         sheet.cell(index, 8).value = export_date
         sheet.cell(index, 9).value = str(segment.get("content_type") or "")
         sheet.cell(index, 10).value = str(segment.get("news_event_type") or "")
+        if segment.get("manual_merge"):
+            sheet.cell(index, 39).value = "是"
 
     sheet.auto_filter.ref = f"A1:AP{max(2, len(segments) + 1)}"
 
