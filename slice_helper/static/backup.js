@@ -1,4 +1,4 @@
-const state = { instances: [], page: 1, totalPages: 1 };
+const state = { instances: [], channels: [], page: 1, totalPages: 1 };
 
 const $ = (id) => document.getElementById(id);
 const escapeHtml = (value) => String(value ?? "")
@@ -88,6 +88,18 @@ async function loadInstances() {
   renderInstances();
 }
 
+function renderChannels() {
+  const selected = $("backupChannel").value;
+  $("backupChannel").innerHTML = '<option value="">全部频道</option>' + state.channels
+    .map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join("");
+  if (state.channels.some((item) => item.id === selected)) $("backupChannel").value = selected;
+}
+
+async function loadChannels() {
+  state.channels = await request("/api/channels");
+  renderChannels();
+}
+
 function renderSources(sources) {
   const online = sources.filter((item) => item.online).length;
   const badge = $("catalogHealth");
@@ -136,6 +148,8 @@ function renderTasks(payload) {
 async function loadBackups() {
   const params = new URLSearchParams({ page: state.page, pageSize: 20 });
   if ($("backupSource").value) params.set("sourceId", $("backupSource").value);
+  if ($("backupChannel").value) params.set("channelId", $("backupChannel").value);
+  if ($("backupDate").value) params.set("broadcastDate", $("backupDate").value);
   if ($("backupState").value) params.set("state", $("backupState").value);
   if ($("backupQuery").value.trim()) params.set("query", $("backupQuery").value.trim());
   renderTasks(await request(`/api/archive/status?${params}`));
@@ -184,9 +198,13 @@ $("closeInstanceDialog").addEventListener("click", () => $("instanceDialog").clo
 $("cancelInstance").addEventListener("click", () => $("instanceDialog").close());
 $("refreshBackup").addEventListener("click", async () => { await loadInstances(); await loadBackups(); });
 $("backupSource").addEventListener("change", () => { state.page = 1; loadBackups(); });
+$("backupChannel").addEventListener("change", () => { state.page = 1; loadBackups(); });
+$("backupDate").addEventListener("change", () => { state.page = 1; loadBackups(); });
 $("backupState").addEventListener("change", () => { state.page = 1; loadBackups(); });
 $("backupQuery").addEventListener("input", () => { clearTimeout(state.queryTimer); state.queryTimer = setTimeout(() => { state.page = 1; loadBackups(); }, 300); });
 $("previousBackupPage").addEventListener("click", () => { state.page -= 1; loadBackups(); });
 $("nextBackupPage").addEventListener("click", () => { state.page += 1; loadBackups(); });
 
-Promise.all([loadInstances(), loadBackups()]).catch((error) => toast(error.message, true));
+Promise.all([loadInstances(), loadChannels()])
+  .then(loadBackups)
+  .catch((error) => toast(error.message, true));

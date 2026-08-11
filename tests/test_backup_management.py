@@ -236,6 +236,8 @@ def test_backup_page_and_instance_api(tmp_path: Path, monkeypatch) -> None:
         page = client.get("/backup")
         assert page.status_code == 200
         assert "iSlice 实例与备份" in page.text
+        assert 'id="backupChannel"' in page.text
+        assert 'id="backupDate"' in page.text
         instances = client.get("/api/islice-instances").json()
         assert instances[0]["source_id"] == "islice-128"
         response = client.post(
@@ -254,3 +256,110 @@ def test_backup_page_and_instance_api(tmp_path: Path, monkeypatch) -> None:
         assert client.delete(
             f"/api/islice-instances/{response.json()['id']}"
         ).status_code == 204
+
+
+def test_archive_status_filters_channel_and_date_and_sorts_business_time_desc(
+    tmp_path: Path, monkeypatch
+) -> None:
+    async def no_start(_self):
+        return None
+
+    async def no_stop(_self):
+        return None
+
+    channel_ids: dict[str, str] = {}
+
+    async def fake_catalog(_self, _instances, _contexts):
+        return {
+            "sources": [],
+            "tasks": [
+                {
+                    "task_id": "older-day",
+                    "source_id": "islice-128",
+                    "source_name": "iSlice 128",
+                    "state": "deleted",
+                    "archived_at": "2026-08-11T03:00:00+00:00",
+                    "context": {
+                        "channel_id": channel_ids["news"],
+                        "channel_name": "新闻频道",
+                        "broadcast_date": "2026-06-19",
+                        "requested_start": 82800,
+                    },
+                },
+                {
+                    "task_id": "new-day-early-window",
+                    "source_id": "islice-128",
+                    "source_name": "iSlice 128",
+                    "state": "deleted",
+                    "archived_at": "2026-08-11T05:00:00+00:00",
+                    "context": {
+                        "channel_id": channel_ids["news"],
+                        "channel_name": "新闻频道",
+                        "broadcast_date": "2026-06-20",
+                        "requested_start": 0,
+                    },
+                },
+                {
+                    "task_id": "new-day-late-window",
+                    "source_id": "islice-128",
+                    "source_name": "iSlice 128",
+                    "state": "archived_hold",
+                    "archived_at": "2026-08-11T04:00:00+00:00",
+                    "context": {
+                        "channel_id": channel_ids["news"],
+                        "channel_name": "新闻频道",
+                        "broadcast_date": "2026-06-20",
+                        "requested_start": 3600,
+                    },
+                },
+                {
+                    "task_id": "other-channel",
+                    "source_id": "islice-128",
+                    "source_name": "iSlice 128",
+                    "state": "deleted",
+                    "archived_at": "2026-08-11T06:00:00+00:00",
+                    "context": {
+                        "channel_id": channel_ids["movie"],
+                        "channel_name": "影视频道",
+                        "broadcast_date": "2026-06-20",
+                        "requested_start": 7200,
+                    },
+                },
+            ],
+        }
+
+    monkeypatch.setattr(Orchestrator, "start", no_start)
+    monkeypatch.setattr(Orchestrator, "stop", no_stop)
+    monkeypatch.setattr(ArchiveCatalogReader, "read", fake_catalog)
+
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        channel_ids["news"] = client.post(
+            "/api/channels", json={"name": "新闻频道"}
+        ).json()["id"]
+        channel_ids["movie"] = client.post(
+            "/api/channels", json={"name": "影视频道"}
+        ).json()["id"]
+
+        payload = client.get("/api/archive/status?pageSize=20").json()
+        assert [item["task_id"] for item in payload["items"]] == [
+            "other-channel",
+            "new-day-late-window",
+            "new-day-early-window",
+            "older-day",
+        ]
+
+        filtered = client.get(
+            "/api/archive/status",
+            params={
+                "channelId": channel_ids["news"],
+                "broadcastDate": "2026-06-20",
+            },
+        ).json()
+        assert [item["task_id"] for item in filtered["items"]] == [
+            "new-day-late-window",
+            "new-day-early-window",
+        ]
+        invalid = client.get(
+            "/api/archive/status", params={"broadcastDate": "2026-02-30"}
+        )
+        assert invalid.status_code == 422

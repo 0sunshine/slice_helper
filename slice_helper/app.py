@@ -254,6 +254,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request,
         source_id: str | None = Query(default=None, alias="sourceId"),
         state: str | None = Query(default=None),
+        channel_id: str | None = Query(
+            default=None, alias="channelId", min_length=1, max_length=64
+        ),
+        broadcast_date: str | None = Query(
+            default=None, alias="broadcastDate", min_length=10, max_length=10
+        ),
         query: str = Query(default="", max_length=200),
         page: int = Query(default=1, ge=1),
         page_size: int = Query(default=20, alias="pageSize", ge=1, le=100),
@@ -261,6 +267,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         instances = await request.app.state.database.list_islice_instances()
         contexts = await request.app.state.database.archive_task_contexts()
         catalog = await request.app.state.archive_catalog.read(instances, contexts)
+        if broadcast_date:
+            try:
+                date.fromisoformat(broadcast_date)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail="业务日期格式必须为 YYYY-MM-DD") from exc
         needle = query.strip().casefold()
         tasks = []
         for task in catalog["tasks"]:
@@ -269,6 +280,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if state and task.get("state") != state:
                 continue
             context = task.get("context") or {}
+            if channel_id and str(context.get("channel_id") or "") != channel_id:
+                continue
+            if broadcast_date and str(context.get("broadcast_date") or "") != broadcast_date:
+                continue
             haystack = " ".join(
                 str(value or "")
                 for value in (
@@ -284,7 +299,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 continue
             tasks.append(task)
         tasks.sort(
-            key=lambda item: str(item.get("updated_at") or item.get("discovered_at") or ""),
+            key=lambda item: (
+                str((item.get("context") or {}).get("broadcast_date") or ""),
+                float((item.get("context") or {}).get("requested_start") or -1),
+                str(
+                    item.get("archived_at")
+                    or item.get("updated_at")
+                    or item.get("discovered_at")
+                    or ""
+                ),
+                str(item.get("task_id") or ""),
+            ),
             reverse=True,
         )
         total = len(tasks)

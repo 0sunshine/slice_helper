@@ -769,9 +769,10 @@ class Database:
             rows = await (
                 await db.execute(
                     """
-                    SELECT i.source_id,a.task_id,j.id AS job_id,j.channel_name,
-                           j.broadcast_date,j.status AS job_status,j.islice_base_url,
-                           w.window_index,a.status AS attempt_status,
+                    SELECT i.source_id,a.task_id,j.id AS job_id,j.channel_id,
+                           j.channel_name,j.broadcast_date,j.program_start_time,
+                           j.status AS job_status,j.islice_base_url,
+                           w.window_index,w.requested_start,a.status AS attempt_status,
                            SUM(CASE WHEN s.accepted=1 AND s.ignored=0 THEN 1 ELSE 0 END)
                                AS accepted_segment_count
                     FROM attempts a
