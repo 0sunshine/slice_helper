@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import random
+import secrets
 import shutil
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from datetime import date
 from typing import Any
 from urllib.parse import quote, urlsplit
 
@@ -19,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from . import __version__
-from .archive_status import ArchiveCatalogReader
+from .archive_status import ArchiveCatalogReader, ArchivePreviewError
 from .config import Settings
 from .database import Database
 from .excel_export import build_channel_workbook, safe_export_filename
@@ -33,6 +35,7 @@ from .models import (
     JobCreate,
     JobStatus,
     ISliceInstanceUpsert,
+    SystemResetExecute,
     SegmentUpdate,
     SegmentMergeCreate,
     SegmentMergePreviewRequest,
@@ -47,6 +50,13 @@ from .orchestrator import (
     RebuildValidationError,
     ResplitConflictError,
     ResplitValidationError,
+)
+from .system_reset import (
+    SystemResetError,
+    commit_agent_command,
+    create_helper_backup,
+    prepare_agent_command,
+    validate_agent_receipts,
 )
 from .processing import calculate_total_windows
 from .source_download import HttpSourceDownloader, SourceDownloadError
@@ -165,6 +175,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.islice = islice
         app.state.archive_catalog = archive_catalog
         app.state.orchestrator = orchestrator
+        app.state.system_reset_lock = asyncio.Lock()
+        app.state.system_write_condition = asyncio.Condition()
+        app.state.active_write_requests = 0
+        app.state.system_reset_in_progress = False
         await orchestrator.start()
         try:
             yield
@@ -178,6 +192,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version=__version__,
         lifespan=lifespan,
     )
+
+    @application.middleware("http")
+    async def reject_writes_during_system_reset(request: Request, call_next):
+        is_write = request.method in {"POST", "PUT", "PATCH", "DELETE"}
+        if not is_write or request.url.path == "/api/system-reset/execute":
+            return await call_next(request)
+        condition = request.app.state.system_write_condition
+        async with condition:
+            if request.app.state.system_reset_in_progress:
+                return JSONResponse(status_code=503, content={"detail": "系统正在执行重置"})
+            request.app.state.active_write_requests += 1
+        try:
+            return await call_next(request)
+        finally:
+            async with condition:
+                request.app.state.active_write_requests -= 1
+                condition.notify_all()
+
     templates = Jinja2Templates(directory=str(PACKAGE_DIR / "templates"))
     application.mount("/static", StaticFiles(directory=str(PACKAGE_DIR / "static")), name="static")
 
@@ -325,6 +357,174 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "totalPages": total_pages,
         }
 
+    @application.get("/api/archive/tasks/{source_id}/{task_id}/preview")
+    async def archive_task_preview(
+        request: Request,
+        source_id: str,
+        task_id: str,
+        revision_digest: str | None = Query(
+            default=None, alias="revisionDigest", pattern=r"^[0-9a-f]{64}$"
+        ),
+    ):
+        instances = await request.app.state.database.list_islice_instances()
+        instance = next(
+            (item for item in instances if str(item["source_id"]) == source_id),
+            None,
+        )
+        if instance is None:
+            raise HTTPException(status_code=404, detail="归档来源不存在")
+        try:
+            return await request.app.state.archive_catalog.read_task_preview(
+                instance,
+                task_id,
+                revision_digest,
+            )
+        except ArchivePreviewError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @application.post("/api/system-reset/preview")
+    async def preview_system_reset(request: Request):
+        database = request.app.state.database
+        preview_state = await database.reset_preview_counts()
+        if preview_state["active_jobs"]:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "active_jobs",
+                    "message": "仍有活动或待调度作业，必须先暂停或停止",
+                    "jobs": preview_state["active_jobs"],
+                },
+            )
+        instances = await database.list_islice_instances()
+        if not instances:
+            raise HTTPException(status_code=409, detail="没有配置 iSlice 实例")
+        request_id = uuid.uuid4().hex
+        nonce = secrets.token_urlsafe(24)
+        short_id = request_id[:8]
+        confirmation_text = f"RESET {short_id}"
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
+        sources = [
+            {
+                "sourceId": str(instance["source_id"]),
+                "name": str(instance["name"]),
+                "baseUrl": str(instance["base_url"]),
+                "prepareConfirmation": f"BACKUP {instance['source_id']} {short_id}",
+            }
+            for instance in instances
+        ]
+        preview = {
+            "requestId": request_id,
+            "counts": preview_state["counts"],
+            "sources": sources,
+            "mediaDirectoriesIncluded": False,
+        }
+        await database.create_system_reset_request(
+            request_id=request_id,
+            nonce=nonce,
+            confirmation_hash=hashlib.sha256(
+                confirmation_text.encode("utf-8")
+            ).hexdigest(),
+            expires_at=expires_at.isoformat(),
+            preview=preview,
+        )
+        for source in sources:
+            source["prepareCommand"] = prepare_agent_command(
+                source["sourceId"],
+                request_id,
+                nonce,
+                source["prepareConfirmation"],
+            )
+        return {
+            **preview,
+            "expiresAt": expires_at.isoformat(),
+            "confirmationText": confirmation_text,
+            "warnings": [
+                "只备份并重置数据库，不备份、不删除任何媒体目录",
+                "执行后所有 iSlice 实例会自动关闭新作业调度",
+                "必须先在每台 iSlice 上执行 prepare-reset 并粘贴全部 JSON 回执",
+            ],
+        }
+
+    @application.post("/api/system-reset/execute")
+    async def execute_system_reset(request: Request, body: SystemResetExecute):
+        if not body.acknowledge_media_handling:
+            raise HTTPException(status_code=400, detail="必须确认媒体目录由用户自行处理")
+        lock = request.app.state.system_reset_lock
+        async with lock:
+            condition = request.app.state.system_write_condition
+            async with condition:
+                request.app.state.system_reset_in_progress = True
+                while request.app.state.active_write_requests:
+                    await condition.wait()
+            try:
+                database = request.app.state.database
+                reset_request = await database.get_system_reset_request(body.request_id)
+                if reset_request is None:
+                    raise HTTPException(status_code=404, detail="重置请求不存在")
+                if reset_request["status"] != "prepared":
+                    raise HTTPException(status_code=409, detail="重置请求已使用或已失效")
+                expires_at = datetime.fromisoformat(str(reset_request["expires_at"]))
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                if expires_at <= datetime.now(timezone.utc):
+                    raise HTTPException(status_code=409, detail="重置请求已过期")
+                expected_hash = str(reset_request["confirmation_hash"])
+                supplied_hash = hashlib.sha256(
+                    body.confirmation_text.encode("utf-8")
+                ).hexdigest()
+                if not secrets.compare_digest(expected_hash, supplied_hash):
+                    raise HTTPException(status_code=400, detail="二次确认短语不正确")
+                preview = json.loads(str(reset_request["preview_json"]))
+                required_sources = {
+                    str(source["sourceId"]) for source in preview.get("sources", [])
+                }
+                try:
+                    receipts = validate_agent_receipts(
+                        [dict(item) for item in body.receipts],
+                        request_id=body.request_id,
+                        nonce=str(reset_request["nonce"]),
+                        required_source_ids=required_sources,
+                    )
+                    helper_backup = await asyncio.to_thread(
+                        create_helper_backup,
+                        configured.database_path,
+                        configured.data_dir,
+                        body.request_id,
+                    )
+                    deleted_counts = await database.reset_operational_data(
+                        request_id=body.request_id,
+                        receipts=receipts,
+                        helper_backup_path=str(helper_backup["databaseBackup"]),
+                    )
+                except (SystemResetError, ValueError, OSError, sqlite3.Error) as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                commands = []
+                for receipt in receipts:
+                    confirmation = (
+                        f"RESET {receipt['sourceId']} {body.request_id[:8]}"
+                    )
+                    commands.append(
+                        {
+                            "sourceId": receipt["sourceId"],
+                            "confirmation": confirmation,
+                            "command": commit_agent_command(receipt, confirmation),
+                        }
+                    )
+                request.app.state.orchestrator.notify()
+                return {
+                    "status": "helper_reset",
+                    "requestId": body.request_id,
+                    "helperBackup": helper_backup,
+                    "deletedCounts": deleted_counts,
+                    "commitCommands": commands,
+                    "mediaDirectoriesTouched": False,
+                    "message": "helper 已重置；请在每台 iSlice 停止服务后执行 commit-reset",
+                }
+            finally:
+                async with condition:
+                    request.app.state.system_reset_in_progress = False
+                    condition.notify_all()
+
     @application.get("/internal/archive-references/{task_id}")
     async def archive_references(
         request: Request,
@@ -410,6 +610,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.post("/api/jobs", status_code=201)
     async def create_job(request: Request, body: JobCreate):
+        if request.app.state.system_reset_in_progress:
+            raise HTTPException(status_code=503, detail="系统正在执行重置")
         channel = await request.app.state.database.get_channel(body.channel_id)
         if channel is None:
             raise HTTPException(status_code=400, detail="请选择有效频道")

@@ -11,6 +11,8 @@ from slice_helper.archive_agent import (
     TaskManifest,
     RemoteSyncResult,
     build_manifest,
+    commit_reset,
+    prepare_reset,
 )
 
 
@@ -109,6 +111,7 @@ def make_config(tmp_path: Path, *, delete_delay_hours: float = 24) -> ArchiveCon
         ssh_key=tmp_path / "id_ed25519",
         known_hosts=tmp_path / "known_hosts",
         delete_delay_hours=delete_delay_hours,
+        reset_backup_root=tmp_path / "state" / "reset-backups",
     )
 
 
@@ -116,6 +119,7 @@ class FakeRemote:
     def __init__(self) -> None:
         self.synced: list[TaskManifest] = []
         self.verified: list[TaskManifest] = []
+        self.catalogs: list[dict] = []
 
     def sync(
         self,
@@ -137,8 +141,8 @@ class FakeRemote:
     def verify(self, manifest) -> None:
         self.verified.append(manifest)
 
-    def publish_catalog(self, _path) -> None:
-        return None
+    def publish_catalog(self, path) -> None:
+        self.catalogs.append(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
 def test_manifest_hashes_all_output_and_is_deletion_eligible(tmp_path: Path) -> None:
@@ -257,3 +261,117 @@ def test_state_store_tracks_new_digest_as_a_revision_without_overwrite(
     assert revisions[first.digest]["remote_path"].startswith("/archive/history/")
     assert revisions[second.digest]["state"] == "published"
     assert state.get("task-001")["revision_count"] == 2
+    catalog = state.catalog(config)
+    assert catalog["schemaVersion"] == 3
+    assert catalog["source"]["archiveHttpBase"] == "http://archive.test"
+    assert catalog["tasks"][0]["archive_url"] == "http://archive.test/tasks/task-001"
+    assert all(revision["archive_url"] for revision in catalog["tasks"][0]["revisions"])
+
+
+def test_two_phase_reset_backs_up_databases_and_never_touches_media(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    make_task_database(config.islice_database)
+    output = make_output(config.storage_root)
+    state = StateStore(config.state_database, config.source_id)
+    state.initialize()
+    state.discover(
+        "task-001",
+        config.storage_root / "task-001",
+        output,
+        "/archive/tasks/task-001",
+        "v1",
+    )
+    request_id = "a" * 32
+    nonce = "n" * 24
+
+    receipt = prepare_reset(
+        config,
+        request_id=request_id,
+        nonce=nonce,
+        confirmation=f"BACKUP {config.source_id} {request_id[:8]}",
+    )
+
+    assert receipt["status"] == "prepared"
+    assert receipt["mediaDirectoriesBackedUp"] is False
+    for path_key, hash_key in (
+        ("isliceDatabaseBackup", "isliceDatabaseSha256"),
+        ("archiveDatabaseBackup", "archiveDatabaseSha256"),
+    ):
+        backup = Path(receipt[path_key])
+        assert backup.is_file()
+        assert len(receipt[hash_key]) == 64
+        with sqlite3.connect(backup) as connection:
+            assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    assert output.is_dir()
+    assert (output / "segments" / "one.mp4").is_file()
+
+    with sqlite3.connect(config.islice_database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+    try:
+        commit_reset(
+            config,
+            request_id=request_id,
+            proof="wrong-proof-value-with-enough-characters",
+            confirmation=f"RESET {config.source_id} {request_id[:8]}",
+            services_stopped=True,
+            remote=FakeRemote(),
+        )
+    except RuntimeError as exc:
+        assert "proof" in str(exc).lower()
+    else:  # pragma: no cover
+        raise AssertionError("commit-reset accepted the wrong proof")
+    with sqlite3.connect(config.islice_database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+
+    remote = FakeRemote()
+    committed = commit_reset(
+        config,
+        request_id=request_id,
+        proof=receipt["proof"],
+        confirmation=f"RESET {config.source_id} {request_id[:8]}",
+        services_stopped=True,
+        remote=remote,
+    )
+
+    assert committed["status"] == "committed"
+    assert committed["mediaDirectoriesTouched"] is False
+    assert Path(committed["finalIsliceDatabaseBackup"]).is_file()
+    assert Path(committed["finalArchiveDatabaseBackup"]).is_file()
+    with sqlite3.connect(config.islice_database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    with sqlite3.connect(config.state_database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM archives").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM archive_events").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM archive_revisions").fetchone()[0] == 0
+    assert remote.catalogs[-1]["summary"]["taskCount"] == 0
+    assert output.is_dir()
+    assert (output / "segments" / "one.mp4").is_file()
+
+
+def test_commit_reset_requires_explicit_services_stopped_confirmation(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    make_task_database(config.islice_database)
+    receipt = prepare_reset(
+        config,
+        request_id="b" * 32,
+        nonce="n" * 24,
+        confirmation=f"BACKUP {config.source_id} {'b' * 8}",
+    )
+
+    try:
+        commit_reset(
+            config,
+            request_id="b" * 32,
+            proof=receipt["proof"],
+            confirmation=f"RESET {config.source_id} {'b' * 8}",
+            services_stopped=False,
+            remote=FakeRemote(),
+        )
+    except RuntimeError as exc:
+        assert "services-stopped" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("commit-reset did not require --services-stopped")

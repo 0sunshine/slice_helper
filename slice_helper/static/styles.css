@@ -254,17 +254,72 @@ dialog::backdrop { background: #1c252180; }
 .table-subtext { display: block; margin-top: 3px; color: #737b75; font-size: 11px; }
 .task-id-cell { max-width: 290px; overflow-wrap: anywhere; font-size: 12px; }
 .backup-detail-cell { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.archive-preview-dialog { width: min(1180px, calc(100vw - 28px)); }
+.archive-preview-body { min-height: 520px; display: grid; grid-template-columns: minmax(560px, 2fr) minmax(320px, 1fr); background: #f3f5f3; }
+.archive-player-panel { min-width: 0; padding: 14px; display: flex; flex-direction: column; background: #171a18; }
+.archive-player-panel video { width: 100%; min-height: 390px; max-height: 620px; flex: 1; background: #000; object-fit: contain; }
+.archive-player-info { min-height: 74px; padding: 11px 3px 0; color: #e8ece9; display: flex; flex-direction: column; gap: 5px; }
+.archive-player-info strong { font-size: 15px; }
+.archive-player-info .mono { color: #b8c0ba; font-size: 12px; }
+.archive-player-info .muted { color: #9ba59e; font-size: 12px; }
+.archive-segments-panel { min-width: 0; max-height: 680px; padding: 12px; border-left: 1px solid #d8ddd9; background: #fff; display: flex; flex-direction: column; gap: 10px; }
+.archive-segments-panel .filter-label { flex: 0 0 auto; }
+.archive-segment-list { min-height: 0; flex: 1; overflow-y: auto; border: 1px solid #dfe3df; }
+.archive-segment-item { width: 100%; min-height: 62px; padding: 8px 9px; border: 0; border-bottom: 1px solid #e7eae7; background: #fff; color: #333a35; text-align: left; display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 4px 7px; cursor: pointer; }
+.archive-segment-item:last-child { border-bottom: 0; }
+.archive-segment-item:hover { background: #f4f8f6; }
+.archive-segment-item.is-active { background: #e5f4ee; box-shadow: inset 3px 0 #23836d; }
+.archive-segment-item.is-unavailable { color: #858b87; background: #f4f4f3; }
+.archive-segment-item > span { grid-row: 1 / 3; align-self: center; color: #737b75; text-align: center; }
+.archive-segment-item strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.archive-segment-item small { color: #737b75; }
+.archive-preview-warnings { max-height: 110px; padding: 8px 20px; overflow-y: auto; border-top: 1px solid #e5c67f; background: #fff6df; color: #795000; }
+.archive-preview-warnings p { margin: 3px 0; }
+.error-text { color: #a52e21; }
 .instance-dialog { width: min(720px, calc(100vw - 28px)); }
 .instance-form-grid { padding: 18px 20px 8px; }
 .instance-help { padding: 0 20px 12px; }
 .checkbox-label { display: flex !important; flex-direction: row !important; align-items: center; gap: 8px; }
 .checkbox-label input { width: 17px; min-height: 17px; margin: 0; accent-color: #176b57; }
+.reset-danger-zone { margin-top: 10px; border-top: 4px solid #b93b2f; display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+.reset-danger-zone h2 { color: #92291f; }
+.reset-danger-zone p { margin: 7px 0 5px; color: #59615b; }
+.reset-danger-zone strong { color: #a52e21; font-size: 12px; }
+.reset-dialog { width: min(920px, calc(100vw - 28px)); }
+.reset-dialog-body { max-height: min(72vh, 780px); padding: 18px 20px; overflow-y: auto; }
+.reset-dialog-body h3 { margin: 18px 0 8px; font-size: 14px; }
+.reset-warning, .reset-success { padding: 12px 14px; border-left: 4px solid #b93b2f; background: #fff1ef; color: #7f281f; line-height: 1.5; }
+.reset-warning p, .reset-success p { margin: 5px 0 0; }
+.reset-success { border-color: #23836d; background: #eaf7f1; color: #176b57; }
+.reset-counts { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 1px; border: 1px solid #ead3d0; background: #ead3d0; }
+.reset-counts > div { padding: 9px 10px; background: #fff; display: flex; flex-direction: column; gap: 5px; }
+.reset-counts span { color: #737b75; font-size: 11px; }
+.reset-counts strong { font-size: 16px; }
+.reset-command-list { display: flex; flex-direction: column; gap: 8px; }
+.reset-command-card { border: 1px solid #d8ddd9; background: #f7f8f6; }
+.reset-command-card > div { min-height: 38px; padding: 5px 9px; border-bottom: 1px solid #d8ddd9; display: flex; align-items: center; justify-content: space-between; }
+.reset-command-card code { padding: 10px; display: block; color: #343a36; background: #eef1ee; white-space: pre-wrap; overflow-wrap: anywhere; user-select: all; }
+.reset-field { margin-top: 15px; display: flex; flex-direction: column; gap: 7px; color: #4f5751; font-size: 12px; }
+.reset-field textarea { width: 100%; min-height: 130px; padding: 9px; resize: vertical; font-family: Consolas, "Courier New", monospace; font-size: 12px; }
+.reset-field input { font-family: Consolas, "Courier New", monospace; }
+.reset-ack { margin-top: 14px; padding: 10px; border: 1px solid #e1a49d; background: #fff8f7; color: #8c2a20; }
+.reset-backup-result { margin: 14px 0; border: 1px solid #dfe3df; }
+.reset-backup-result > div { display: grid; grid-template-columns: 120px minmax(0, 1fr); border-bottom: 1px solid #e7eae7; }
+.reset-backup-result > div:last-child { border-bottom: 0; }
+.reset-backup-result dt, .reset-backup-result dd { margin: 0; padding: 9px 10px; }
+.reset-backup-result dt { color: #626a64; background: #f5f7f5; }
+.reset-backup-result dd { overflow-wrap: anywhere; }
+.reset-warning-text { margin-top: 14px; color: #92291f; font-weight: 600; }
 
 @media (max-width: 760px) {
   .topbar { align-items: flex-start; padding: 12px 14px; }
   .topbar-actions { flex-wrap: wrap; justify-content: flex-end; }
   .backup-heading { align-items: flex-start; flex-direction: column; }
   .instance-grid { grid-template-columns: 1fr; }
+  .archive-preview-body { min-height: 0; grid-template-columns: 1fr; }
+  .archive-player-panel video { min-height: 220px; aspect-ratio: 16 / 9; }
+  .archive-segments-panel { max-height: 360px; border-left: 0; border-top: 1px solid #d8ddd9; }
+  .reset-danger-zone { align-items: flex-start; flex-direction: column; }
 }
 .segment-detail-dialog { width: min(1080px, calc(100vw - 28px)); }
 .segment-detail-body { max-height: min(68vh, 720px); padding: 18px 20px 22px; overflow-y: auto; }

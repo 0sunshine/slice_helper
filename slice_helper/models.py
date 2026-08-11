@@ -161,6 +161,15 @@ class ISliceInstanceUpsert(BaseModel):
         return normalized
 
 
+class SystemResetExecute(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    request_id: str = Field(alias="requestId", pattern=r"^[0-9a-f]{32}$")
+    confirmation_text: str = Field(alias="confirmationText", min_length=8, max_length=100)
+    receipts: list[dict[str, object]] = Field(min_length=1, max_length=100)
+    acknowledge_media_handling: bool = Field(alias="acknowledgeMediaHandling")
+
+
 class TimeReferenceUpdate(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 

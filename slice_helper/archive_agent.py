@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import shutil
 import sqlite3
@@ -31,6 +32,9 @@ except ImportError:  # pragma: no cover - the deployed agent runs on Linux
 logger = logging.getLogger("islice-archiver")
 TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+RESET_REQUEST_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+RESET_NONCE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,128}$")
+RESET_PROOF_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,128}$")
 MEDIA_DIRS = ("segments", "covers")
 DELETE_DIRS = ("video", "temp", "output")
 
@@ -94,6 +98,7 @@ class ArchiveConfig:
     max_tasks_per_run: int = 4
     command_timeout_seconds: float = 21600.0
     http_timeout_seconds: float = 30.0
+    reset_backup_root: Path = Path("/var/lib/islice-archiver/reset-backups")
 
     @classmethod
     def from_file(cls, path: Path) -> "ArchiveConfig":
@@ -129,6 +134,12 @@ class ArchiveConfig:
             max_tasks_per_run=section.getint("max_tasks_per_run", 4),
             command_timeout_seconds=section.getfloat("command_timeout_seconds", 21600.0),
             http_timeout_seconds=section.getfloat("http_timeout_seconds", 30.0),
+            reset_backup_root=Path(
+                section.get(
+                    "reset_backup_root",
+                    str(Path(required("state_database")).parent / "reset-backups"),
+                )
+            ),
         )
         if config.delete_delay_hours < 0:
             raise ArchiveError("delete_delay_hours must not be negative")
@@ -139,6 +150,8 @@ class ArchiveConfig:
         if not config.remote_http_base.startswith(("http://", "https://")):
             raise ArchiveError("remote_http_base must use HTTP or HTTPS")
         require_source_id(config.source_id)
+        if not config.reset_backup_root.is_absolute():
+            raise ArchiveError("reset_backup_root must be absolute")
         for name, value in (
             ("islice_base_url", config.islice_base_url),
             ("slice_helper_base_url", config.slice_helper_base_url),
@@ -146,6 +159,80 @@ class ArchiveConfig:
             if value and not value.startswith(("http://", "https://")):
                 raise ArchiveError(f"{name} must use HTTP or HTTPS")
         return config
+
+
+def require_reset_request_id(value: str) -> str:
+    if not RESET_REQUEST_PATTERN.fullmatch(value):
+        raise ArchiveError("Reset request ID must be 32 lowercase hexadecimal characters")
+    return value
+
+
+def require_reset_nonce(value: str) -> str:
+    if not RESET_NONCE_PATTERN.fullmatch(value):
+        raise ArchiveError("Reset nonce is invalid")
+    return value
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def backup_sqlite(source: Path, destination: Path) -> None:
+    source = source.resolve()
+    destination = destination.resolve()
+    if not source.is_file():
+        raise ArchiveError(f"SQLite database does not exist: {source}")
+    if source == destination:
+        raise ArchiveError("SQLite backup destination must differ from its source")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".partial")
+    temporary.unlink(missing_ok=True)
+    source_connection: sqlite3.Connection | None = None
+    destination_connection: sqlite3.Connection | None = None
+    try:
+        source_connection = sqlite3.connect(source, timeout=30.0)
+        destination_connection = sqlite3.connect(temporary)
+        source_connection.backup(destination_connection)
+        row = destination_connection.execute("PRAGMA integrity_check").fetchone()
+        if not row or row[0] != "ok":
+            raise ArchiveError(f"SQLite backup integrity check failed: {row}")
+        destination_connection.close()
+        destination_connection = None
+        source_connection.close()
+        source_connection = None
+        os.replace(temporary, destination)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    finally:
+        if destination_connection is not None:
+            destination_connection.close()
+        if source_connection is not None:
+            source_connection.close()
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".partial")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    os.replace(temporary, path)
+
+
+def reset_request_directory(config: ArchiveConfig, request_id: str) -> Path:
+    request_id = require_reset_request_id(request_id)
+    root = config.reset_backup_root.resolve()
+    directory = (root / request_id).resolve()
+    try:
+        directory.relative_to(root)
+    except ValueError as exc:  # pragma: no cover - guarded by the ID pattern
+        raise ArchiveError("Reset request path escaped reset_backup_root") from exc
+    return directory
 
 
 @dataclass(frozen=True, slots=True)
@@ -613,8 +700,23 @@ class StateStore:
     def catalog(self, config: ArchiveConfig) -> dict[str, Any]:
         tasks = self.list()
         revisions = self.revisions()
+
+        def public_archive_url(remote_path: Any) -> str:
+            root = config.remote_root.rstrip("/")
+            path = str(remote_path or "").rstrip("/")
+            if path == root:
+                return config.remote_http_base
+            if not path.startswith(root + "/"):
+                return ""
+            relative = path[len(root) + 1 :]
+            encoded = "/".join(
+                urllib.parse.quote(part, safe="") for part in relative.split("/")
+            )
+            return f"{config.remote_http_base}/{encoded}"
+
         by_task: dict[str, list[dict[str, Any]]] = {}
         for revision in revisions:
+            revision["archive_url"] = public_archive_url(revision.get("remote_path"))
             by_task.setdefault(str(revision["task_id"]), []).append(revision)
         counts: dict[str, int] = {}
         total_bytes = 0
@@ -622,14 +724,16 @@ class StateStore:
             state = str(row["state"])
             counts[state] = counts.get(state, 0) + 1
             total_bytes += int(row.get("total_bytes") or 0)
+            row["archive_url"] = public_archive_url(row.get("remote_path"))
             row["revisions"] = by_task.get(str(row["task_id"]), [])
         return {
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "generatedAt": iso_time(),
             "source": {
                 "id": config.source_id,
                 "name": config.source_name or config.source_id,
                 "isliceBaseUrl": config.islice_base_url,
+                "archiveHttpBase": config.remote_http_base,
             },
             "summary": {
                 "taskCount": len(tasks),
@@ -1186,6 +1290,250 @@ class Archiver:
                 target.unlink()
 
 
+def load_reset_receipt(config: ArchiveConfig, request_id: str) -> tuple[Path, dict[str, Any]]:
+    directory = reset_request_directory(config, request_id)
+    receipt_path = directory / "receipt.json"
+    if not receipt_path.is_file():
+        raise ArchiveError(f"Prepared reset receipt does not exist: {receipt_path}")
+    try:
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ArchiveError(f"Cannot read prepared reset receipt: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ArchiveError("Prepared reset receipt is not a JSON object")
+    return receipt_path, payload
+
+
+def verify_reset_backup(
+    path_value: Any,
+    digest_value: Any,
+    *,
+    expected_path: Path,
+    label: str,
+) -> None:
+    path = Path(str(path_value or ""))
+    if not path.is_absolute() or path.resolve() != expected_path.resolve():
+        raise ArchiveError(f"{label} backup path differs from the prepared request")
+    if not path.is_file():
+        raise ArchiveError(f"{label} backup does not exist: {path}")
+    digest = str(digest_value or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ArchiveError(f"{label} backup digest is invalid")
+    if not secrets.compare_digest(file_sha256(path), digest):
+        raise ArchiveError(f"{label} backup digest verification failed")
+    with sqlite3.connect(path) as connection:
+        row = connection.execute("PRAGMA integrity_check").fetchone()
+    if not row or row[0] != "ok":
+        raise ArchiveError(f"{label} backup integrity check failed: {row}")
+
+
+def prepare_reset(
+    config: ArchiveConfig,
+    *,
+    request_id: str,
+    nonce: str,
+    confirmation: str,
+) -> dict[str, Any]:
+    request_id = require_reset_request_id(request_id)
+    nonce = require_reset_nonce(nonce)
+    expected_confirmation = f"BACKUP {config.source_id} {request_id[:8]}"
+    if not secrets.compare_digest(confirmation, expected_confirmation):
+        raise ArchiveError("prepare-reset confirmation text is incorrect")
+    archiver = Archiver(config)
+    with archiver.lock():
+        archiver.state.initialize()
+        directory = reset_request_directory(config, request_id)
+        receipt_path = directory / "receipt.json"
+        islice_backup = directory / "islice-tasks.db"
+        archive_backup = directory / "archive.db"
+        if receipt_path.exists():
+            _, receipt = load_reset_receipt(config, request_id)
+            if str(receipt.get("nonce") or "") != nonce:
+                raise ArchiveError("Existing reset receipt has a different nonce")
+            if str(receipt.get("sourceId") or "") != config.source_id:
+                raise ArchiveError("Existing reset receipt has a different source ID")
+            verify_reset_backup(
+                receipt.get("isliceDatabaseBackup"),
+                receipt.get("isliceDatabaseSha256"),
+                expected_path=islice_backup,
+                label="iSlice database",
+            )
+            verify_reset_backup(
+                receipt.get("archiveDatabaseBackup"),
+                receipt.get("archiveDatabaseSha256"),
+                expected_path=archive_backup,
+                label="archive database",
+            )
+            return receipt
+        if islice_backup.exists() or archive_backup.exists():
+            raise ArchiveError(
+                "Reset backup files already exist without a receipt; inspect them manually"
+            )
+        backup_sqlite(config.islice_database, islice_backup)
+        backup_sqlite(config.state_database, archive_backup)
+        receipt = {
+            "requestId": request_id,
+            "nonce": nonce,
+            "sourceId": config.source_id,
+            "preparedAt": iso_time(),
+            "status": "prepared",
+            "isliceDatabaseBackup": str(islice_backup),
+            "isliceDatabaseSha256": file_sha256(islice_backup),
+            "archiveDatabaseBackup": str(archive_backup),
+            "archiveDatabaseSha256": file_sha256(archive_backup),
+            "proof": secrets.token_urlsafe(32),
+            "mediaDirectoriesBackedUp": False,
+        }
+        write_json_atomic(receipt_path, receipt)
+        return receipt
+
+
+def clear_islice_tasks(database: Path) -> None:
+    with sqlite3.connect(database, timeout=30.0) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("BEGIN IMMEDIATE")
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'"
+        ).fetchone()
+        if table is None:
+            raise ArchiveError("iSlice database has no tasks table")
+        connection.execute("DELETE FROM tasks")
+        sequence = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'"
+        ).fetchone()
+        if sequence is not None:
+            connection.execute("DELETE FROM sqlite_sequence WHERE name='tasks'")
+        row = connection.execute("PRAGMA integrity_check").fetchone()
+        if not row or row[0] != "ok":
+            raise ArchiveError(f"iSlice database integrity check failed after reset: {row}")
+
+
+def clear_archive_state(database: Path) -> None:
+    with sqlite3.connect(database, timeout=30.0) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("BEGIN IMMEDIATE")
+        for table in ("archive_events", "archive_revisions", "archives"):
+            exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if exists is None:
+                raise ArchiveError(f"Archive database has no {table} table")
+            connection.execute(f"DELETE FROM {table}")
+        sequence = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'"
+        ).fetchone()
+        if sequence is not None:
+            connection.execute(
+                "DELETE FROM sqlite_sequence WHERE name IN ('archive_events')"
+            )
+        row = connection.execute("PRAGMA integrity_check").fetchone()
+        if not row or row[0] != "ok":
+            raise ArchiveError(f"Archive database integrity check failed after reset: {row}")
+
+
+def publish_empty_catalog(
+    config: ArchiveConfig,
+    state: StateStore,
+    remote: Any | None = None,
+) -> None:
+    payload = state.catalog(config)
+    path = config.manifest_root / "catalog.json"
+    write_json_atomic(path, payload)
+    (remote or RemoteArchive(config)).publish_catalog(path)
+
+
+def commit_reset(
+    config: ArchiveConfig,
+    *,
+    request_id: str,
+    proof: str,
+    confirmation: str,
+    services_stopped: bool,
+    remote: Any | None = None,
+) -> dict[str, Any]:
+    request_id = require_reset_request_id(request_id)
+    if not services_stopped:
+        raise ArchiveError("commit-reset requires --services-stopped")
+    if not RESET_PROOF_PATTERN.fullmatch(proof):
+        raise ArchiveError("Reset proof is invalid")
+    expected_confirmation = f"RESET {config.source_id} {request_id[:8]}"
+    if not secrets.compare_digest(confirmation, expected_confirmation):
+        raise ArchiveError("commit-reset confirmation text is incorrect")
+    archiver = Archiver(config, remote=remote)
+    with archiver.lock():
+        archiver.state.initialize()
+        receipt_path, receipt = load_reset_receipt(config, request_id)
+        if str(receipt.get("requestId") or "") != request_id:
+            raise ArchiveError("Prepared reset receipt has a different request ID")
+        if str(receipt.get("sourceId") or "") != config.source_id:
+            raise ArchiveError("Prepared reset receipt has a different source ID")
+        if not secrets.compare_digest(str(receipt.get("proof") or ""), proof):
+            raise ArchiveError("Reset proof does not match the prepared receipt")
+        directory = reset_request_directory(config, request_id)
+        verify_reset_backup(
+            receipt.get("isliceDatabaseBackup"),
+            receipt.get("isliceDatabaseSha256"),
+            expected_path=directory / "islice-tasks.db",
+            label="iSlice database",
+        )
+        verify_reset_backup(
+            receipt.get("archiveDatabaseBackup"),
+            receipt.get("archiveDatabaseSha256"),
+            expected_path=directory / "archive.db",
+            label="archive database",
+        )
+        if receipt.get("status") == "committed":
+            return receipt
+        if receipt.get("status") not in {"prepared", "commit_ready"}:
+            raise ArchiveError("Prepared reset receipt has an invalid status")
+
+        final_islice = directory / "islice-tasks-final.db"
+        final_archive = directory / "archive-final.db"
+        if receipt.get("status") == "prepared":
+            if final_islice.exists() or final_archive.exists():
+                raise ArchiveError(
+                    "Final reset backups exist without a commit-ready receipt; inspect manually"
+                )
+            backup_sqlite(config.islice_database, final_islice)
+            backup_sqlite(config.state_database, final_archive)
+            receipt.update(
+                {
+                    "status": "commit_ready",
+                    "commitPreparedAt": iso_time(),
+                    "finalIsliceDatabaseBackup": str(final_islice),
+                    "finalIsliceDatabaseSha256": file_sha256(final_islice),
+                    "finalArchiveDatabaseBackup": str(final_archive),
+                    "finalArchiveDatabaseSha256": file_sha256(final_archive),
+                }
+            )
+            write_json_atomic(receipt_path, receipt)
+        verify_reset_backup(
+            receipt.get("finalIsliceDatabaseBackup"),
+            receipt.get("finalIsliceDatabaseSha256"),
+            expected_path=final_islice,
+            label="final iSlice database",
+        )
+        verify_reset_backup(
+            receipt.get("finalArchiveDatabaseBackup"),
+            receipt.get("finalArchiveDatabaseSha256"),
+            expected_path=final_archive,
+            label="final archive database",
+        )
+
+        clear_islice_tasks(config.islice_database)
+        clear_archive_state(config.state_database)
+        publish_empty_catalog(config, archiver.state, remote=archiver.remote)
+        receipt.update(
+            {
+                "status": "committed",
+                "committedAt": iso_time(),
+                "mediaDirectoriesTouched": False,
+            }
+        )
+        write_json_atomic(receipt_path, receipt)
+        return receipt
+
+
 def configure_logging(verbose: bool) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -1203,11 +1551,47 @@ def main(argv: Sequence[str] | None = None) -> int:
     status_parser.add_argument("--json", action="store_true")
     retry_parser = commands.add_parser("retry")
     retry_parser.add_argument("task_id")
+    prepare_parser = commands.add_parser(
+        "prepare-reset", help="back up databases and issue a reset receipt"
+    )
+    prepare_parser.add_argument("--request-id", required=True)
+    prepare_parser.add_argument("--nonce", required=True)
+    prepare_parser.add_argument("--confirm", required=True)
+    prepare_parser.add_argument("--json", action="store_true")
+    commit_parser = commands.add_parser(
+        "commit-reset", help="clear database state after a prepared reset"
+    )
+    commit_parser.add_argument("--request-id", required=True)
+    commit_parser.add_argument("--proof", required=True)
+    commit_parser.add_argument("--confirm", required=True)
+    commit_parser.add_argument("--services-stopped", action="store_true")
     args = parser.parse_args(argv)
     configure_logging(args.verbose)
 
     try:
         config = ArchiveConfig.from_file(args.config)
+        if args.command == "prepare-reset":
+            receipt = prepare_reset(
+                config,
+                request_id=args.request_id,
+                nonce=args.nonce,
+                confirmation=args.confirm,
+            )
+            if args.json:
+                print(json.dumps(receipt, ensure_ascii=False))
+            else:
+                print(json.dumps(receipt, ensure_ascii=False, indent=2))
+            return 0
+        if args.command == "commit-reset":
+            receipt = commit_reset(
+                config,
+                request_id=args.request_id,
+                proof=args.proof,
+                confirmation=args.confirm,
+                services_stopped=args.services_stopped,
+            )
+            print(json.dumps(receipt, ensure_ascii=False, indent=2))
+            return 0
         state = StateStore(config.state_database, config.source_id)
         state.initialize()
         if args.command == "run-once":
@@ -1225,7 +1609,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         f"{row['total_bytes']} bytes\t{row['error_message']}"
                     )
         return 0
-    except ArchiveError as exc:
+    except (ArchiveError, OSError, sqlite3.Error) as exc:
         logger.error("%s", exc)
         return 1
 

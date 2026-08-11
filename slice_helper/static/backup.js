@@ -1,4 +1,8 @@
-const state = { instances: [], channels: [], page: 1, totalPages: 1 };
+const state = {
+  instances: [], channels: [], page: 1, totalPages: 1,
+  archiveItems: [], archivePreviewItem: null, archivePreviewSegments: [],
+  resetPreview: null, resetExecuting: false,
+};
 
 const $ = (id) => document.getElementById(id);
 const escapeHtml = (value) => String(value ?? "")
@@ -120,9 +124,10 @@ function renderSources(sources) {
 function renderTasks(payload) {
   state.page = payload.page;
   state.totalPages = payload.totalPages;
+  state.archiveItems = payload.items;
   $("backupCount").textContent = payload.total;
   $("emptyBackups").hidden = payload.items.length > 0;
-  $("backupBody").innerHTML = payload.items.map((item) => {
+  $("backupBody").innerHTML = payload.items.map((item, itemIndex) => {
     const context = item.context || {};
     const revisions = item.revisions || [];
     const detail = item.error_message || warnings(item.warnings_json).join("；") || "—";
@@ -136,6 +141,7 @@ function renderTasks(payload) {
       <td>${item.file_count || 0}</td><td>${bytes(item.total_bytes)}</td>
       <td>${dateTime(item.archived_at)}<small class="table-subtext">删除：${dateTime(item.deleted_at || item.delete_after)}</small></td>
       <td class="backup-detail-cell" title="${escapeHtml(detail)}">${escapeHtml(detail)}</td>
+      <td><button class="button secondary small preview-archive" data-index="${itemIndex}" type="button">预览</button></td>
     </tr>`;
   }).join("");
   $("backupPageSummary").textContent = `共 ${payload.total} 条`;
@@ -143,6 +149,112 @@ function renderTasks(payload) {
   $("previousBackupPage").disabled = payload.page <= 1;
   $("nextBackupPage").disabled = payload.page >= payload.totalPages;
   renderSources(payload.sources);
+}
+
+function archiveTime(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds)) return "—";
+  const whole = Math.max(0, Math.round(seconds));
+  const hours = Math.floor(whole / 3600);
+  const minutes = Math.floor((whole % 3600) / 60);
+  const remain = whole % 60;
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(remain).padStart(2, "0")}`;
+}
+
+function resetArchivePlayer(message = "正在读取归档结果…") {
+  const video = $("archivePreviewVideo");
+  video.pause();
+  video.removeAttribute("src");
+  video.removeAttribute("poster");
+  video.load();
+  $("archiveSegmentTitle").textContent = "请选择右侧片段";
+  $("archiveSegmentTime").textContent = "";
+  $("archivePreviewStatus").textContent = message;
+  $("openArchiveVideo").hidden = true;
+  $("openArchiveVideo").removeAttribute("href");
+}
+
+function selectArchiveSegment(index, autoplay = false) {
+  const segment = state.archivePreviewSegments[index];
+  if (!segment) return;
+  const video = $("archivePreviewVideo");
+  document.querySelectorAll(".archive-segment-item").forEach((item) => {
+    item.classList.toggle("is-active", Number(item.dataset.index) === index);
+  });
+  $("archiveSegmentTitle").textContent = segment.title || segment.topic || `片段 ${index + 1}`;
+  $("archiveSegmentTime").textContent = `${archiveTime(segment.startTime)} — ${archiveTime(segment.endTime)}`;
+  if (!segment.segmentUrl) {
+    resetArchivePlayer("该片段没有可用的归档视频文件");
+    $("archiveSegmentTitle").textContent = segment.title || segment.topic || `片段 ${index + 1}`;
+    $("archiveSegmentTime").textContent = `${archiveTime(segment.startTime)} — ${archiveTime(segment.endTime)}`;
+    return;
+  }
+  video.src = segment.segmentUrl;
+  if (segment.coverImgUrl) video.poster = segment.coverImgUrl;
+  else video.removeAttribute("poster");
+  video.load();
+  $("archivePreviewStatus").textContent = "视频来自远端归档存储";
+  $("openArchiveVideo").href = segment.segmentUrl;
+  $("openArchiveVideo").hidden = false;
+  if (autoplay) video.play().catch(() => {});
+}
+
+function renderArchiveSegments(payload) {
+  state.archivePreviewSegments = payload.segments || [];
+  $("archiveSegmentList").innerHTML = state.archivePreviewSegments.length
+    ? state.archivePreviewSegments.map((segment, index) => `
+      <button class="archive-segment-item ${segment.segmentUrl ? "" : "is-unavailable"}" data-index="${index}" type="button">
+        <span>${index + 1}</span>
+        <strong>${escapeHtml(segment.title || segment.topic || `片段 ${index + 1}`)}</strong>
+        <small class="mono">${archiveTime(segment.startTime)} — ${archiveTime(segment.endTime)}</small>
+      </button>`).join("")
+    : '<div class="empty-state">归档结果中没有片段</div>';
+  const warnings = payload.warnings || [];
+  $("archivePreviewWarnings").hidden = warnings.length === 0;
+  $("archivePreviewWarnings").innerHTML = warnings.map((warning) => `<p>${escapeHtml(warning)}</p>`).join("");
+  if (state.archivePreviewSegments.length) selectArchiveSegment(0, false);
+  else resetArchivePlayer("归档结果中没有可预览片段");
+}
+
+async function loadArchivePreview(revisionDigest = "") {
+  const item = state.archivePreviewItem;
+  if (!item) return;
+  resetArchivePlayer();
+  $("archiveSegmentList").innerHTML = '<div class="empty-state">正在加载归档片段…</div>';
+  $("archivePreviewWarnings").hidden = true;
+  const params = new URLSearchParams();
+  if (revisionDigest) params.set("revisionDigest", revisionDigest);
+  const query = params.toString();
+  const suffix = query ? `?${query}` : "";
+  try {
+    const payload = await request(`/api/archive/tasks/${encodeURIComponent(item.source_id)}/${encodeURIComponent(item.task_id)}/preview${suffix}`);
+    renderArchiveSegments(payload);
+  } catch (error) {
+    state.archivePreviewSegments = [];
+    resetArchivePlayer(error.message);
+    $("archiveSegmentList").innerHTML = `<div class="empty-state error-text">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function openArchivePreview(item) {
+  state.archivePreviewItem = item;
+  state.archivePreviewSegments = [];
+  $("archivePreviewTitle").textContent = item.context?.channel_name || item.task_id;
+  $("archivePreviewSource").textContent = `${item.source_name} · ${item.task_id}`;
+  const revisions = (item.revisions || []).filter((revision) => revision.manifest_digest);
+  $("archiveRevision").innerHTML = '<option value="">当前归档版本</option>' + revisions
+    .map((revision) => `<option value="${escapeHtml(revision.manifest_digest)}">${escapeHtml(revision.state || "历史版本")} · ${escapeHtml(revision.manifest_digest.slice(0, 12))}</option>`)
+    .join("");
+  $("archiveRevisionField").hidden = revisions.length < 2;
+  $("archivePreviewDialog").showModal();
+  loadArchivePreview();
+}
+
+function closeArchivePreview() {
+  resetArchivePlayer("");
+  state.archivePreviewItem = null;
+  state.archivePreviewSegments = [];
+  $("archivePreviewDialog").close();
 }
 
 async function loadBackups() {
@@ -153,6 +265,122 @@ async function loadBackups() {
   if ($("backupState").value) params.set("state", $("backupState").value);
   if ($("backupQuery").value.trim()) params.set("query", $("backupQuery").value.trim());
   renderTasks(await request(`/api/archive/status?${params}`));
+}
+
+const resetCountLabels = {
+  channels: "频道", jobs: "作业", windows: "窗口", attempts: "iSlice 尝试",
+  segments: "拆条片段", segment_merges: "人工合并", segment_merge_members: "合并成员",
+  job_rebuilds: "重建记录",
+};
+
+function resetCommandCard(item) {
+  return `<article class="reset-command-card">
+    <div><strong>${escapeHtml(item.sourceId)}</strong><button class="button secondary small copy-reset-command" type="button">复制</button></div>
+    <code>${escapeHtml(item.command)}</code>
+  </article>`;
+}
+
+function renderResetPreview(preview) {
+  state.resetPreview = preview;
+  $("resetExpiry").textContent = `请求有效期至 ${dateTime(preview.expiresAt)}`;
+  $("resetCounts").innerHTML = Object.entries(preview.counts || {})
+    .map(([key, value]) => `<div><span>${escapeHtml(resetCountLabels[key] || key)}</span><strong>${Number(value || 0)}</strong></div>`)
+    .join("");
+  $("resetPrepareCommands").innerHTML = preview.sources.map(resetCommandCard).join("");
+  $("resetConfirmationHint").textContent = preview.confirmationText;
+  $("resetReceipts").value = "";
+  $("resetConfirmation").value = "";
+  $("resetMediaAck").checked = false;
+  $("resetError").hidden = true;
+  $("resetPreparePhase").hidden = false;
+  $("resetResultPhase").hidden = true;
+  $("executeSystemReset").hidden = false;
+  $("finishSystemReset").hidden = true;
+  $("cancelSystemReset").textContent = "取消";
+}
+
+function parseResetReceipts(value) {
+  const text = value.trim();
+  if (!text) throw new Error("请粘贴所有 iSlice 主机的备份回执");
+  try {
+    const parsed = JSON.parse(text);
+    const receipts = Array.isArray(parsed) ? parsed : [parsed];
+    if (!receipts.length || receipts.some((item) => !item || typeof item !== "object" || Array.isArray(item))) {
+      throw new Error("回执必须是 JSON 对象");
+    }
+    return receipts;
+  } catch (wholeError) {
+    const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (lines.length < 2) throw wholeError;
+    return lines.map((line, index) => {
+      try {
+        const parsed = JSON.parse(line);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
+        return parsed;
+      } catch (_) {
+        throw new Error(`第 ${index + 1} 行不是有效的 JSON 回执`);
+      }
+    });
+  }
+}
+
+async function startSystemReset() {
+  const button = $("startSystemReset");
+  button.disabled = true;
+  try {
+    const preview = await request("/api/system-reset/preview", { method: "POST" });
+    renderResetPreview(preview);
+    $("resetDialog").showModal();
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function executeSystemReset() {
+  const errorNode = $("resetError");
+  errorNode.hidden = true;
+  try {
+    if (!state.resetPreview) throw new Error("重置请求不存在，请重新生成");
+    if (!$("resetMediaAck").checked) throw new Error("必须确认媒体目录由用户自行处理");
+    if ($("resetConfirmation").value !== state.resetPreview.confirmationText) {
+      throw new Error("二次确认短语不正确");
+    }
+    const receipts = parseResetReceipts($("resetReceipts").value);
+    state.resetExecuting = true;
+    $("executeSystemReset").disabled = true;
+    $("cancelSystemReset").disabled = true;
+    const result = await request("/api/system-reset/execute", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        requestId: state.resetPreview.requestId,
+        confirmationText: $("resetConfirmation").value,
+        receipts,
+        acknowledgeMediaHandling: true,
+      }),
+    });
+    $("resetPreparePhase").hidden = true;
+    $("resetResultPhase").hidden = false;
+    $("resetHelperBackup").textContent = result.helperBackup.databaseBackup;
+    $("resetHelperSha").textContent = result.helperBackup.sha256;
+    $("resetCommitCommands").innerHTML = result.commitCommands.map(resetCommandCard).join("");
+    $("executeSystemReset").hidden = true;
+    $("finishSystemReset").hidden = false;
+    $("cancelSystemReset").hidden = true;
+    await Promise.all([loadInstances(), loadChannels()]);
+    state.page = 1;
+    await loadBackups();
+    toast("helper 已完成备份和状态重置；尚未执行各 iSlice 的 commit-reset");
+  } catch (error) {
+    errorNode.textContent = error.message;
+    errorNode.hidden = false;
+  } finally {
+    state.resetExecuting = false;
+    $("executeSystemReset").disabled = false;
+    $("cancelSystemReset").disabled = false;
+  }
 }
 
 function openInstance(item = null) {
@@ -204,6 +432,31 @@ $("backupState").addEventListener("change", () => { state.page = 1; loadBackups(
 $("backupQuery").addEventListener("input", () => { clearTimeout(state.queryTimer); state.queryTimer = setTimeout(() => { state.page = 1; loadBackups(); }, 300); });
 $("previousBackupPage").addEventListener("click", () => { state.page -= 1; loadBackups(); });
 $("nextBackupPage").addEventListener("click", () => { state.page += 1; loadBackups(); });
+$("backupBody").addEventListener("click", (event) => {
+  const button = event.target.closest(".preview-archive");
+  if (button) openArchivePreview(state.archiveItems[Number(button.dataset.index)]);
+});
+$("archiveRevision").addEventListener("change", () => loadArchivePreview($("archiveRevision").value));
+$("archiveSegmentList").addEventListener("click", (event) => {
+  const item = event.target.closest(".archive-segment-item");
+  if (item) selectArchiveSegment(Number(item.dataset.index), true);
+});
+$("closeArchivePreview").addEventListener("click", closeArchivePreview);
+$("finishArchivePreview").addEventListener("click", closeArchivePreview);
+$("archivePreviewDialog").addEventListener("cancel", (event) => { event.preventDefault(); closeArchivePreview(); });
+$("startSystemReset").addEventListener("click", startSystemReset);
+$("executeSystemReset").addEventListener("click", executeSystemReset);
+$("closeResetDialog").addEventListener("click", () => { if (!state.resetExecuting) $("resetDialog").close(); });
+$("cancelSystemReset").addEventListener("click", () => $("resetDialog").close());
+$("finishSystemReset").addEventListener("click", () => $("resetDialog").close());
+$("resetDialog").addEventListener("cancel", (event) => { if (state.resetExecuting) event.preventDefault(); });
+$("resetDialog").addEventListener("click", async (event) => {
+  const button = event.target.closest(".copy-reset-command");
+  if (!button) return;
+  const command = button.closest(".reset-command-card").querySelector("code").textContent;
+  try { await navigator.clipboard.writeText(command); toast("命令已复制"); }
+  catch (_) { toast("浏览器未允许访问剪贴板，请手工复制", true); }
+});
 
 Promise.all([loadInstances(), loadChannels()])
   .then(loadBackups)

@@ -54,10 +54,28 @@ helper 不限制每台 iSlice 已绑定的长文件作业总数；新作业优�
 - 新作业只分配给允许调度的实例；作业一旦绑定，全部窗口、恢复和重试都继续使用原实例，关闭调度不会迁移历史作业
 - 已产生作业的实例不能修改 API 地址或 `sourceId`，防止归档命名空间与任务来源错配；名称、catalog 地址和调度开关仍可修改
 - 备份页按来源、状态和关键字筛选，逐个 task ID 显示归档状态、版本数、文件数、容量、清理时间和失败原因
+- 每个备份任务可直接预览。页面从远端归档读取 `segments.json`，把原 iSlice 媒体地址安全改写为归档 HTTP 地址，并在弹窗中播放视频；新版 catalog 同时支持选择重新拆条产生的历史归档版本
 - 多台 iSlice 的归档必须使用不同 `sourceId`，远端目录为 `archive/sources/{sourceId}`；相同 task ID 在不同来源之间互不冲突
 - 重新拆条产生新内容时，归档代理先完整上传并校验新 Digest。只有 helper 当前引用已属于新版本时，旧 `tasks/{taskId}` 才原子改名到 `history/{taskId}/{oldDigest}`，新版本再占用原 task ID；冲突时新版本只存入 history，旧发布版本和本地文件均保留
 
 归档代理和 Nginx 的部署文件位于 `deploy/archive-agent/` 与 `deploy/nginx/`。该功能不调用 iSlice 重新拆条，也不修改 iSlice 业务代码。
+
+## 系统重置
+
+“iSlice 与备份”页面底部提供系统重置入口。它采用两阶段人工确认，管理系统不会保存 iSlice 主机 SSH 密码，也不会远程执行清理命令：
+
+1. 所有运行中、排队中作业停止后，点击“生成重置备份指令”。请求和确认短语有效 15 分钟。
+2. 在页面列出的每台 iSlice 主机执行 `prepare-reset`。代理对 iSlice `tasks.db` 和自身 `archive.db` 做 SQLite 在线备份、完整性检查和 SHA-256 校验，只输出 JSON 回执，不清理任何数据。
+3. 把全部回执粘贴回页面，勾选“媒体目录由用户自行处理”，并原样输入二次确认短语。
+4. helper 再在线备份 `data/slice_helper.db`，随后清空作业、窗口、拆条结果和频道；iSlice 实例配置保留，但全部关闭调度。
+5. 页面仅显示每台主机的 `commit-reset` 命令。人工停止 iSlice 服务和 `islice-archiver.timer` 后再执行；代理在清库前还会生成一份最终数据库快照，然后只清空 iSlice `tasks` 表、归档状态库并发布空 catalog。
+
+重置功能永远不会备份、删除或移动 iSlice storage、远端归档视频、原始 TS、helper 的 `data/jobs` 与 `temp` 媒体文件。上述目录必须由用户另行确认和处理。数据库快照分别保存在 helper 的 `data/reset-backups/{requestId}/` 和每台代理配置的 `reset_backup_root/{requestId}/`。出现任何回执缺失、哈希格式异常、确认短语错误、作业仍活动或备份完整性失败时，重置会拒绝继续。
+
+重置接口为：
+
+- `POST /api/system-reset/preview`
+- `POST /api/system-reset/execute`
 
 ## 启动
 

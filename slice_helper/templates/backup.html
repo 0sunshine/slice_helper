@@ -49,7 +49,7 @@
       <div class="archive-summary" id="archiveSummary"></div>
       <div class="table-scroll">
         <table class="data-table backup-table">
-          <thead><tr><th>来源</th><th>频道/业务日期</th><th>窗口</th><th>task ID</th><th>状态</th><th>版本</th><th>文件</th><th>容量</th><th>归档/删除时间</th><th>说明</th></tr></thead>
+          <thead><tr><th>来源</th><th>频道/业务日期</th><th>窗口</th><th>task ID</th><th>状态</th><th>版本</th><th>文件</th><th>容量</th><th>归档/删除时间</th><th>说明</th><th>预览</th></tr></thead>
           <tbody id="backupBody"></tbody>
         </table>
       </div>
@@ -60,6 +60,15 @@
         <span id="backupPageInfo">1 / 1</span>
         <button id="nextBackupPage" class="icon-button pagination-button" type="button">&rsaquo;</button>
       </div>
+    </section>
+
+    <section class="band reset-danger-zone">
+      <div>
+        <h2>系统重置</h2>
+        <p>清空 slice_helper、iSlice 与归档代理的业务状态，保留 iSlice 实例配置并关闭调度。</p>
+        <strong>媒体目录不会被备份或删除，必须由用户自行处理。</strong>
+      </div>
+      <button id="startSystemReset" class="button danger" type="button">生成重置备份指令</button>
     </section>
   </main>
 
@@ -77,6 +86,75 @@
       <p class="muted instance-help">关闭调度只影响后续新作业；已经绑定到该实例的作业不会迁移。</p>
       <div class="dialog-actions"><button id="cancelInstance" class="button secondary" type="button">取消</button><button class="button primary" type="submit">保存</button></div>
     </form>
+  </dialog>
+
+  <dialog id="archivePreviewDialog" class="archive-preview-dialog">
+    <div class="dialog-header">
+      <div><h2 id="archivePreviewTitle">归档任务预览</h2><small id="archivePreviewSource" class="muted mono"></small></div>
+      <button id="closeArchivePreview" class="icon-button" type="button">×</button>
+    </div>
+    <div class="archive-preview-body">
+      <section class="archive-player-panel">
+        <video id="archivePreviewVideo" controls preload="metadata"></video>
+        <div class="archive-player-info">
+          <strong id="archiveSegmentTitle">请选择右侧片段</strong>
+          <span id="archiveSegmentTime" class="mono"></span>
+          <span id="archivePreviewStatus" class="muted">正在读取归档结果…</span>
+        </div>
+      </section>
+      <section class="archive-segments-panel">
+        <label id="archiveRevisionField" class="filter-label">归档版本
+          <select id="archiveRevision"></select>
+        </label>
+        <div id="archiveSegmentList" class="archive-segment-list"></div>
+      </section>
+    </div>
+    <div id="archivePreviewWarnings" class="archive-preview-warnings" hidden></div>
+    <div class="dialog-actions">
+      <a id="openArchiveVideo" class="button secondary button-link" href="#" target="_blank" rel="noopener" hidden>新窗口打开视频</a>
+      <button id="finishArchivePreview" class="button primary" type="button">关闭</button>
+    </div>
+  </dialog>
+
+  <dialog id="resetDialog" class="reset-dialog">
+    <div class="dialog-header">
+      <div><h2>系统重置二次验证</h2><small id="resetExpiry" class="muted"></small></div>
+      <button id="closeResetDialog" class="icon-button" type="button">×</button>
+    </div>
+    <div id="resetPreparePhase" class="reset-dialog-body">
+      <div class="reset-warning">
+        <strong>此操作会清空数据库中的作业、拆条结果、频道和归档状态。</strong>
+        <p>只备份数据库；不备份、不删除 iSlice storage、远端归档视频、原始 TS 或临时媒体目录。</p>
+      </div>
+      <h3>将清空的数据</h3>
+      <div id="resetCounts" class="reset-counts"></div>
+      <h3>第一步：在每台 iSlice 主机准备数据库备份</h3>
+      <p class="muted">逐台执行下列命令，把每条命令输出的单行 JSON 全部粘贴到回执框。prepare-reset 只备份，不清理。</p>
+      <div id="resetPrepareCommands" class="reset-command-list"></div>
+      <label class="reset-field">备份回执（JSON 数组，或每行一个 JSON）
+        <textarea id="resetReceipts" rows="7" spellcheck="false" placeholder='{"requestId":"...","sourceId":"..."}'></textarea>
+      </label>
+      <label class="checkbox-label reset-ack"><input id="resetMediaAck" type="checkbox">我确认媒体目录由我自行备份、保留或清理，系统不会处理媒体文件</label>
+      <label class="reset-field">输入二次确认短语 <strong id="resetConfirmationHint" class="mono"></strong>
+        <input id="resetConfirmation" autocomplete="off" spellcheck="false">
+      </label>
+      <p id="resetError" class="form-error" hidden></p>
+    </div>
+    <div id="resetResultPhase" class="reset-dialog-body" hidden>
+      <div class="reset-success"><strong>slice_helper 数据库已备份并完成状态重置。</strong><p>下面的命令不会自动执行。请先逐台停止 iSlice 和归档定时器，再人工执行。</p></div>
+      <dl class="reset-backup-result">
+        <div><dt>helper 备份</dt><dd id="resetHelperBackup" class="mono"></dd></div>
+        <div><dt>SHA-256</dt><dd id="resetHelperSha" class="mono"></dd></div>
+      </dl>
+      <h3>第二步：停止服务后提交各 iSlice 重置</h3>
+      <div id="resetCommitCommands" class="reset-command-list"></div>
+      <p class="reset-warning-text">commit-reset 只清空 iSlice tasks 表和归档代理状态库，并发布空 catalog；所有媒体目录仍保持原样。</p>
+    </div>
+    <div class="dialog-actions">
+      <button id="cancelSystemReset" class="button secondary" type="button">取消</button>
+      <button id="executeSystemReset" class="button danger" type="button">备份并重置 helper</button>
+      <button id="finishSystemReset" class="button primary" type="button" hidden>完成</button>
+    </div>
   </dialog>
 
   <div id="toast" class="toast" hidden></div>

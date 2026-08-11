@@ -130,6 +130,19 @@ class Database:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS system_reset_requests (
+                    id TEXT PRIMARY KEY,
+                    nonce TEXT NOT NULL,
+                    confirmation_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    preview_json TEXT NOT NULL,
+                    receipts_json TEXT NOT NULL DEFAULT '[]',
+                    helper_backup_path TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    executed_at TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY,
                     source_path TEXT NOT NULL,
@@ -559,6 +572,10 @@ class Database:
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(19, ?)",
                 (utc_now(),),
             )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(20, ?)",
+                (utc_now(),),
+            )
             await db.commit()
 
     @staticmethod
@@ -609,6 +626,156 @@ class Database:
                     ),
                 )
             await db.commit()
+
+    async def reset_preview_counts(self) -> dict[str, Any]:
+        async with self.connect() as db:
+            counts: dict[str, int] = {}
+            for table in (
+                "channels",
+                "jobs",
+                "windows",
+                "attempts",
+                "segments",
+                "segment_merges",
+                "segment_merge_members",
+                "job_rebuilds",
+            ):
+                row = await (
+                    await db.execute(f"SELECT COUNT(*) AS value FROM {table}")
+                ).fetchone()
+                counts[table] = int(row["value"])
+            active_rows = await (
+                await db.execute(
+                    """
+                    SELECT id,status,channel_name,broadcast_date FROM jobs
+                    WHERE status IN (
+                        'pending_schedule','queued','probing','running',
+                        'pause_requested','stop_requested'
+                    ) AND superseded_at IS NULL
+                    ORDER BY created_at,id
+                    """
+                )
+            ).fetchall()
+        return {"counts": counts, "active_jobs": [dict(row) for row in active_rows]}
+
+    async def create_system_reset_request(
+        self,
+        *,
+        request_id: str,
+        nonce: str,
+        confirmation_hash: str,
+        expires_at: str,
+        preview: dict[str, Any],
+    ) -> None:
+        now = utc_now()
+        async with self.connect() as db:
+            await db.execute(
+                "UPDATE system_reset_requests SET status='expired' "
+                "WHERE status='prepared' AND expires_at<=?",
+                (now,),
+            )
+            await db.execute(
+                """
+                INSERT INTO system_reset_requests(
+                    id,nonce,confirmation_hash,status,expires_at,preview_json,created_at
+                ) VALUES(?,?,?,'prepared',?,?,?)
+                """,
+                (
+                    request_id,
+                    nonce,
+                    confirmation_hash,
+                    expires_at,
+                    json.dumps(preview, ensure_ascii=False),
+                    now,
+                ),
+            )
+            await db.commit()
+
+    async def get_system_reset_request(self, request_id: str) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            row = await (
+                await db.execute(
+                    "SELECT * FROM system_reset_requests WHERE id=?", (request_id,)
+                )
+            ).fetchone()
+        return self._row(row)
+
+    async def reset_operational_data(
+        self,
+        *,
+        request_id: str,
+        receipts: list[dict[str, Any]],
+        helper_backup_path: str,
+    ) -> dict[str, int]:
+        now = utc_now()
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            request_row = await (
+                await db.execute(
+                    "SELECT status,expires_at FROM system_reset_requests WHERE id=?",
+                    (request_id,),
+                )
+            ).fetchone()
+            if request_row is None or request_row["status"] != "prepared":
+                await db.rollback()
+                raise ValueError("Reset request is no longer prepared")
+            if str(request_row["expires_at"]) <= now:
+                await db.execute(
+                    "UPDATE system_reset_requests SET status='expired' WHERE id=?",
+                    (request_id,),
+                )
+                await db.commit()
+                raise ValueError("Reset request has expired")
+            active = await (
+                await db.execute(
+                    """
+                    SELECT COUNT(*) AS value FROM jobs
+                    WHERE status IN (
+                        'pending_schedule','queued','probing','running',
+                        'pause_requested','stop_requested'
+                    ) AND superseded_at IS NULL
+                    """
+                )
+            ).fetchone()
+            if int(active["value"]):
+                await db.rollback()
+                raise ValueError("Active jobs exist")
+            counts: dict[str, int] = {}
+            for table in (
+                "channels",
+                "jobs",
+                "windows",
+                "attempts",
+                "segments",
+                "segment_merges",
+                "segment_merge_members",
+                "job_rebuilds",
+            ):
+                count_row = await (
+                    await db.execute(f"SELECT COUNT(*) AS value FROM {table}")
+                ).fetchone()
+                counts[table] = int(count_row["value"])
+            await db.execute("DELETE FROM jobs")
+            await db.execute("DELETE FROM channels")
+            await db.execute("UPDATE islice_instances SET schedulable=0,updated_at=?", (now,))
+            await db.execute(
+                "DELETE FROM sqlite_sequence WHERE name IN ('windows','attempts','segments')"
+            )
+            await db.execute(
+                """
+                UPDATE system_reset_requests
+                SET status='helper_reset',receipts_json=?,helper_backup_path=?,executed_at=?
+                WHERE id=?
+                """,
+                (
+                    json.dumps(receipts, ensure_ascii=False),
+                    helper_backup_path,
+                    now,
+                    request_id,
+                ),
+            )
+            await db.commit()
+        return counts
 
     async def list_islice_instances(self) -> list[dict[str, Any]]:
         async with self.connect() as db:
