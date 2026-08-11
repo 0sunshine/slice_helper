@@ -235,7 +235,7 @@
         <button id="closeWindowRangeResplitButton" class="icon-button" type="button" aria-label="关闭">×</button>
       </div>
       <div class="confirm-dialog-body">
-        <p>系统会依次重新拆条所选连续窗口，并按连续成功块校验边界。成功且边界兼容的窗口会覆盖正式结果。</p>
+        <p>系统会依次重新拆条所选连续窗口。全部候选结果成功并通过边界校验后，才会一次性替换正式结果。</p>
         <dl>
           <div><dt>频道 / 日期</dt><dd id="rangeResplitChannelDate"></dd></div>
           <div><dt>窗口范围</dt><dd id="rangeResplitWindows"></dd></div>
@@ -248,7 +248,7 @@
           <summary>查看原任务 ID</summary>
           <pre id="rangeResplitTaskIds" class="range-task-ids"></pre>
         </details>
-        <p class="confirm-warning">失败或边界不兼容的窗口会保留原结果，后续窗口仍会继续处理。部分窗口可能已经覆盖且不可自动撤销，请确认后再操作。</p>
+        <p class="confirm-warning">任一窗口失败，本批次的候选结果全部不采用。处理时间可能较长，请勿在处理期间修改该作业。</p>
         <label class="range-confirm-label">请输入 <strong id="rangeResplitConfirmationHint"></strong> 进行二次确认
           <input id="rangeResplitConfirmationInput" name="confirmationText" autocomplete="off" required>
         </label>

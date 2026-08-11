@@ -85,8 +85,6 @@ class Database:
         "status",
         "current_window_index",
         "completed_window_count",
-        "processed_window_count",
-        "adopted_window_count",
         "snapshot_path",
         "error_message",
         "started_at",
@@ -253,8 +251,6 @@ class Database:
                     status TEXT NOT NULL,
                     current_window_index INTEGER,
                     completed_window_count INTEGER NOT NULL DEFAULT 0,
-                    processed_window_count INTEGER NOT NULL DEFAULT 0,
-                    adopted_window_count INTEGER NOT NULL DEFAULT 0,
                     total_window_count INTEGER NOT NULL,
                     affected_segment_count INTEGER NOT NULL DEFAULT 0,
                     snapshot_path TEXT NOT NULL DEFAULT '',
@@ -530,26 +526,6 @@ class Database:
             )
             await db.execute(
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(16, ?)",
-                (utc_now(),),
-            )
-            batch_columns = {
-                row["name"]
-                for row in await (
-                    await db.execute("PRAGMA table_info(resplit_batches)")
-                ).fetchall()
-            }
-            if "processed_window_count" not in batch_columns:
-                await db.execute(
-                    "ALTER TABLE resplit_batches ADD COLUMN "
-                    "processed_window_count INTEGER NOT NULL DEFAULT 0"
-                )
-            if "adopted_window_count" not in batch_columns:
-                await db.execute(
-                    "ALTER TABLE resplit_batches ADD COLUMN "
-                    "adopted_window_count INTEGER NOT NULL DEFAULT 0"
-                )
-            await db.execute(
-                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(17, ?)",
                 (utc_now(),),
             )
             await db.commit()
@@ -1190,26 +1166,6 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    async def get_resplit_batch_window_summaries(
-        self, batch_id: str
-    ) -> list[dict[str, Any]]:
-        async with self.connect() as db:
-            rows = await (
-                await db.execute(
-                    """
-                    SELECT id, batch_id, window_index, original_task_id,
-                           candidate_task_id, requested_start, nominal_end,
-                           handoff_start, next_window_start, status,
-                           service_status, progress, error_message,
-                           submitted_at, finished_at, updated_at
-                    FROM resplit_batch_windows
-                    WHERE batch_id=? ORDER BY window_index
-                    """,
-                    (batch_id,),
-                )
-            ).fetchall()
-        return [dict(row) for row in rows]
-
     async def update_resplit_batch(self, batch_id: str, **fields: Any) -> None:
         unknown = set(fields) - self.RESPLIT_BATCH_FIELDS
         if unknown:
@@ -1240,28 +1196,10 @@ class Database:
             )
             await db.commit()
 
-    async def recover_interrupted_range_resplits(self) -> list[dict[str, Any]]:
+    async def recover_interrupted_range_resplits(self) -> None:
         message = "Helper restarted during range resplit; official results were not changed"
         now = utc_now()
         async with self.connect() as db:
-            batch_rows = await (
-                await db.execute(
-                    "SELECT * FROM resplit_batches "
-                    "WHERE status IN ('queued', 'running', 'committing')"
-                )
-            ).fetchall()
-            recovered: list[dict[str, Any]] = []
-            for batch in batch_rows:
-                window_rows = await (
-                    await db.execute(
-                        "SELECT * FROM resplit_batch_windows "
-                        "WHERE batch_id=? ORDER BY window_index",
-                        (batch["id"],),
-                    )
-                ).fetchall()
-                recovered.append(
-                    {**dict(batch), "windows": [dict(row) for row in window_rows]}
-                )
             await db.execute(
                 "UPDATE resplit_batches SET status='failed', error_message=?, "
                 "finished_at=?, updated_at=? "
@@ -1276,17 +1214,9 @@ class Database:
                 (message, now, now, message),
             )
             await db.commit()
-        return recovered
 
-    async def commit_resplit_batch(
-        self,
-        batch_id: str,
-        adopted_row_ids: list[int],
-        *,
-        error_message: str = "",
-    ) -> str:
+    async def commit_resplit_batch(self, batch_id: str) -> None:
         now = utc_now()
-        adopted_ids = {int(value) for value in adopted_row_ids}
         segment_columns = (
             "job_id", "window_id", "source_index", "accepted", "ignored", "reason",
             "local_start", "local_end", "global_start", "global_end", "absolute_start",
@@ -1308,17 +1238,9 @@ class Database:
                     (batch_id,),
                 )
             ).fetchall()
-            if not candidate_rows:
+            if not candidate_rows or any(row["status"] != "candidate_ready" for row in candidate_rows):
                 await db.rollback()
-                raise ValueError("Range resplit batch has no windows")
-            adopted_rows = [
-                row for row in candidate_rows if int(row["id"]) in adopted_ids
-            ]
-            if len(adopted_rows) != len(adopted_ids) or any(
-                row["status"] != "candidate_ready" for row in adopted_rows
-            ):
-                await db.rollback()
-                raise ValueError("An adopted range resplit window is not candidate-ready")
+                raise ValueError("Not every range resplit window has a candidate result")
             job = await (
                 await db.execute("SELECT * FROM jobs WHERE id=?", (batch["job_id"],))
             ).fetchone()
@@ -1326,7 +1248,7 @@ class Database:
                 await db.rollback()
                 raise ValueError("Job not found")
 
-            for candidate in adopted_rows:
+            for candidate in candidate_rows:
                 segments = json.loads(candidate["processed_json"])
                 attempt_no_row = await (
                     await db.execute(
@@ -1386,87 +1308,56 @@ class Database:
                     ),
                 )
 
-            if adopted_rows:
-                window_rows = await (
-                    await db.execute(
-                        "SELECT * FROM windows WHERE job_id=? ORDER BY window_index",
-                        (batch["job_id"],),
-                    )
-                ).fetchall()
-                completed_prefix = 0
-                for window in window_rows:
-                    if window["status"] != "completed":
-                        break
-                    completed_prefix += 1
-                all_completed = bool(window_rows) and completed_prefix == len(window_rows)
-                if completed_prefix:
-                    previous = window_rows[completed_prefix - 1]
-                    next_start = (
-                        previous["handoff_start"]
-                        if previous["handoff_start"] is not None
-                        else previous["nominal_end"]
-                    )
-                else:
-                    next_start = 0.0
-                warnings = json.loads(job["warnings_json"] or "[]")
-                for candidate in adopted_rows:
-                    warning = str(candidate["warning"] or "")
-                    if warning:
-                        rendered = f"Window {int(candidate['window_index']) + 1}: {warning}"
-                        if rendered not in warnings:
-                            warnings.append(rendered)
-                job_fields = {
-                    "current_window": completed_prefix,
-                    "next_window_start": float(next_start),
-                    "progress": (
-                        100.0
-                        if all_completed
-                        else completed_prefix / len(window_rows) * 100.0
-                    ),
-                    "reviewed": 0,
-                    "warnings_json": json.dumps(warnings, ensure_ascii=False),
-                    "updated_at": now,
-                }
-                if all_completed:
-                    job_fields.update(
-                        status="completed", error_message="", completed_at=now
-                    )
-                assignments = ", ".join(f"{key}=?" for key in job_fields)
+            window_rows = await (
                 await db.execute(
-                    f"UPDATE jobs SET {assignments} WHERE id=?",
-                    (*job_fields.values(), batch["job_id"]),
+                    "SELECT * FROM windows WHERE job_id=? ORDER BY window_index",
+                    (batch["job_id"],),
                 )
-                await db.executemany(
-                    "UPDATE resplit_batch_windows SET status='adopted', updated_at=? "
-                    "WHERE id=?",
-                    [(now, int(row["id"])) for row in adopted_rows],
+            ).fetchall()
+            completed_prefix = 0
+            for window in window_rows:
+                if window["status"] != "completed":
+                    break
+                completed_prefix += 1
+            all_completed = bool(window_rows) and completed_prefix == len(window_rows)
+            if completed_prefix:
+                previous = window_rows[completed_prefix - 1]
+                next_start = (
+                    previous["handoff_start"]
+                    if previous["handoff_start"] is not None
+                    else previous["nominal_end"]
                 )
-
-            adopted_count = len(adopted_rows)
-            total_count = int(batch["total_window_count"])
-            final_status = (
-                "completed"
-                if adopted_count == total_count
-                else "partial_completed"
-                if adopted_count
-                else "failed"
+            else:
+                next_start = 0.0
+            warnings = json.loads(job["warnings_json"] or "[]")
+            for candidate in candidate_rows:
+                warning = str(candidate["warning"] or "")
+                if warning:
+                    rendered = f"Window {int(candidate['window_index']) + 1}: {warning}"
+                    if rendered not in warnings:
+                        warnings.append(rendered)
+            job_fields = {
+                "current_window": completed_prefix,
+                "next_window_start": float(next_start),
+                "progress": 100.0 if all_completed else completed_prefix / len(window_rows) * 100.0,
+                "reviewed": 0,
+                "warnings_json": json.dumps(warnings, ensure_ascii=False),
+                "updated_at": now,
+            }
+            if all_completed:
+                job_fields.update(status="completed", error_message="", completed_at=now)
+            assignments = ", ".join(f"{key}=?" for key in job_fields)
+            await db.execute(
+                f"UPDATE jobs SET {assignments} WHERE id=?",
+                (*job_fields.values(), batch["job_id"]),
             )
             await db.execute(
-                "UPDATE resplit_batches SET status=?, current_window_index=NULL, "
-                "completed_window_count=?, adopted_window_count=?, error_message=?, "
-                "finished_at=?, updated_at=? WHERE id=?",
-                (
-                    final_status,
-                    adopted_count,
-                    adopted_count,
-                    error_message,
-                    now,
-                    now,
-                    batch_id,
-                ),
+                "UPDATE resplit_batches SET status='completed', current_window_index=NULL, "
+                "completed_window_count=total_window_count, error_message='', finished_at=?, "
+                "updated_at=? WHERE id=?",
+                (now, now, batch_id),
             )
             await db.commit()
-        return final_status
 
     async def update_window(self, window_id: int, **fields: Any) -> None:
         unknown = set(fields) - self.WINDOW_FIELDS

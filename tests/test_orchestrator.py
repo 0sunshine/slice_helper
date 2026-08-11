@@ -26,15 +26,6 @@ class FakeMedia:
         return MediaProbe(duration=3600, format_name="mpegts", video_codec="h264")
 
 
-class RecordingMedia(FakeMedia):
-    def __init__(self) -> None:
-        self.ranges: list[tuple[float, float]] = []
-
-    async def cut(self, source, target, start, end, mode):
-        self.ranges.append((float(start), float(end)))
-        return await super().cut(source, target, start, end, mode)
-
-
 class InvalidMedia:
     async def cut(self, _source, _target, _start, _end, _mode):
         raise MediaError("chunk failed validation after audio repair")
@@ -194,48 +185,6 @@ class FailingSecondRangeISlice(FakeISlice):
                 "segments": [],
             }
         return await super().get_task_info(task_id)
-
-
-class FailingSecondOfFourRangeISlice:
-    async def ensure_task(self, _task_id, _request):
-        return None
-
-    async def delete_task(self, _task_id):
-        return True
-
-    async def get_task_info(self, task_id):
-        if "-r" in task_id and "w001" in task_id:
-            return {
-                "taskInfo": {
-                    "taskId": task_id,
-                    "status": "failed",
-                    "progress": 100,
-                    "videoPath": "unused",
-                    "errorMessage": "second candidate failed",
-                },
-                "segments": [],
-            }
-        if "w000" in task_id:
-            segments = [
-                {"startTime": 0, "endTime": 3500, "title": "main-0"},
-                {"startTime": 3500, "endTime": 3600, "title": "tail-0"},
-            ]
-        elif "w003" in task_id:
-            segments = [{"startTime": 0, "endTime": 3700, "title": "main-3"}]
-        else:
-            segments = [
-                {"startTime": 0, "endTime": 3600, "title": "main"},
-                {"startTime": 3600, "endTime": 3700, "title": "tail"},
-            ]
-        return {
-            "taskInfo": {
-                "taskId": task_id,
-                "status": "completed",
-                "progress": 100,
-                "videoPath": "unused",
-            },
-            "segments": segments,
-        }
 
 
 class OverlappingISlice:
@@ -516,137 +465,7 @@ async def test_range_resplit_uses_candidate_tasks_and_commits_all_windows_atomic
 
 
 @pytest.mark.asyncio
-async def test_range_resplit_failure_adopts_compatible_successful_windows(
-    tmp_path: Path,
-) -> None:
-    source = tmp_path / "source.ts"
-    source.write_bytes(b"source")
-    settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    await database.initialize()
-    await create_job(database, source, duration=7200.0)
-    await database.update_job("abc123", islice_base_url="http://islice.test")
-    original = Orchestrator(settings, database, FakeMedia(), FakeISlice())
-    await original._process_job("abc123")
-    segments_before = await database.get_segments("abc123")
-    second_window_before = [
-        (item["id"], item["task_id"]) for item in segments_before if item["window_index"] == 1
-    ]
-
-    orchestrator = Orchestrator(
-        settings, database, FakeMedia(), FailingSecondRangeISlice()
-    )
-    preview = await orchestrator.preview_range_resplit("abc123", 0, 1)
-    response = await orchestrator.schedule_range_resplit(
-        "abc123", preview["previewId"], preview["confirmationText"]
-    )
-    await asyncio.wait_for(orchestrator._range_resplit_tasks["abc123"], timeout=2)
-
-    batch = await database.get_resplit_batch(response["batchId"])
-    assert batch["status"] == "partial_completed"
-    assert batch["processed_window_count"] == 2
-    assert batch["adopted_window_count"] == 1
-    assert "second candidate failed" in batch["error_message"]
-    rows = await database.get_resplit_batch_windows(response["batchId"])
-    assert [item["status"] for item in rows] == ["adopted", "failed"]
-    segments_after = await database.get_segments("abc123")
-    assert all("-r" in item["task_id"] for item in segments_after if item["window_index"] == 0)
-    assert [
-        (item["id"], item["task_id"])
-        for item in segments_after
-        if item["window_index"] == 1
-    ] == second_window_before
-    windows = await database.get_windows("abc123")
-    assert [len(await database.get_attempts(item["id"])) for item in windows] == [2, 1]
-    assert (await database.get_job("abc123"))["status"] == "completed"
-
-
-@pytest.mark.asyncio
-async def test_range_resplit_continues_after_failure_from_next_official_start(
-    tmp_path: Path,
-) -> None:
-    source = tmp_path / "source.ts"
-    source.write_bytes(b"source")
-    settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    await database.initialize()
-    await create_job(database, source, duration=14400.0)
-    await database.update_job("abc123", islice_base_url="http://islice.test")
-    service = FailingSecondOfFourRangeISlice()
-    original = Orchestrator(settings, database, FakeMedia(), service)
-    await original._process_job("abc123")
-    official_starts = [
-        float(item["requested_start"]) for item in await database.get_windows("abc123")
-    ]
-    assert official_starts == [0.0, 3500.0, 7100.0, 10700.0]
-
-    media = RecordingMedia()
-    orchestrator = Orchestrator(settings, database, media, service)
-    preview = await orchestrator.preview_range_resplit("abc123", 0, 3)
-    response = await orchestrator.schedule_range_resplit(
-        "abc123", preview["previewId"], preview["confirmationText"]
-    )
-    await asyncio.wait_for(orchestrator._range_resplit_tasks["abc123"], timeout=2)
-
-    batch = await database.get_resplit_batch(response["batchId"])
-    assert batch["status"] == "partial_completed"
-    assert batch["processed_window_count"] == 4
-    assert batch["adopted_window_count"] == 3
-    rows = await database.get_resplit_batch_windows(response["batchId"])
-    assert [item["status"] for item in rows] == [
-        "adopted",
-        "failed",
-        "adopted",
-        "adopted",
-    ]
-    assert [start for start, _end in media.ranges] == [0.0, 3500.0, 7100.0, 10700.0]
-    windows = await database.get_windows("abc123")
-    assert [len(await database.get_attempts(item["id"])) for item in windows] == [
-        2,
-        1,
-        2,
-        2,
-    ]
-
-
-@pytest.mark.asyncio
-async def test_range_resplit_manifest_failure_does_not_undo_committed_results(
-    tmp_path: Path,
-) -> None:
-    source = tmp_path / "source.ts"
-    source.write_bytes(b"source")
-    settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    await database.initialize()
-    await create_job(database, source, duration=7200.0)
-    await database.update_job("abc123", islice_base_url="http://islice.test")
-    original = Orchestrator(settings, database, FakeMedia(), FakeISlice())
-    await original._process_job("abc123")
-
-    orchestrator = Orchestrator(settings, database, FakeMedia(), FakeISlice())
-
-    async def fail_manifest(_job_id: str) -> dict:
-        raise OSError("manifest disk full")
-
-    orchestrator.write_manifest = fail_manifest  # type: ignore[method-assign]
-    preview = await orchestrator.preview_range_resplit("abc123", 0, 1)
-    response = await orchestrator.schedule_range_resplit(
-        "abc123", preview["previewId"], preview["confirmationText"]
-    )
-    await asyncio.wait_for(orchestrator._range_resplit_tasks["abc123"], timeout=2)
-
-    batch = await database.get_resplit_batch(response["batchId"])
-    assert batch["status"] == "completed"
-    rows = await database.get_resplit_batch_windows(response["batchId"])
-    assert [item["status"] for item in rows] == ["adopted", "adopted"]
-    segments = await database.get_segments("abc123")
-    assert segments and all("-r" in item["task_id"] for item in segments)
-    job = await database.get_job("abc123")
-    assert "manifest refresh failed" in job["warnings_json"]
-
-
-@pytest.mark.asyncio
-async def test_range_resplit_rejects_a_successful_block_with_incompatible_boundaries(
+async def test_range_resplit_failure_keeps_every_official_result_unchanged(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source.ts"
@@ -659,10 +478,13 @@ async def test_range_resplit_rejects_a_successful_block_with_incompatible_bounda
     original = Orchestrator(settings, database, FakeMedia(), FakeISlice())
     await original._process_job("abc123")
     segments_before = [
-        (item["id"], item["task_id"]) for item in await database.get_segments("abc123")
+        (item["id"], item["title"], item["task_id"], item["global_start"], item["global_end"])
+        for item in await database.get_segments("abc123")
     ]
 
-    orchestrator = Orchestrator(settings, database, FakeMedia(), OverlappingISlice())
+    orchestrator = Orchestrator(
+        settings, database, FakeMedia(), FailingSecondRangeISlice()
+    )
     preview = await orchestrator.preview_range_resplit("abc123", 0, 1)
     response = await orchestrator.schedule_range_resplit(
         "abc123", preview["previewId"], preview["confirmationText"]
@@ -671,60 +493,15 @@ async def test_range_resplit_rejects_a_successful_block_with_incompatible_bounda
 
     batch = await database.get_resplit_batch(response["batchId"])
     assert batch["status"] == "failed"
-    assert batch["adopted_window_count"] == 0
-    rows = await database.get_resplit_batch_windows(response["batchId"])
-    assert all(item["status"] in {"failed", "boundary_rejected"} for item in rows)
-    assert [(item["id"], item["task_id"]) for item in await database.get_segments("abc123")] == segments_before
-
-
-@pytest.mark.asyncio
-async def test_start_recovers_and_cleans_interrupted_range_resplit_candidates(
-    tmp_path: Path,
-) -> None:
-    source = tmp_path / "source.ts"
-    source.write_bytes(b"source")
-    settings = make_settings(tmp_path)
-    database = Database(settings.database_path)
-    await database.initialize()
-    await create_job(database, source, duration=3600.0)
-    await database.update_job(
-        "abc123", status="completed", islice_base_url="http://islice.test"
-    )
-    window = await database.upsert_window("abc123", 0, 0.0, 3600.0)
-    chunk = settings.temp_dir / "abc123" / "interrupted.ts"
-    chunk.parent.mkdir(parents=True, exist_ok=True)
-    chunk.write_bytes(b"candidate")
-    await database.create_resplit_batch(
-        "interrupted-batch",
-        "abc123",
-        0,
-        0,
-        0,
-        [
-            {
-                "window_id": window["id"],
-                "window_index": 0,
-                "original_task_id": "original-task",
-                "candidate_task_id": "candidate-task",
-                "nominal_end": 3600.0,
-            }
-        ],
-    )
-    rows = await database.get_resplit_batch_windows("interrupted-batch")
-    await database.update_resplit_batch("interrupted-batch", status="running")
-    await database.update_resplit_batch_window(
-        rows[0]["id"], status="polling", chunk_path=str(chunk)
-    )
-    service = ResplitISlice()
-    orchestrator = Orchestrator(settings, database, FakeMedia(), service)
-
-    await orchestrator.start()
-    await orchestrator.stop()
-
-    batch = await database.get_resplit_batch("interrupted-batch")
-    assert batch["status"] == "failed"
-    assert not chunk.exists()
-    assert service.deleted == ["candidate-task"]
+    assert "second candidate failed" in batch["error_message"]
+    segments_after = [
+        (item["id"], item["title"], item["task_id"], item["global_start"], item["global_end"])
+        for item in await database.get_segments("abc123")
+    ]
+    assert segments_after == segments_before
+    windows = await database.get_windows("abc123")
+    assert [len(await database.get_attempts(item["id"])) for item in windows] == [1, 1]
+    assert (await database.get_job("abc123"))["status"] == "completed"
 
 
 @pytest.mark.asyncio

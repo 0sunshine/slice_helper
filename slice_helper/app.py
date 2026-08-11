@@ -393,9 +393,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         attempts = await request.app.state.database.get_attempts_for_job(job_id)
         range_batch = await request.app.state.database.get_latest_resplit_batch(job_id)
         range_windows = (
-            await request.app.state.database.get_resplit_batch_window_summaries(
-                range_batch["id"]
-            )
+            await request.app.state.database.get_resplit_batch_windows(range_batch["id"])
             if range_batch
             else []
         )
@@ -602,7 +600,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.post("/api/jobs/{job_id}/pause")
     async def pause_job(request: Request, job_id: str):
         job = await _require_job(request, job_id)
-        await _ensure_no_active_range_resplit(request, job_id)
         if job["status"] in {
             JobStatus.PENDING_SCHEDULE.value,
             JobStatus.QUEUED.value,
@@ -637,7 +634,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.post("/api/jobs/{job_id}/stop")
     async def stop_job(request: Request, job_id: str):
         job = await _require_job(request, job_id)
-        await _ensure_no_active_range_resplit(request, job_id)
         if job["status"] in {
             JobStatus.COMPLETED.value,
             JobStatus.STOPPED.value,
