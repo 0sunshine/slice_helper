@@ -469,6 +469,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 source["prepareConfirmation"],
                 source["agentInstallPath"],
             )
+            # Keep a generic command key for clients that render prepare and
+            # commit commands through the same component.  The explicit
+            # prepareCommand key remains part of the response for clarity.
+            source["command"] = source["prepareCommand"]
         return {
             **preview,
             "expiresAt": expires_at.isoformat(),

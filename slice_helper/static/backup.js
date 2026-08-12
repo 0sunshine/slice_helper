@@ -291,7 +291,7 @@ function resetCommandCard(item) {
   const command = item.command || item.prepareCommand || "";
   return `<article class="reset-command-card">
     <div><strong>${escapeHtml(item.sourceId)}</strong><button class="button secondary small copy-reset-command" type="button">复制</button></div>
-    <code>${escapeHtml(command)}</code>
+    <code>${escapeHtml(command || "未生成命令，请重新生成重置请求")}</code>
   </article>`;
 }
 

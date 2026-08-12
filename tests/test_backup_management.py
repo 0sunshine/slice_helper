@@ -539,6 +539,7 @@ def test_system_reset_requires_receipts_and_confirmation_then_preserves_media(
         assert preview["counts"]["channels"] == 1
         assert preview["mediaDirectoriesIncluded"] is False
         assert len(preview["sources"]) == 1
+        assert preview["sources"][0]["command"] == preview["sources"][0]["prepareCommand"]
         tokens = shlex.split(preview["sources"][0]["prepareCommand"])
         nonce = tokens[tokens.index("--nonce") + 1]
         source_id = preview["sources"][0]["sourceId"]
