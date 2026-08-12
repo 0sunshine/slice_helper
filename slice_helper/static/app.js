@@ -145,15 +145,32 @@ function renderJobs() {
       <td><span class="job-row-actions">
         <button class="button secondary small view-job" data-job-id="${escapeHtml(job.id)}" type="button">查看</button>
         <button class="button secondary small refresh-job-time" data-job-id="${escapeHtml(job.id)}" type="button">重新取时</button>
+        ${renderJobControlActions(job)}
       </span></td>
     </tr>`).join("");
   body.querySelectorAll(".view-job").forEach((button) => button.addEventListener("click", () => loadDetail(button.dataset.jobId, true)));
   body.querySelectorAll(".refresh-job-time").forEach((button) => button.addEventListener("click", () => openTimeRefresh(button.dataset.jobId)));
+  body.querySelectorAll(".control-job").forEach((button) => button.addEventListener("click", () => controlJob(button.dataset.jobId, button.dataset.action, button)));
   body.querySelectorAll(".review-checkbox").forEach((checkbox) => checkbox.addEventListener("change", () => updateJobReview(checkbox)));
   $("jobPageSummary").textContent = `共 ${state.jobTotal} 条`;
   $("jobPageInfo").textContent = `${state.jobPage} / ${state.jobTotalPages}`;
   $("previousJobPage").disabled = state.jobPage <= 1;
   $("nextJobPage").disabled = state.jobPage >= state.jobTotalPages;
+}
+
+function renderJobControlActions(job) {
+  const actions = [];
+  const jobId = escapeHtml(job.id);
+  if (["pending_schedule", "queued", "running"].includes(job.status)) {
+    actions.push(`<button class="button warning small control-job" data-job-id="${jobId}" data-action="pause" type="button">暂停</button>`);
+  }
+  if (["paused", "failed"].includes(job.status)) {
+    actions.push(`<button class="button primary small control-job" data-job-id="${jobId}" data-action="resume" type="button">继续</button>`);
+  }
+  if (!["completed", "stopped"].includes(job.status)) {
+    actions.push(`<button class="button danger small control-job" data-job-id="${jobId}" data-action="stop" type="button">停止</button>`);
+  }
+  return actions.join("");
 }
 
 async function updateJobReview(checkbox) {
@@ -830,21 +847,19 @@ function resetPreview() {
 }
 
 function renderActions(job) {
-  const actions = [];
-  if (["pending_schedule", "queued", "running"].includes(job.status)) actions.push(`<button class="button warning small" data-action="pause" type="button">暂停</button>`);
-  if (["paused", "failed"].includes(job.status)) actions.push(`<button class="button primary small" data-action="resume" type="button">继续</button>`);
-  if (!["completed", "stopped"].includes(job.status)) actions.push(`<button class="button danger small" data-action="stop" type="button">停止</button>`);
-  actions.push(`<a class="button secondary small external-link" href="/api/jobs/${escapeHtml(job.id)}/result?download=true">下载 JSON</a>`);
-  $("detailActions").innerHTML = actions.join("");
-  $("detailActions").querySelectorAll("button[data-action]").forEach((button) => button.addEventListener("click", () => controlJob(job.id, button.dataset.action)));
+  $("detailActions").innerHTML = `<a class="button secondary small external-link" href="/api/jobs/${escapeHtml(job.id)}/result?download=true">下载 JSON</a>`;
 }
 
-async function controlJob(jobId, action) {
+async function controlJob(jobId, action, button = null) {
+  if (button) button.disabled = true;
   try {
     await api(`/api/jobs/${jobId}/${action}`, { method: "POST" });
     showToast("作业状态已更新");
     await loadJobs();
-  } catch (error) { showToast(error.message); }
+  } catch (error) {
+    showToast(error.message);
+    if (button) button.disabled = false;
+  }
 }
 
 async function saveTimeReference() {
