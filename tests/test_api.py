@@ -84,7 +84,7 @@ def test_job_api_control_and_database_backed_chunk_route(
         return {
             "jobId": job_id,
             "windowIndex": window_index,
-            "taskId": task_id,
+            "taskId": "new-resplit-task-id",
             "status": "resplit_queued",
         }
 
@@ -150,8 +150,8 @@ def test_job_api_control_and_database_backed_chunk_route(
         ):
             assert f'<option value="{content_type}">{content_type}</option>' in home.text
         assert 'id="summaryISlice"' in home.text
-        assert "/static/styles.css?v=0.17.0" in home.text
-        assert "/static/app.js?v=0.17.0" in home.text
+        assert "/static/styles.css?v=0.17.1" in home.text
+        assert "/static/app.js?v=0.17.1" in home.text
         assert 'id="tailRebuildDialog"' in home.text
         assert 'id="timeRefreshDialog"' in home.text
         assert 'id="timeRefreshForm"' in home.text
@@ -241,7 +241,7 @@ def test_job_api_control_and_database_backed_chunk_route(
             json={"taskId": "sh-test-w000-a1"},
         )
         assert resplit.status_code == 202
-        assert resplit.json()["taskId"] == "sh-test-w000-a1"
+        assert resplit.json()["taskId"] == "new-resplit-task-id"
         assert resplit_call == {
             "job_id": job_id,
             "window_index": 0,

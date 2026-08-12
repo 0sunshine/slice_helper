@@ -365,7 +365,7 @@ function renderResplitAction(job, windowItem, attempt) {
   const jobReady = ["paused", "completed", "failed", "stopped"].includes(job.status);
   const taskReady = ["completed", "failed", "discarded"].includes(attempt.status);
   const disabled = !(jobReady && taskReady);
-  const title = disabled ? "作业及小任务结束后才能重新拆分" : "使用相同任务 ID 重新拆分";
+  const title = disabled ? "作业及小任务结束后才能重新拆分" : "创建全新任务 ID 重新拆分";
   const resplitButton = `<button class="button secondary small resplit-window" type="button"
     data-window-index="${windowItem.window_index}" data-task-id="${escapeHtml(attempt.task_id)}"
     title="${title}" ${disabled ? "disabled" : ""}>重新拆分</button>`;
@@ -938,13 +938,13 @@ async function submitResplit(event) {
   submit.disabled = true;
   submit.textContent = "提交中";
   try {
-    await api(`/api/jobs/${target.jobId}/windows/${target.windowIndex}/resplit`, {
+    const result = await api(`/api/jobs/${target.jobId}/windows/${target.windowIndex}/resplit`, {
       method: "POST",
       body: JSON.stringify({ taskId: target.taskId })
     });
     $("resplitDialog").close();
     state.resplitTarget = null;
-    showToast(`任务 ${target.taskId} 已进入重新拆分流程`);
+    showToast(`新任务 ${result.taskId} 已进入重新拆分流程`);
     await loadJobs();
   } catch (error) {
     $("resplitError").textContent = error.message;

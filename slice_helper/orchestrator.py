@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import time
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -346,17 +347,26 @@ class Orchestrator:
             if not self._source_unchanged(job):
                 raise ResplitValidationError("Source file size or modification time changed")
 
-            await self.database.update_attempt(
-                attempt["id"],
-                status="resplit_queued",
-                service_status="waiting",
-                progress=0.0,
-                error_message="",
-                finished_at=None,
+            next_attempt_no = int(attempt["attempt_no"]) + 1
+            generation = int(job.get("rebuild_revision") or 0)
+            generation_part = f"-g{generation}" if generation else ""
+            new_task_id = (
+                f"sh-{job_id[:16]}-w{window_index:03d}{generation_part}"
+                f"-a{next_attempt_no}-r{uuid.uuid4().hex[:8]}"
             )
+            new_attempt = await self.database.replace_attempt_for_resplit(
+                int(window["id"]),
+                int(attempt["id"]),
+                next_attempt_no,
+                new_task_id,
+            )
+            if new_attempt is None:
+                raise ResplitConflictError(
+                    "The window task changed; refresh the page before resplitting"
+                )
             task = asyncio.create_task(
-                self._run_resplit(job_id, window_index, int(attempt["id"])),
-                name=f"resplit-{expected_task_id}",
+                self._run_resplit(job_id, window_index, int(new_attempt["id"])),
+                name=f"resplit-{new_task_id}",
             )
             self._resplit_tasks[key] = task
             task.add_done_callback(
@@ -365,7 +375,7 @@ class Orchestrator:
             return {
                 "jobId": job_id,
                 "windowIndex": window_index,
-                "taskId": expected_task_id,
+                "taskId": new_task_id,
                 "status": "resplit_queued",
             }
 
@@ -578,13 +588,12 @@ class Orchestrator:
             await self.database.update_attempt(
                 attempt["id"],
                 status="resplitting",
-                service_status="deleting",
+                service_status="submitting",
                 progress=0.0,
                 raw_response_path="",
                 error_message="",
                 finished_at=None,
             )
-            await islice_client.delete_task(task_id)
             existing = await islice_client.ensure_task(task_id, request)
             submitted_at = utc_now()
             service_status, service_progress = self._task_progress(existing)

@@ -239,10 +239,10 @@
         <button id="closeResplitButton" class="icon-button" type="button" aria-label="关闭">×</button>
       </div>
       <div class="confirm-dialog-body">
-        <p>将删除 iSlice 中的现有任务并使用相同任务 ID 重新提交。此操作不会创建新的 attempt。</p>
+        <p>系统会删除本地的当前 attempt，创建全新的任务 ID 后重新提交。旧 iSlice 任务会保留，不会向 iSlice 下发删除请求。</p>
         <dl>
           <div><dt>窗口</dt><dd id="resplitWindow"></dd></div>
-          <div><dt>任务 ID</dt><dd id="resplitTaskId" class="mono"></dd></div>
+          <div><dt>当前任务 ID</dt><dd id="resplitTaskId" class="mono"></dd></div>
         </dl>
         <p class="confirm-warning">重新拆分完成后，该窗口的拆条结果会被新结果替换。</p>
         <p id="resplitError" class="form-error" hidden></p>

@@ -161,14 +161,14 @@ class ResplitISlice:
 class BlockingResplitISlice(ResplitISlice):
     def __init__(self) -> None:
         super().__init__()
-        self.delete_started = asyncio.Event()
-        self.allow_delete = asyncio.Event()
+        self.submission_started = asyncio.Event()
+        self.allow_submission = asyncio.Event()
 
-    async def delete_task(self, task_id):
-        self.deleted.append(task_id)
-        self.delete_started.set()
-        await self.allow_delete.wait()
-        return True
+    async def ensure_task(self, task_id, request):
+        self.created.append((task_id, request))
+        self.submission_started.set()
+        await self.allow_submission.wait()
+        return None
 
 
 class OverlappingISlice:
@@ -764,7 +764,7 @@ async def test_tail_rebuild_snapshot_failure_does_not_change_database(
 
 
 @pytest.mark.asyncio
-async def test_manual_resplit_reuses_task_id_and_replaces_window_results(
+async def test_manual_resplit_replaces_local_attempt_with_a_new_task_id(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source.ts"
@@ -780,9 +780,10 @@ async def test_manual_resplit_reuses_task_id_and_replaces_window_results(
     window = (await database.get_windows("abc123"))[0]
     attempts_before = await database.get_attempts(window["id"])
     assert len(attempts_before) == 1
-    task_id = attempts_before[0]["task_id"]
-    first_submitted_at = attempts_before[0]["submitted_at"]
-    assert first_submitted_at
+    old_attempt_id = attempts_before[0]["id"]
+    old_task_id = attempts_before[0]["task_id"]
+    old_attempt_no = attempts_before[0]["attempt_no"]
+    assert attempts_before[0]["submitted_at"]
     assert not Path(window["chunk_path"]).exists()
     assert {item["title"] for item in await database.get_segments("abc123")} == {
         "first",
@@ -791,21 +792,26 @@ async def test_manual_resplit_reuses_task_id_and_replaces_window_results(
 
     replacement = ResplitISlice()
     orchestrator.islice = replacement
-    response = await orchestrator.schedule_resplit("abc123", 0, task_id)
+    response = await orchestrator.schedule_resplit("abc123", 0, old_task_id)
+    new_task_id = response["taskId"]
     task = orchestrator._resplit_tasks[("abc123", 0)]
     await asyncio.wait_for(task, timeout=1)
 
-    assert response["taskId"] == task_id
-    assert replacement.deleted == [task_id]
-    assert [item[0] for item in replacement.created] == [task_id]
-    assert replacement.created[0][1]["taskId"] == task_id
+    assert new_task_id != old_task_id
+    assert replacement.deleted == []
+    assert [item[0] for item in replacement.created] == [new_task_id]
+    assert replacement.created[0][1]["taskId"] == new_task_id
     attempts_after = await database.get_attempts(window["id"])
     assert len(attempts_after) == 1
-    assert attempts_after[0]["task_id"] == task_id
+    assert attempts_after[0]["id"] != old_attempt_id
+    assert attempts_after[0]["attempt_no"] == old_attempt_no + 1
+    assert attempts_after[0]["task_id"] == new_task_id
     assert attempts_after[0]["status"] == "completed"
-    assert attempts_after[0]["submitted_at"] > first_submitted_at
+    assert attempts_after[0]["submitted_at"]
     segments = await database.get_segments("abc123")
     assert [item["title"] for item in segments] == ["replacement"]
+    assert segments[0]["attempt_id"] == attempts_after[0]["id"]
+    assert segments[0]["task_id"] == new_task_id
     assert (await database.get_job("abc123"))["status"] == "completed"
     assert not Path(window["chunk_path"]).exists()
 
@@ -825,10 +831,11 @@ async def test_manual_resplit_overlap_can_be_explicitly_accepted_without_islice_
     await database.update_job("abc123", islice_base_url="http://islice.test")
 
     window = (await database.get_windows("abc123"))[0]
-    task_id = (await database.get_attempts(window["id"]))[0]["task_id"]
+    old_task_id = (await database.get_attempts(window["id"]))[0]["task_id"]
     replacement = ResplitISlice()
     orchestrator.islice = replacement
-    await orchestrator.schedule_resplit("abc123", 0, task_id)
+    scheduled = await orchestrator.schedule_resplit("abc123", 0, old_task_id)
+    new_task_id = scheduled["taskId"]
     await asyncio.wait_for(orchestrator._resplit_tasks[("abc123", 0)], timeout=1)
 
     paused = await database.get_job("abc123")
@@ -845,10 +852,12 @@ async def test_manual_resplit_overlap_can_be_explicitly_accepted_without_islice_
         "handoff",
     ]
 
-    response = await orchestrator.accept_resplit_overlap("abc123", 0, task_id)
+    response = await orchestrator.accept_resplit_overlap(
+        "abc123", 0, new_task_id
+    )
 
     assert response["status"] == "overlap_accepted"
-    assert replacement.deleted == [task_id]
+    assert replacement.deleted == []
     assert len(replacement.created) == 1
     job = await database.get_job("abc123")
     windows = await database.get_windows("abc123")
@@ -887,17 +896,17 @@ async def test_manual_resplit_rejects_a_second_request_for_the_same_job(
 
     replacement = BlockingResplitISlice()
     orchestrator.islice = replacement
-    await orchestrator.schedule_resplit("abc123", 0, task_id)
+    scheduled = await orchestrator.schedule_resplit("abc123", 0, task_id)
     task = orchestrator._resplit_tasks[("abc123", 0)]
-    await asyncio.wait_for(replacement.delete_started.wait(), timeout=1)
+    await asyncio.wait_for(replacement.submission_started.wait(), timeout=1)
     with pytest.raises(ResplitConflictError, match="already has a resplit"):
-        await orchestrator.schedule_resplit("abc123", 0, task_id)
-    replacement.allow_delete.set()
+        await orchestrator.schedule_resplit("abc123", 0, scheduled["taskId"])
+    replacement.allow_submission.set()
     await asyncio.wait_for(task, timeout=1)
 
 
 @pytest.mark.asyncio
-async def test_manual_resplit_failure_pauses_without_creating_an_attempt(
+async def test_manual_resplit_failure_replaces_attempt_and_preserves_results(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source.ts"
@@ -910,10 +919,11 @@ async def test_manual_resplit_failure_pauses_without_creating_an_attempt(
     await orchestrator._process_job("abc123")
     await database.update_job("abc123", islice_base_url="http://islice.test")
     window = (await database.get_windows("abc123"))[0]
-    task_id = (await database.get_attempts(window["id"]))[0]["task_id"]
+    old_attempt = (await database.get_attempts(window["id"]))[0]
+    task_id = old_attempt["task_id"]
 
     orchestrator.islice = ResplitISlice(terminal_status="failed")
-    await orchestrator.schedule_resplit("abc123", 0, task_id)
+    scheduled = await orchestrator.schedule_resplit("abc123", 0, task_id)
     task = orchestrator._resplit_tasks[("abc123", 0)]
     await asyncio.wait_for(task, timeout=1)
 
@@ -922,8 +932,15 @@ async def test_manual_resplit_failure_pauses_without_creating_an_attempt(
     assert job["status"] == "paused"
     assert "manual resplit failed" in job["error_message"]
     assert len(attempts) == 1
-    assert attempts[0]["task_id"] == task_id
+    assert attempts[0]["id"] != old_attempt["id"]
+    assert attempts[0]["task_id"] == scheduled["taskId"]
+    assert attempts[0]["task_id"] != task_id
     assert attempts[0]["status"] == "failed"
+    assert orchestrator.islice.deleted == []
+    preserved = await database.get_segments("abc123")
+    assert {item["title"] for item in preserved} == {"first", "handoff"}
+    assert all(item["attempt_id"] is None for item in preserved)
+    assert all(item["task_id"] == task_id for item in preserved)
     assert Path(window["chunk_path"]).is_file()
 
 

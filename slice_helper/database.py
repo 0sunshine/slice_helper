@@ -2055,6 +2055,50 @@ class Database:
             raise RuntimeError("Failed to create attempt")
         return dict(row)
 
+    async def replace_attempt_for_resplit(
+        self,
+        window_id: int,
+        expected_attempt_id: int,
+        attempt_no: int,
+        task_id: str,
+    ) -> dict[str, Any] | None:
+        """Replace the latest local attempt without deleting its iSlice task."""
+        now = utc_now()
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            latest = await (
+                await db.execute(
+                    "SELECT id FROM attempts WHERE window_id=? "
+                    "ORDER BY attempt_no DESC LIMIT 1",
+                    (window_id,),
+                )
+            ).fetchone()
+            if latest is None or int(latest["id"]) != expected_attempt_id:
+                await db.rollback()
+                return None
+            await db.execute(
+                "UPDATE segments SET attempt_id=NULL WHERE attempt_id=?",
+                (expected_attempt_id,),
+            )
+            await db.execute(
+                "DELETE FROM attempts WHERE id=?", (expected_attempt_id,)
+            )
+            row = await (
+                await db.execute(
+                    """
+                    INSERT INTO attempts(
+                        window_id, attempt_no, task_id, status, service_status,
+                        progress, raw_response_path, error_message, created_at,
+                        submitted_at, finished_at
+                    ) VALUES(?, ?, ?, 'resplit_queued', 'waiting', 0, '', '', ?, '', NULL)
+                    RETURNING *
+                    """,
+                    (window_id, attempt_no, task_id, now),
+                )
+            ).fetchone()
+            await db.commit()
+        return dict(row) if row is not None else None
+
     async def update_attempt(self, attempt_id: int, **fields: Any) -> None:
         unknown = set(fields) - self.ATTEMPT_FIELDS
         if unknown:
