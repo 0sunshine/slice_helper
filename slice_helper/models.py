@@ -65,6 +65,7 @@ class JobCreate(BaseModel):
     language: str = "zh"
     program_start_time: datetime | None = Field(default=None, alias="programStartTime")
     cut_mode: CutMode = Field(default=CutMode.COPY, alias="cutMode")
+    islice_base_url: str | None = Field(default=None, alias="isliceBaseUrl", max_length=2048)
     overwrite: bool = False
 
     @field_validator("source_path")
@@ -97,6 +98,18 @@ class JobCreate(BaseModel):
         normalized = value.strip().lower()
         if normalized not in {"zh", "en"}:
             raise ValueError("language must be zh or en")
+        return normalized
+
+    @field_validator("islice_base_url")
+    @classmethod
+    def validate_islice_base_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().rstrip("/")
+        if not normalized:
+            return None
+        if not normalized.startswith(("http://", "https://")):
+            raise ValueError("isliceBaseUrl must use http:// or https://")
         return normalized
 
 

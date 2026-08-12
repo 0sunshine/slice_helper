@@ -658,6 +658,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         channel = await request.app.state.database.get_channel(body.channel_id)
         if channel is None:
             raise HTTPException(status_code=400, detail="请选择有效频道")
+        selected_islice_url = ""
+        if body.islice_base_url:
+            selected_islice_url = body.islice_base_url.rstrip("/")
+            instances = await request.app.state.database.list_islice_instances()
+            selected = next((item for item in instances if str(item.get("base_url") or "").rstrip("/") == selected_islice_url), None)
+            if selected is None:
+                raise HTTPException(status_code=400, detail="所选 iSlice 实例不存在")
+            if not selected.get("schedulable"):
+                raise HTTPException(status_code=400, detail="所选 iSlice 实例当前不可调度")
         broadcast_date = body.broadcast_date.isoformat()
         existing = await request.app.state.database.get_current_job_for_channel_date(
             body.channel_id, broadcast_date
@@ -783,7 +792,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "source_mtime_ns": stat.st_mtime_ns,
                 "source_duration": probe.duration,
                 "source_url": source_url,
-                "islice_base_url": "",
+                "islice_base_url": selected_islice_url,
                 "template_id": body.template_id,
                 "language": body.language,
                 "channel_id": channel["id"],

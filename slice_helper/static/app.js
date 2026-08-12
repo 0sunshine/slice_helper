@@ -1,5 +1,5 @@
 const state = {
-  jobs: [], channels: [], selectedJobId: null, detail: null, segments: [],
+  jobs: [], channels: [], isliceInstances: [], selectedJobId: null, detail: null, segments: [],
   jobPage: 1, jobPageSize: 20, jobTotal: 0, jobTotalPages: 1,
   segmentPage: 1, previewUrl: null, resplitTarget: null, tailRebuildTarget: null,
   segmentEditTarget: null, selectedSegmentIds: new Set(), mergePreview: null,
@@ -232,6 +232,15 @@ async function loadChannels() {
   if (state.channels.some((channel) => channel.id === selectedCreate)) $("createChannelId").value = selectedCreate;
   $("exportChannelButton").disabled = !$("channelFilter").value;
   renderChannels();
+}
+
+async function loadISliceInstances() {
+  const selected = $("createISliceBaseUrl").value;
+  state.isliceInstances = await api("/api/islice-instances");
+  const options = state.isliceInstances.filter((item) => item.schedulable)
+    .map((item) => `<option value="${escapeHtml(item.base_url)}">${escapeHtml(item.name || item.source_id)} (${escapeHtml(item.base_url)})</option>`).join("");
+  $("createISliceBaseUrl").innerHTML = `<option value="">自动选择</option>${options}`;
+  if (state.isliceInstances.some((item) => item.schedulable && item.base_url === selected)) $("createISliceBaseUrl").value = selected;
 }
 
 function renderChannels() {
@@ -1208,6 +1217,6 @@ $("nextSegmentPage").addEventListener("click", () => {
   renderSegments();
 });
 
-Promise.all([loadHealth(), loadChannels().then(loadJobs)]).catch((error) => showToast(error.message));
+Promise.all([loadHealth(), loadChannels().then(loadJobs), loadISliceInstances()]).catch((error) => showToast(error.message));
 window.setInterval(() => loadJobs().catch(() => {}), 5000);
 window.setInterval(() => loadHealth().catch(() => {}), 30000);

@@ -150,8 +150,8 @@ def test_job_api_control_and_database_backed_chunk_route(
         ):
             assert f'<option value="{content_type}">{content_type}</option>' in home.text
         assert 'id="summaryISlice"' in home.text
-        assert "/static/styles.css?v=0.17.1" in home.text
-        assert "/static/app.js?v=0.17.1" in home.text
+        assert "/static/styles.css?v=0.17.2" in home.text
+        assert "/static/app.js?v=0.17.2" in home.text
         assert 'id="tailRebuildDialog"' in home.text
         assert 'id="timeRefreshDialog"' in home.text
         assert 'id="timeRefreshForm"' in home.text
@@ -160,6 +160,7 @@ def test_job_api_control_and_database_backed_chunk_route(
         assert 'id="tailRebuildConfirmation"' in home.text
         assert "TS 路径或 HTTP 地址" in home.text
         assert 'id="manageChannelsButton"' in home.text
+        assert 'id="createISliceBaseUrl"' in home.text
         assert 'id="jobPageInfo"' in home.text
         app_js = client.get("/static/app.js")
         styles_css = client.get("/static/styles.css")
@@ -182,6 +183,7 @@ def test_job_api_control_and_database_backed_chunk_route(
                 "templateId": "general",
                 "language": "zh",
                 "cutMode": "copy",
+                "isliceBaseUrl": "http://islice.test",
             },
         )
         assert created.status_code == 201
@@ -189,7 +191,7 @@ def test_job_api_control_and_database_backed_chunk_route(
         job_id = job["id"]
         assert job["total_windows"] == 1
         assert job["status"] == "pending_schedule"
-        assert job["islice_base_url"] == ""
+        assert job["islice_base_url"] == "http://islice.test"
         assert job["channel_name"] == "测试频道"
         assert job["reviewed"] is False
 
