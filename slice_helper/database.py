@@ -1686,44 +1686,27 @@ class Database:
             )
             await db.commit()
 
-    async def recover_interrupted_resplits(self) -> None:
-        message = "Helper restarted during manual resplit; start the resplit again"
-        now = utc_now()
+    async def recover_interrupted_resplits(self) -> list[dict[str, Any]]:
+        """Return resplits that were in progress so the orchestrator can resume them.
+
+        Resplit execution is deliberately driven by the persisted attempt row.  A
+        process restart must not turn a recoverable operation into a failure.
+        """
         async with self.connect() as db:
             rows = await (
                 await db.execute(
                     """
-                    SELECT DISTINCT w.id AS window_id, w.job_id
+                    SELECT a.id AS attempt_id, a.window_id, a.task_id,
+                           w.job_id, w.window_index, j.islice_base_url
                     FROM attempts a
                     JOIN windows w ON w.id=a.window_id
+                    JOIN jobs j ON j.id=w.job_id
                     WHERE a.status IN ('resplit_queued', 'resplitting')
+                    ORDER BY a.created_at, a.id
                     """
                 )
             ).fetchall()
-            if not rows:
-                return
-            await db.execute(
-                """
-                UPDATE attempts
-                SET status='failed', error_message=?, finished_at=?
-                WHERE status IN ('resplit_queued', 'resplitting')
-                """,
-                (message, now),
-            )
-            for row in rows:
-                await db.execute(
-                    "UPDATE windows SET status='failed', error_message=?, updated_at=? WHERE id=?",
-                    (message, now, row["window_id"]),
-                )
-                await db.execute(
-                    """
-                    UPDATE jobs
-                    SET status='paused', pause_requested=0, error_message=?, updated_at=?
-                    WHERE id=?
-                    """,
-                    (message, now, row["job_id"]),
-                )
-            await db.commit()
+        return [dict(row) for row in rows]
 
     @staticmethod
     def _tail_token(

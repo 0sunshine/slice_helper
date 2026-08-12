@@ -129,10 +129,26 @@ class Orchestrator:
         self._stopping = False
 
     async def start(self) -> None:
-        await self.database.recover_interrupted_resplits()
+        interrupted = await self.database.recover_interrupted_resplits()
         await self.database.recover_jobs()
         self._stopping = False
         self._scheduler_task = asyncio.create_task(self._scheduler_loop(), name="job-scheduler")
+        for item in interrupted:
+            key = (str(item["job_id"]), int(item["window_index"]))
+            if key in self._resplit_tasks:
+                continue
+            task = asyncio.create_task(
+                self._run_resplit(
+                    str(item["job_id"]),
+                    int(item["window_index"]),
+                    int(item["attempt_id"]),
+                ),
+                name=f"resplit-recover-{item['task_id']}",
+            )
+            self._resplit_tasks[key] = task
+            task.add_done_callback(
+                lambda done, task_key=key: self._resplit_finished(task_key, done)
+            )
 
     async def stop(self) -> None:
         self._stopping = True
@@ -557,6 +573,25 @@ class Orchestrator:
         end = float(window["nominal_end"])
         chunk_path = self.settings.temp_dir / job_id / f"window-{index:03d}.ts"
         chunk_url = f"{self.settings.public_base_url}/internal/chunks/{job_id}/{index}.ts"
+        # If the process stopped after persisting the iSlice response, finish the
+        # local commit directly instead of submitting/polling again.
+        raw_response_path = str(attempt.get("raw_response_path") or "")
+        if raw_response_path:
+            try:
+                raw_payload = json.loads(Path(raw_response_path).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                raw_payload = None
+            if raw_payload and self._task_progress(raw_payload)[0] == "completed":
+                await self.database.update_attempt(
+                    attempt["id"],
+                    status="completed",
+                    service_status="completed",
+                    progress=100.0,
+                    finished_at=attempt.get("finished_at") or utc_now(),
+                    error_message="",
+                )
+                await self._commit_resplit_payload(job, window, raw_payload)
+                return
         if not chunk_path.is_file():
             await self.database.update_window(
                 window["id"], status=WindowStatus.CUTTING.value, error_message=""
@@ -590,7 +625,6 @@ class Orchestrator:
                 status="resplitting",
                 service_status="submitting",
                 progress=0.0,
-                raw_response_path="",
                 error_message="",
                 finished_at=None,
             )
