@@ -288,9 +288,10 @@ const resetCountLabels = {
 };
 
 function resetCommandCard(item) {
+  const command = item.command || item.prepareCommand || "";
   return `<article class="reset-command-card">
     <div><strong>${escapeHtml(item.sourceId)}</strong><button class="button secondary small copy-reset-command" type="button">复制</button></div>
-    <code>${escapeHtml(item.command)}</code>
+    <code>${escapeHtml(command)}</code>
   </article>`;
 }
 
