@@ -1,4 +1,4 @@
-const state = {
+﻿const state = {
   jobs: [], channels: [], isliceInstances: [], selectedJobId: null, detail: null, segments: [],
   jobPage: 1, jobPageSize: 20, jobTotal: 0, jobTotalPages: 1,
   segmentPage: 1, previewUrl: null, resplitTarget: null, tailRebuildTarget: null,
@@ -7,30 +7,38 @@ const state = {
 };
 const SEGMENTS_PER_PAGE = 10;
 const CONTENT_TYPES = [
-  "新闻", "电视剧", "电影", "综艺", "少儿", "体育", "纪录片", "科教",
-  "文艺", "生活服务", "商业广告", "公益广告", "电视购物", "其他"
+  "鏂伴椈", "鐢佃鍓?, "鐢靛奖", "缁艰壓", "灏戝効", "浣撹偛", "绾綍鐗?, "绉戞暀",
+  "鏂囪壓", "鐢熸椿鏈嶅姟", "鍟嗕笟骞垮憡", "鍏泭骞垮憡", "鐢佃璐墿", "鍏朵粬"
 ];
 
 const statusNames = {
-  pending_schedule: "待调度", queued: "已调度", probing: "探测中", running: "处理中",
-  pause_requested: "等待暂停", paused: "已暂停", completed: "已完成",
-  failed: "失败", stop_requested: "等待停止", stopped: "已停止"
+  pending_schedule: "寰呰皟搴?, queued: "宸茶皟搴?, probing: "鎺㈡祴涓?, running: "澶勭悊涓?,
+  pause_requested: "绛夊緟鏆傚仠", paused: "宸叉殏鍋?, completed: "宸插畬鎴?,
+  failed: "澶辫触", stop_requested: "绛夊緟鍋滄", stopped: "宸插仠姝?
 };
 
 const $ = (id) => document.getElementById(id);
 
 async function configureSchedulingPriority() {
   const current = await api("/api/settings/scheduling-priority");
-  const value = prompt("调度优先策略：fewest_completed=完成数最少优先，most_completed=完成数最多优先", current.priority);
-  if (value === null || value === current.priority) return;
-  if (!["fewest_completed", "most_completed"].includes(value.trim())) {
-    showToast("请输入 fewest_completed 或 most_completed");
-    return;
-  }
-  await api("/api/settings/scheduling-priority", { method: "PUT", body: JSON.stringify({ priority: value.trim() }) });
-  showToast(value.trim() === "fewest_completed" ? "已切换为完成数最少优先" : "已切换为完成数最多优先");
-}
-const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (character) => ({
+  const dialog = document.createElement("dialog");
+  dialog.className = "instance-dialog";
+  dialog.innerHTML = `<form method="dialog"><div class="dialog-header"><h2>调度优先策略</h2><button class="icon-button" value="cancel" aria-label="关闭">×</button></div><p class="muted">选择后立即对后续调度生效，当前正在执行的任务不受影响。</p><label>调度策略<select id="schedulingPriorityChoice"><option value="fewest_completed">完成数最少优先</option><option value="most_completed">完成数最多优先</option></select></label><div class="dialog-actions"><button class="button secondary" value="cancel">取消</button><button id="saveSchedulingPriority" class="button primary" value="default">保存</button></div></form>`;
+  document.body.append(dialog);
+  const choice = dialog.querySelector("#schedulingPriorityChoice");
+  choice.value = current.priority;
+  dialog.querySelector("form").addEventListener("submit", async (event) => {
+    if (event.submitter?.id !== "saveSchedulingPriority") return;
+    event.preventDefault();
+    try {
+      await api("/api/settings/scheduling-priority", { method: "PUT", body: JSON.stringify({ priority: choice.value }) });
+      dialog.close();
+      showToast(choice.value === "fewest_completed" ? "已切换为完成数最少优先" : "已切换为完成数最多优先");
+    } catch (error) { showToast(error.message); }
+  });
+  dialog.addEventListener("close", () => dialog.remove(), { once: true });
+  dialog.showModal();
+}const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (character) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;"
 })[character]);
 
@@ -113,10 +121,10 @@ async function loadHealth() {
   const badge = $("healthBadge");
   try {
     const response = await fetch("/health/ready");
-    badge.textContent = response.ok ? "服务就绪" : "依赖异常";
+    badge.textContent = response.ok ? "鏈嶅姟灏辩华" : "渚濊禆寮傚父";
     badge.className = `health ${response.ok ? "ok" : "bad"}`;
   } catch (_) {
-    badge.textContent = "连接失败";
+    badge.textContent = "杩炴帴澶辫触";
     badge.className = "health bad";
   }
 }
@@ -153,11 +161,11 @@ function renderJobs() {
       <td>${renderJobProgress(job)}</td>
       <td>${job.current_window}/${job.total_windows}</td>
       <td>${job.accepted_segment_count}</td>
-      <td class="reviewed-cell"><input class="review-checkbox" data-job-id="${escapeHtml(job.id)}" type="checkbox" ${job.reviewed ? "checked" : ""} aria-label="${job.reviewed ? "取消" : "标记"}${escapeHtml(job.channel_name || sourceName(job))}已审核"></td>
+      <td class="reviewed-cell"><input class="review-checkbox" data-job-id="${escapeHtml(job.id)}" type="checkbox" ${job.reviewed ? "checked" : ""} aria-label="${job.reviewed ? "鍙栨秷" : "鏍囪"}${escapeHtml(job.channel_name || sourceName(job))}宸插鏍?></td>
       <td>${escapeHtml(formatDate(job.created_at))}</td>
       <td><span class="job-row-actions">
-        <button class="button secondary small view-job" data-job-id="${escapeHtml(job.id)}" type="button">查看</button>
-        <button class="button secondary small refresh-job-time" data-job-id="${escapeHtml(job.id)}" type="button">重新取时</button>
+        <button class="button secondary small view-job" data-job-id="${escapeHtml(job.id)}" type="button">鏌ョ湅</button>
+        <button class="button secondary small refresh-job-time" data-job-id="${escapeHtml(job.id)}" type="button">閲嶆柊鍙栨椂</button>
         ${renderJobControlActions(job)}
       </span></td>
     </tr>`).join("");
@@ -165,7 +173,7 @@ function renderJobs() {
   body.querySelectorAll(".refresh-job-time").forEach((button) => button.addEventListener("click", () => openTimeRefresh(button.dataset.jobId)));
   body.querySelectorAll(".control-job").forEach((button) => button.addEventListener("click", () => controlJob(button.dataset.jobId, button.dataset.action, button)));
   body.querySelectorAll(".review-checkbox").forEach((checkbox) => checkbox.addEventListener("change", () => updateJobReview(checkbox)));
-  $("jobPageSummary").textContent = `共 ${state.jobTotal} 条`;
+  $("jobPageSummary").textContent = `鍏?${state.jobTotal} 鏉;
   $("jobPageInfo").textContent = `${state.jobPage} / ${state.jobTotalPages}`;
   $("previousJobPage").disabled = state.jobPage <= 1;
   $("nextJobPage").disabled = state.jobPage >= state.jobTotalPages;
@@ -178,8 +186,8 @@ function renderJobProgress(job) {
   const taskStatus = job.current_task_service_status || job.current_task_status || "";
   const activeTask = ["pending", "submitting", "processing", "polling", "resplitting"].includes(taskStatus.toLowerCase());
   const taskLabel = taskId && activeTask
-    ? `当前小任务 ${Number(job.current_task_window || 0) + 1}：${taskStatus} ${taskProgress.toFixed(1)}%`
-    : "暂无运行中的小任务";
+    ? `褰撳墠灏忎换鍔?${Number(job.current_task_window || 0) + 1}锛?{taskStatus} ${taskProgress.toFixed(1)}%`
+    : "鏆傛棤杩愯涓殑灏忎换鍔?;
   return `<div class="job-progress-cell">
     <span><span class="mini-progress"><span style="width:${overall}%"></span></span>${overall.toFixed(1)}%</span>
     <span class="muted job-current-task" title="${escapeHtml(taskId)}">${escapeHtml(taskLabel)}</span>
@@ -190,13 +198,13 @@ function renderJobControlActions(job) {
   const actions = [];
   const jobId = escapeHtml(job.id);
   if (["pending_schedule", "queued", "running"].includes(job.status)) {
-    actions.push(`<button class="button warning small control-job" data-job-id="${jobId}" data-action="pause" type="button">暂停</button>`);
+    actions.push(`<button class="button warning small control-job" data-job-id="${jobId}" data-action="pause" type="button">鏆傚仠</button>`);
   }
   if (["paused", "failed"].includes(job.status)) {
-    actions.push(`<button class="button primary small control-job" data-job-id="${jobId}" data-action="resume" type="button">继续</button>`);
+    actions.push(`<button class="button primary small control-job" data-job-id="${jobId}" data-action="resume" type="button">缁х画</button>`);
   }
   if (!["completed", "stopped"].includes(job.status)) {
-    actions.push(`<button class="button danger small control-job" data-job-id="${jobId}" data-action="stop" type="button">停止</button>`);
+    actions.push(`<button class="button danger small control-job" data-job-id="${jobId}" data-action="stop" type="button">鍋滄</button>`);
   }
   return actions.join("");
 }
@@ -213,8 +221,8 @@ async function updateJobReview(checkbox) {
     const job = state.jobs.find((item) => item.id === jobId);
     if (job) job.reviewed = updated.reviewed;
     if (state.detail?.job?.id === jobId) state.detail.job.reviewed = updated.reviewed;
-    checkbox.setAttribute("aria-label", `${updated.reviewed ? "取消" : "标记"}${updated.channel_name || sourceName(updated)}已审核`);
-    showToast(updated.reviewed ? "作业已标记为审核完成" : "已取消作业审核标记");
+    checkbox.setAttribute("aria-label", `${updated.reviewed ? "鍙栨秷" : "鏍囪"}${updated.channel_name || sourceName(updated)}宸插鏍竊);
+    showToast(updated.reviewed ? "浣滀笟宸叉爣璁颁负瀹℃牳瀹屾垚" : "宸插彇娑堜綔涓氬鏍告爣璁?);
   } catch (error) {
     checkbox.checked = !reviewed;
     showToast(error.message);
@@ -247,7 +255,7 @@ async function submitTimeRefresh(event) {
   if (!job) return;
   const submit = $("submitTimeRefreshButton");
   submit.disabled = true;
-  submit.textContent = "识别中";
+  submit.textContent = "璇嗗埆涓?;
   $("timeRefreshError").hidden = true;
   try {
     const manualTime = $("timeRefreshManualTime").value;
@@ -255,14 +263,14 @@ async function submitTimeRefresh(event) {
     if (manualTime) options.body = JSON.stringify({ programStartTime: manualTime });
     const result = await api(`/api/jobs/${job.id}/refresh-time-reference`, options);
     closeTimeRefresh();
-    showToast(result.manual ? `手动时间已保存，同步 ${result.updatedSegmentCount} 个片段` : `首帧时间已更新，尝试 ${result.attemptCount} 次，同步 ${result.updatedSegmentCount} 个片段`);
+    showToast(result.manual ? `鎵嬪姩鏃堕棿宸蹭繚瀛橈紝鍚屾 ${result.updatedSegmentCount} 涓墖娈礰 : `棣栧抚鏃堕棿宸叉洿鏂帮紝灏濊瘯 ${result.attemptCount} 娆★紝鍚屾 ${result.updatedSegmentCount} 涓墖娈礰);
     await loadJobs();
   } catch (error) {
     $("timeRefreshError").textContent = error.message;
     $("timeRefreshError").hidden = false;
   } finally {
     submit.disabled = false;
-    submit.textContent = "确认重新识别";
+    submit.textContent = "纭閲嶆柊璇嗗埆";
   }
 }
 
@@ -273,8 +281,8 @@ async function loadChannels() {
   const options = state.channels.map((channel) =>
     `<option value="${escapeHtml(channel.id)}">${escapeHtml(channel.name)}</option>`
   ).join("");
-  $("channelFilter").innerHTML = `<option value="">全部频道</option>${options}`;
-  $("createChannelId").innerHTML = `<option value="">请选择频道</option>${options}`;
+  $("channelFilter").innerHTML = `<option value="">鍏ㄩ儴棰戦亾</option>${options}`;
+  $("createChannelId").innerHTML = `<option value="">璇烽€夋嫨棰戦亾</option>${options}`;
   if (state.channels.some((channel) => channel.id === selectedFilter)) $("channelFilter").value = selectedFilter;
   if (state.channels.some((channel) => channel.id === selectedCreate)) $("createChannelId").value = selectedCreate;
   $("exportChannelButton").disabled = !$("channelFilter").value;
@@ -288,23 +296,23 @@ async function loadISliceInstances() {
   const filterOptions = state.isliceInstances
     .map((item) => `<option value="${escapeHtml(item.base_url)}">${escapeHtml(item.name || item.source_id || item.base_url)} (${escapeHtml(item.base_url)})</option>`)
     .join("");
-  $("isliceFilter").innerHTML = `<option value="">全部节点</option>${filterOptions}`;
+  $("isliceFilter").innerHTML = `<option value="">鍏ㄩ儴鑺傜偣</option>${filterOptions}`;
   if (state.isliceInstances.some((item) => item.base_url === selectedFilter)) $("isliceFilter").value = selectedFilter;
   const options = state.isliceInstances.filter((item) => item.schedulable)
     .map((item) => `<option value="${escapeHtml(item.base_url)}">${escapeHtml(item.name || item.source_id)} (${escapeHtml(item.base_url)})</option>`).join("");
-  $("createISliceBaseUrl").innerHTML = `<option value="">自动选择</option>${options}`;
+  $("createISliceBaseUrl").innerHTML = `<option value="">鑷姩閫夋嫨</option>${options}`;
   if (state.isliceInstances.some((item) => item.schedulable && item.base_url === selected)) $("createISliceBaseUrl").value = selected;
 }
 
 function renderChannels() {
   $("channelsList").innerHTML = state.channels.map((channel) => `
     <div class="channel-row">
-      <div><strong>${escapeHtml(channel.name)}</strong><span>${channel.job_count || 0} 个当前作业</span></div>
+      <div><strong>${escapeHtml(channel.name)}</strong><span>${channel.job_count || 0} 涓綋鍓嶄綔涓?/span></div>
       <div>
-        <button class="button secondary small rename-channel" data-channel-id="${escapeHtml(channel.id)}" type="button">重命名</button>
-        <button class="button danger small delete-channel" data-channel-id="${escapeHtml(channel.id)}" type="button" ${channel.job_count ? "disabled" : ""}>删除</button>
+        <button class="button secondary small rename-channel" data-channel-id="${escapeHtml(channel.id)}" type="button">閲嶅懡鍚?/button>
+        <button class="button danger small delete-channel" data-channel-id="${escapeHtml(channel.id)}" type="button" ${channel.job_count ? "disabled" : ""}>鍒犻櫎</button>
       </div>
-    </div>`).join("") || '<p class="empty-channel-list">暂无频道，请先添加。</p>';
+    </div>`).join("") || '<p class="empty-channel-list">鏆傛棤棰戦亾锛岃鍏堟坊鍔犮€?/p>';
   $("channelsList").querySelectorAll(".rename-channel").forEach((button) => button.addEventListener("click", () => renameChannel(button.dataset.channelId)));
   $("channelsList").querySelectorAll(".delete-channel").forEach((button) => button.addEventListener("click", () => deleteChannel(button.dataset.channelId)));
 }
@@ -344,28 +352,28 @@ function renderDetail() {
   $("summaryStatus").innerHTML = `<span class="status-pill ${statusClass(job.status)}">${escapeHtml(statusNames[job.status] || job.status)}</span>`;
   $("summaryDuration").textContent = formatSeconds(job.source_duration);
   $("summaryWindow").textContent = `${job.current_window} / ${job.total_windows}`;
-  $("summaryCutMode").textContent = job.cut_mode === "copy" ? "流复制" : "重编码";
+  $("summaryCutMode").textContent = job.cut_mode === "copy" ? "娴佸鍒? : "閲嶇紪鐮?;
   const referenceNames = {
     ocr: "OCR",
-    manual_fallback: "手工回退",
-    manual_override: "手工修正",
-    unavailable: "未识别"
+    manual_fallback: "鎵嬪伐鍥為€€",
+    manual_override: "鎵嬪伐淇",
+    unavailable: "鏈瘑鍒?
   };
   const timeInput = $("summaryRealTime");
   if (document.activeElement !== timeInput) {
     timeInput.value = toDateTimeLocal(job.program_start_time);
   }
-  const referenceLabel = referenceNames[job.time_reference_source] || "已有数据";
+  const referenceLabel = referenceNames[job.time_reference_source] || "宸叉湁鏁版嵁";
   $("timeReferenceMeta").textContent = job.time_reference_source === "ocr" && job.time_reference_frame_offset
-    ? `${referenceLabel}（取样 +${Number(job.time_reference_frame_offset).toFixed(0)} 秒，已反推首帧）`
+    ? `${referenceLabel}锛堝彇鏍?+${Number(job.time_reference_frame_offset).toFixed(0)} 绉掞紝宸插弽鎺ㄩ甯э級`
     : referenceLabel;
   $("detailProgress").style.width = `${Math.max(0, Math.min(100, job.progress || 0))}%`;
   $("detailError").hidden = !job.error_message;
   $("detailError").textContent = job.error_message || "";
   $("detailWarnings").innerHTML = (job.warnings || []).map((warning) => `<p>${escapeHtml(warning)}</p>`).join("");
   const archiveStatus = state.archiveStatus || {};
-  const archiveLabel = {ready: "已归档，可在 iSlice 清理后继续预览", pending: "归档处理中，暂不建议清理 iSlice", error: "归档存在异常，请先处理", unavailable: "归档状态暂不可用", not_applicable: "暂无可归档任务"}[archiveStatus.status] || "归档状态未知";
-  $("archiveStatus").textContent = `归档状态：${archiveLabel}`;
+  const archiveLabel = {ready: "宸插綊妗ｏ紝鍙湪 iSlice 娓呯悊鍚庣户缁瑙?, pending: "褰掓。澶勭悊涓紝鏆備笉寤鸿娓呯悊 iSlice", error: "褰掓。瀛樺湪寮傚父锛岃鍏堝鐞?, unavailable: "褰掓。鐘舵€佹殏涓嶅彲鐢?, not_applicable: "鏆傛棤鍙綊妗ｄ换鍔?}[archiveStatus.status] || "褰掓。鐘舵€佹湭鐭?;
+  $("archiveStatus").textContent = `褰掓。鐘舵€侊細${archiveLabel}`;
   renderActions(job);
 
   const latestAttempts = new Map();
@@ -412,13 +420,13 @@ function renderDetail() {
 }
 
 function renderTaskProgress(attempt) {
-  if (!attempt) return '<span class="muted">尚未提交</span>';
+  if (!attempt) return '<span class="muted">灏氭湭鎻愪氦</span>';
   const progress = Math.max(0, Math.min(100, Number(attempt.progress || 0)));
   const serviceStatus = attempt.service_status || attempt.status || "pending";
   return `
     <div class="task-progress-cell">
       <span class="mono window-task-id" title="${escapeHtml(attempt.task_id)}">${escapeHtml(attempt.task_id)}</span>
-      <span class="muted mono">真实起点 ${escapeHtml(formatRealTime(attempt.program_start_time))}</span>
+      <span class="muted mono">鐪熷疄璧风偣 ${escapeHtml(formatRealTime(attempt.program_start_time))}</span>
       <span class="task-progress-meta">
         <span class="mini-progress"><span style="width:${progress}%"></span></span>
         <strong>${progress.toFixed(0)}%</strong>
@@ -432,10 +440,10 @@ function renderResplitAction(job, windowItem, attempt) {
   const jobReady = ["paused", "completed", "failed", "stopped"].includes(job.status);
   const taskReady = ["completed", "failed", "discarded"].includes(attempt.status);
   const disabled = !(jobReady && taskReady);
-  const title = disabled ? "作业及小任务结束后才能重新拆分" : "创建全新任务 ID 重新拆分";
+  const title = disabled ? "浣滀笟鍙婂皬浠诲姟缁撴潫鍚庢墠鑳介噸鏂版媶鍒? : "鍒涘缓鍏ㄦ柊浠诲姟 ID 閲嶆柊鎷嗗垎";
   const resplitButton = `<button class="button secondary small resplit-window" type="button"
     data-window-index="${windowItem.window_index}" data-task-id="${escapeHtml(attempt.task_id)}"
-    title="${title}" ${disabled ? "disabled" : ""}>重新拆分</button>`;
+    title="${title}" ${disabled ? "disabled" : ""}>閲嶆柊鎷嗗垎</button>`;
   const boundaryError = String(windowItem.error_message || "");
   const overlapReady = job.status === "paused"
     && windowItem.status === "failed"
@@ -450,7 +458,7 @@ function renderResplitAction(job, windowItem, attempt) {
   const overlapButton = overlapReady
     ? `<button class="button danger small accept-overlap" type="button"
         data-window-index="${windowItem.window_index}" data-task-id="${escapeHtml(attempt.task_id)}"
-        title="接纳已保存的重拆结果，不再调用 iSlice">允许重叠并合并</button>`
+        title="鎺ョ撼宸蹭繚瀛樼殑閲嶆媶缁撴灉锛屼笉鍐嶈皟鐢?iSlice">鍏佽閲嶅彔骞跺悎骞?/button>`
     : "";
   return `<span class="window-actions">${resplitButton}${overlapButton}</span>`;
 }
@@ -461,7 +469,7 @@ function renderWindowActions(job, windowItem, attempt) {
   const disabled = !jobReady;
   const rebuildButton = `<button class="button danger small tail-rebuild-window" type="button"
     data-window-index="${windowItem.window_index}"
-    title="删除此窗口及后续结果，并使用新的任务 ID 从这里重新执行" ${disabled ? "disabled" : ""}>从此窗口重跑</button>`;
+    title="鍒犻櫎姝ょ獥鍙ｅ強鍚庣画缁撴灉锛屽苟浣跨敤鏂扮殑浠诲姟 ID 浠庤繖閲岄噸鏂版墽琛? ${disabled ? "disabled" : ""}>浠庢绐楀彛閲嶈窇</button>`;
   return `<span class="window-actions">${resplit}${rebuildButton}</span>`;
 }
 
@@ -480,36 +488,36 @@ function renderSegments() {
     const segmentIndex = startIndex + pageIndex;
     const previewable = Boolean(segment.segment_url);
     const active = previewable && segment.segment_url === state.previewUrl;
-    const title = segment.title || `片段 ${segmentIndex + 1}`;
+    const title = segment.title || `鐗囨 ${segmentIndex + 1}`;
     const keywords = (segment.keywords || []).join(", ") || "-";
     const isMerge = segment.record_kind === "merge";
     const isMember = Boolean(segment.active_merge_id);
     const selectable = isMergeSelectable(segment);
     const selected = selectable && state.selectedSegmentIds.has(Number(segment.id));
     const titleMarkup = isMerge
-      ? `<span class="manual-merge-badge">手工合并 · ${segment.member_count} 条</span><span class="segment-title" title="${escapeHtml(title)}">${escapeHtml(title)}</span>`
+      ? `<span class="manual-merge-badge">鎵嬪伐鍚堝苟 路 ${segment.member_count} 鏉?/span><span class="segment-title" title="${escapeHtml(title)}">${escapeHtml(title)}</span>`
       : `<span class="segment-title" title="${escapeHtml(title)}">${escapeHtml(title)}</span>`;
     let statusMarkup = segment.ignored
-      ? '<span class="status-pill neutral">忽略</span>'
+      ? '<span class="status-pill neutral">蹇界暐</span>'
       : segment.accepted
-        ? '<span class="status-pill ok">采用</span>'
-        : `<span class="status-pill warn">${escapeHtml(segment.reason || "舍弃")}</span>`;
-    if (isMember) statusMarkup = `<span class="status-pill merged">已并入手工合并</span>`;
-    if (isMerge) statusMarkup = `<span class="status-pill merged">手工合并${segment.ignored ? " · 忽略" : ""}</span>`;
-    if (segment.archive_status === "ready") statusMarkup += '<span class="status-pill ok archive-state-pill">已归档</span>';
-    else if (segment.archive_status === "pending") statusMarkup += '<span class="status-pill warn archive-state-pill">归档中</span>';
-    else if (segment.archive_status === "error") statusMarkup += '<span class="status-pill bad archive-state-pill">归档异常</span>';
-    let actions = `<button class="button secondary small segment-detail" data-segment-index="${segmentIndex}" type="button">详情</button>`;
+        ? '<span class="status-pill ok">閲囩敤</span>'
+        : `<span class="status-pill warn">${escapeHtml(segment.reason || "鑸嶅純")}</span>`;
+    if (isMember) statusMarkup = `<span class="status-pill merged">宸插苟鍏ユ墜宸ュ悎骞?/span>`;
+    if (isMerge) statusMarkup = `<span class="status-pill merged">鎵嬪伐鍚堝苟${segment.ignored ? " 路 蹇界暐" : ""}</span>`;
+    if (segment.archive_status === "ready") statusMarkup += '<span class="status-pill ok archive-state-pill">宸插綊妗?/span>';
+    else if (segment.archive_status === "pending") statusMarkup += '<span class="status-pill warn archive-state-pill">褰掓。涓?/span>';
+    else if (segment.archive_status === "error") statusMarkup += '<span class="status-pill bad archive-state-pill">褰掓。寮傚父</span>';
+    let actions = `<button class="button secondary small segment-detail" data-segment-index="${segmentIndex}" type="button">璇︽儏</button>`;
     if (isMerge) {
-      actions += `<button class="button secondary small edit-segment" data-segment-index="${segmentIndex}" type="button">编辑</button><button class="button danger small cancel-merge" data-merge-id="${escapeHtml(segment.merge_id)}" type="button">取消合并</button>`;
+      actions += `<button class="button secondary small edit-segment" data-segment-index="${segmentIndex}" type="button">缂栬緫</button><button class="button danger small cancel-merge" data-merge-id="${escapeHtml(segment.merge_id)}" type="button">鍙栨秷鍚堝苟</button>`;
     } else if (!isMember) {
-      actions += `<button class="button secondary small edit-segment" data-segment-index="${segmentIndex}" type="button">编辑</button>`;
+      actions += `<button class="button secondary small edit-segment" data-segment-index="${segmentIndex}" type="button">缂栬緫</button>`;
     }
     return `
     <tr class="segment-row${previewable ? " is-previewable" : ""}${active ? " is-active" : ""}${segment.ignored ? " is-ignored" : ""}${isMerge ? " is-manual-merge" : ""}${isMember ? " is-merge-member" : ""}${selected ? " is-selected" : ""}"
-        ${previewable ? `data-segment-index="${segmentIndex}" tabindex="0" aria-label="播放 ${escapeHtml(title)}"` : ""}
+        ${previewable ? `data-segment-index="${segmentIndex}" tabindex="0" aria-label="鎾斁 ${escapeHtml(title)}"` : ""}
         ${active ? 'aria-current="true"' : ""}>
-      <td class="merge-select-cell">${selectable ? `<input class="merge-segment-checkbox" type="checkbox" data-segment-id="${segment.id}" aria-label="选择 ${escapeHtml(title)}用于合并" ${selected ? "checked" : ""}>` : ""}</td>
+      <td class="merge-select-cell">${selectable ? `<input class="merge-segment-checkbox" type="checkbox" data-segment-id="${segment.id}" aria-label="閫夋嫨 ${escapeHtml(title)}鐢ㄤ簬鍚堝苟" ${selected ? "checked" : ""}>` : ""}</td>
       <td>${segment.window_index + 1}</td>
       <td class="mono"><span class="segment-time-stack"><span>${formatRealTime(segment.absolute_start)}</span><span>${formatRealTime(segment.absolute_end)}</span></span></td>
       <td>${titleMarkup}</td>
@@ -520,7 +528,7 @@ function renderSegments() {
       <td>${statusMarkup}</td>
       <td><span class="segment-actions">${actions}</span></td>
      </tr>`;
-  }).join("") || '<tr><td class="empty-table-row" colspan="10">暂无拆条结果</td></tr>';
+  }).join("") || '<tr><td class="empty-table-row" colspan="10">鏆傛棤鎷嗘潯缁撴灉</td></tr>';
   renderMergeSelectionBar();
 }
 
@@ -534,7 +542,7 @@ function isMergeSelectable(segment) {
 function renderMergeSelectionBar() {
   const selected = state.segments.filter((segment) => state.selectedSegmentIds.has(Number(segment.id)) && isMergeSelectable(segment));
   $("mergeSelectionBar").hidden = selected.length === 0;
-  $("mergeSelectionSummary").textContent = `已选择 ${selected.length} 条`;
+  $("mergeSelectionSummary").textContent = `宸查€夋嫨 ${selected.length} 鏉;
   $("openMergeDialogButton").disabled = selected.length < 2;
   if (!selected.length) {
     $("mergeSelectionTime").textContent = "";
@@ -542,7 +550,7 @@ function renderMergeSelectionBar() {
   }
   const start = Math.min(...selected.map((segment) => Number(segment.global_start)));
   const end = Math.max(...selected.map((segment) => Number(segment.global_end)));
-  $("mergeSelectionTime").textContent = `${formatSeconds(start)} – ${formatSeconds(end)}`;
+  $("mergeSelectionTime").textContent = `${formatSeconds(start)} 鈥?${formatSeconds(end)}`;
 }
 
 function openSegmentEdit(segmentIndex) {
@@ -556,17 +564,17 @@ function openSegmentEdit(segmentIndex) {
     index: segmentIndex,
     restoredFromTask: false
   };
-  $("segmentEditDialog").querySelector("h2").textContent = isMerge ? "编辑手工合并结果" : "编辑拆条结果";
+  $("segmentEditDialog").querySelector("h2").textContent = isMerge ? "缂栬緫鎵嬪伐鍚堝苟缁撴灉" : "缂栬緫鎷嗘潯缁撴灉";
   $("restoreSegmentEditButton").hidden = isMerge;
   $("segmentEditTitle").value = segment.title || "";
   const currentType = segment.content_type || "";
   const currentOption = $("segmentEditContentTypeCurrent");
   currentOption.value = "";
   if (CONTENT_TYPES.includes(currentType)) {
-    currentOption.textContent = "保持当前值";
+    currentOption.textContent = "淇濇寔褰撳墠鍊?;
     $("segmentEditContentType").value = currentType;
   } else {
-    currentOption.textContent = `保持当前（${currentType || "未填写"}）`;
+    currentOption.textContent = `淇濇寔褰撳墠锛?{currentType || "鏈～鍐?}锛塦;
     $("segmentEditContentType").value = "";
   }
   $("segmentEditIgnored").checked = Boolean(segment.ignored);
@@ -581,7 +589,7 @@ async function restoreSegmentEdit() {
   if (!target || !jobId || target.kind === "merge") return;
   const button = $("restoreSegmentEditButton");
   button.disabled = true;
-  button.textContent = "读取中";
+  button.textContent = "璇诲彇涓?;
   $("segmentEditError").hidden = true;
   try {
     const taskValues = await api(`/api/jobs/${jobId}/segments/${target.id}/task-values`);
@@ -590,22 +598,22 @@ async function restoreSegmentEdit() {
     const currentOption = $("segmentEditContentTypeCurrent");
     if (CONTENT_TYPES.includes(taskType)) {
       currentOption.value = "";
-      currentOption.textContent = "保持当前值";
+      currentOption.textContent = "淇濇寔褰撳墠鍊?;
       $("segmentEditContentType").value = taskType;
     } else {
       currentOption.value = taskType;
-      currentOption.textContent = `任务原值（${taskType || "未填写"}）`;
+      currentOption.textContent = `浠诲姟鍘熷€硷紙${taskType || "鏈～鍐?}锛塦;
       $("segmentEditContentType").value = taskType;
     }
     target.restoredFromTask = true;
-    $("segmentEditRestoreHint").textContent = "已从任务信息填入原始标题和节目类型，点击保存后生效。";
+    $("segmentEditRestoreHint").textContent = "宸蹭粠浠诲姟淇℃伅濉叆鍘熷鏍囬鍜岃妭鐩被鍨嬶紝鐐瑰嚮淇濆瓨鍚庣敓鏁堛€?;
     $("segmentEditRestoreHint").hidden = false;
   } catch (error) {
     $("segmentEditError").textContent = error.message;
     $("segmentEditError").hidden = false;
   } finally {
     button.disabled = false;
-    button.textContent = "还原";
+    button.textContent = "杩樺師";
   }
 }
 
@@ -616,7 +624,7 @@ async function submitSegmentEdit(event) {
   if (!target || !jobId) return;
   const submit = $("submitSegmentEditButton");
   submit.disabled = true;
-  submit.textContent = "保存中";
+  submit.textContent = "淇濆瓨涓?;
   try {
     const payload = {
       title: $("segmentEditTitle").value,
@@ -638,18 +646,18 @@ async function submitSegmentEdit(event) {
       : segment.id === updated.id);
     if (index >= 0) state.segments[index] = updated;
     if (state.previewUrl && updated.segment_url === state.previewUrl) {
-      $("previewTitle").textContent = updated.title || `片段 ${index + 1}`;
+      $("previewTitle").textContent = updated.title || `鐗囨 ${index + 1}`;
     }
     $("segmentEditDialog").close();
     state.segmentEditTarget = null;
     renderSegments();
-    showToast(updated.ignored ? "结果已标记为忽略" : "结果已保存");
+    showToast(updated.ignored ? "缁撴灉宸叉爣璁颁负蹇界暐" : "缁撴灉宸蹭繚瀛?);
   } catch (error) {
     $("segmentEditError").textContent = error.message;
     $("segmentEditError").hidden = false;
   } finally {
     submit.disabled = false;
-    submit.textContent = "保存";
+    submit.textContent = "淇濆瓨";
   }
 }
 
@@ -673,15 +681,15 @@ async function loadSegmentMergePreview(segmentIds, primarySegmentId, openDialog 
     $("segmentMergeMembers").innerHTML = preview.members.map((member) => `
       <label class="merge-member-option${member.primary ? " is-primary" : ""}">
         <input type="radio" name="mergePrimarySegment" value="${member.id}" ${member.primary ? "checked" : ""}>
-        <span class="merge-member-order">窗口 ${member.windowIndex + 1}</span>
-        <strong>${escapeHtml(member.title || "未命名片段")}</strong>
-        <span>${escapeHtml(member.contentType || "未分类")}</span>
-        <span class="mono">${escapeHtml(formatRealTime(member.absoluteStart))} – ${escapeHtml(formatRealTime(member.absoluteEnd))}</span>
+        <span class="merge-member-order">绐楀彛 ${member.windowIndex + 1}</span>
+        <strong>${escapeHtml(member.title || "鏈懡鍚嶇墖娈?)}</strong>
+        <span>${escapeHtml(member.contentType || "鏈垎绫?)}</span>
+        <span class="mono">${escapeHtml(formatRealTime(member.absoluteStart))} 鈥?${escapeHtml(formatRealTime(member.absoluteEnd))}</span>
       </label>`).join("");
     $("segmentMergeResultTitle").textContent = preview.result.title || "-";
     $("segmentMergeResultType").textContent = preview.result.contentType || "-";
     $("segmentMergeResultEvent").textContent = preview.result.newsEventType || "-";
-    $("segmentMergeResultTime").textContent = `${formatRealTime(preview.result.absoluteStart)} – ${formatRealTime(preview.result.absoluteEnd)}`;
+    $("segmentMergeResultTime").textContent = `${formatRealTime(preview.result.absoluteStart)} 鈥?${formatRealTime(preview.result.absoluteEnd)}`;
     $("segmentMergeResultDuration").textContent = formatSeconds(preview.result.globalEnd - preview.result.globalStart);
     $("segmentMergeResultBoundary").textContent = `${Number(preview.gapSeconds).toFixed(2)}s / ${Number(preview.overlapSeconds).toFixed(2)}s`;
     if (openDialog) $("segmentMergeDialog").showModal();
@@ -701,7 +709,7 @@ async function submitSegmentMerge(event) {
   if (!preview || !state.selectedJobId) return;
   const submit = $("submitSegmentMergeButton");
   submit.disabled = true;
-  submit.textContent = "合并中";
+  submit.textContent = "鍚堝苟涓?;
   try {
     await api(`/api/jobs/${state.selectedJobId}/segment-merges`, {
       method: "POST",
@@ -714,23 +722,23 @@ async function submitSegmentMerge(event) {
     $("segmentMergeDialog").close();
     state.mergePreview = null;
     state.selectedSegmentIds.clear();
-    showToast(`已手工合并 ${preview.segmentIds.length} 条结果`);
+    showToast(`宸叉墜宸ュ悎骞?${preview.segmentIds.length} 鏉＄粨鏋渀);
     await loadJobs();
   } catch (error) {
     $("segmentMergeError").textContent = error.message;
     $("segmentMergeError").hidden = false;
   } finally {
     submit.disabled = false;
-    submit.textContent = "确认手工合并";
+    submit.textContent = "纭鎵嬪伐鍚堝苟";
   }
 }
 
 async function cancelSegmentMerge(mergeId) {
   if (!state.selectedJobId) return;
-  if (!window.confirm("取消这次手工合并？原始拆条结果将恢复为独立结果并重新参与 Excel 导出。")) return;
+  if (!window.confirm("鍙栨秷杩欐鎵嬪伐鍚堝苟锛熷師濮嬫媶鏉＄粨鏋滃皢鎭㈠涓虹嫭绔嬬粨鏋滃苟閲嶆柊鍙備笌 Excel 瀵煎嚭銆?)) return;
   try {
     await api(`/api/jobs/${state.selectedJobId}/segment-merges/${mergeId}`, { method: "DELETE" });
-    showToast("已取消手工合并，原始结果已恢复");
+    showToast("宸插彇娑堟墜宸ュ悎骞讹紝鍘熷缁撴灉宸叉仮澶?);
     await loadJobs();
   } catch (error) {
     showToast(error.message);
@@ -739,7 +747,7 @@ async function cancelSegmentMerge(mergeId) {
 
 function exportDetailValue(value, kind = "text") {
   const textValue = String(value ?? "");
-  if (!textValue) return '<span class="muted">（空）</span>';
+  if (!textValue) return '<span class="muted">锛堢┖锛?/span>';
   if (kind === "link" && /^https?:\/\//i.test(textValue)) {
     return `<a class="external-link" href="${escapeHtml(textValue)}" target="_blank" rel="noreferrer">${escapeHtml(textValue)}</a>`;
   }
@@ -754,59 +762,59 @@ function openSegmentDetail(segmentIndex) {
   const isMerge = segment.record_kind === "merge";
   const isMember = Boolean(segment.active_merge_id);
   const exportDate = String(segment.absolute_start || "").match(/^(\d{4}-\d{2}-\d{2})/)?.[1] || job.broadcast_date || "";
-  const unmapped = "无映射（留空）";
+  const unmapped = "鏃犳槧灏勶紙鐣欑┖锛?;
   const fields = [
-    ["节目ID", unmapped, ""],
-    ["program_name", "标题（最终值）", segment.title || ""],
-    ["关键字", "关键词", keywords],
-    ["摘要", "摘要", segment.summary || ""],
-    ["channel_name", "频道名", job.channel_name || ""],
-    ["begin_time", "实际开始时间", segment.absolute_start ? formatRealTime(segment.absolute_start) : "", "mono"],
-    ["end_time", "实际结束时间", segment.absolute_end ? formatRealTime(segment.absolute_end) : "", "mono"],
-    ["日期", "实际开始日期；无可靠时间时回退业务日期", exportDate, "mono"],
-    ["类型1", "节目类型（最终值）", segment.content_type || ""],
-    ["类型2", "新闻事件类型", segment.news_event_type || ""],
-    ["节目是否首播", unmapped, ""],
-    ["内容是否首播", unmapped, ""],
-    ["是否栏目", unmapped, ""],
-    ["栏目名称", unmapped, ""],
-    ["节目", unmapped, ""],
-    ["集数", unmapped, ""],
-    ["是否黄金时段", unmapped, ""],
-    ["是否国产", unmapped, ""],
-    ["是否收官", unmapped, ""],
-    ["标签", unmapped, ""],
-    ["是否含广告", unmapped, ""],
-    ["处理方式", unmapped, ""],
-    ["改后节目名称", unmapped, ""],
-    ["改后开始时间", unmapped, ""],
-    ["改后结束时间", unmapped, ""],
-    ["改后日期", unmapped, ""],
-    ["改后类型1", unmapped, ""],
-    ["改后类型2", unmapped, ""],
-    ["改后节目是否首播", unmapped, ""],
-    ["改后内容是否首播", unmapped, ""],
-    ["改后是否栏目", unmapped, ""],
-    ["改后栏目名称", unmapped, ""],
-    ["改后节目", unmapped, ""],
-    ["改后集数", unmapped, ""],
-    ["改后是否黄金时段", unmapped, ""],
-    ["改后是否国产", unmapped, ""],
-    ["改后是否收官", unmapped, ""],
-    ["改后标签", unmapped, ""],
-    ["是否合并", isMerge ? "手工合并标记" : unmapped, isMerge ? "是" : ""],
-    ["是否拆条", unmapped, ""],
-    ["改后节目曾用名", unmapped, ""],
-    ["是否立即", unmapped, ""]
+    ["鑺傜洰ID", unmapped, ""],
+    ["program_name", "鏍囬锛堟渶缁堝€硷級", segment.title || ""],
+    ["鍏抽敭瀛?, "鍏抽敭璇?, keywords],
+    ["鎽樿", "鎽樿", segment.summary || ""],
+    ["channel_name", "棰戦亾鍚?, job.channel_name || ""],
+    ["begin_time", "瀹為檯寮€濮嬫椂闂?, segment.absolute_start ? formatRealTime(segment.absolute_start) : "", "mono"],
+    ["end_time", "瀹為檯缁撴潫鏃堕棿", segment.absolute_end ? formatRealTime(segment.absolute_end) : "", "mono"],
+    ["鏃ユ湡", "瀹為檯寮€濮嬫棩鏈燂紱鏃犲彲闈犳椂闂存椂鍥為€€涓氬姟鏃ユ湡", exportDate, "mono"],
+    ["绫诲瀷1", "鑺傜洰绫诲瀷锛堟渶缁堝€硷級", segment.content_type || ""],
+    ["绫诲瀷2", "鏂伴椈浜嬩欢绫诲瀷", segment.news_event_type || ""],
+    ["鑺傜洰鏄惁棣栨挱", unmapped, ""],
+    ["鍐呭鏄惁棣栨挱", unmapped, ""],
+    ["鏄惁鏍忕洰", unmapped, ""],
+    ["鏍忕洰鍚嶇О", unmapped, ""],
+    ["鑺傜洰", unmapped, ""],
+    ["闆嗘暟", unmapped, ""],
+    ["鏄惁榛勯噾鏃舵", unmapped, ""],
+    ["鏄惁鍥戒骇", unmapped, ""],
+    ["鏄惁鏀跺畼", unmapped, ""],
+    ["鏍囩", unmapped, ""],
+    ["鏄惁鍚箍鍛?, unmapped, ""],
+    ["澶勭悊鏂瑰紡", unmapped, ""],
+    ["鏀瑰悗鑺傜洰鍚嶇О", unmapped, ""],
+    ["鏀瑰悗寮€濮嬫椂闂?, unmapped, ""],
+    ["鏀瑰悗缁撴潫鏃堕棿", unmapped, ""],
+    ["鏀瑰悗鏃ユ湡", unmapped, ""],
+    ["鏀瑰悗绫诲瀷1", unmapped, ""],
+    ["鏀瑰悗绫诲瀷2", unmapped, ""],
+    ["鏀瑰悗鑺傜洰鏄惁棣栨挱", unmapped, ""],
+    ["鏀瑰悗鍐呭鏄惁棣栨挱", unmapped, ""],
+    ["鏀瑰悗鏄惁鏍忕洰", unmapped, ""],
+    ["鏀瑰悗鏍忕洰鍚嶇О", unmapped, ""],
+    ["鏀瑰悗鑺傜洰", unmapped, ""],
+    ["鏀瑰悗闆嗘暟", unmapped, ""],
+    ["鏀瑰悗鏄惁榛勯噾鏃舵", unmapped, ""],
+    ["鏀瑰悗鏄惁鍥戒骇", unmapped, ""],
+    ["鏀瑰悗鏄惁鏀跺畼", unmapped, ""],
+    ["鏀瑰悗鏍囩", unmapped, ""],
+    ["鏄惁鍚堝苟", isMerge ? "鎵嬪伐鍚堝苟鏍囪" : unmapped, isMerge ? "鏄? : ""],
+    ["鏄惁鎷嗘潯", unmapped, ""],
+    ["鏀瑰悗鑺傜洰鏇剧敤鍚?, unmapped, ""],
+    ["鏄惁绔嬪嵆", unmapped, ""]
   ];
   const eligible = Boolean(segment.accepted && !segment.ignored && !isMember && job.channel_id && job.broadcast_date);
-  let eligibilityText = "该片段会随频道 Excel 导出。";
-  if (isMerge) eligibilityText = "该手工合并结果会作为一条记录随频道 Excel 导出，原始成员不再单独导出。";
-  if (!segment.accepted) eligibilityText = "该片段不是最终采用结果，不会导出。";
-  else if (segment.ignored) eligibilityText = "该片段已标记为忽略，不会导出。";
-  else if (isMember) eligibilityText = `该片段已并入手工合并“${segment.active_merge_title || "未命名"}”，不会单独导出。`;
-  else if (!job.channel_id || !job.broadcast_date) eligibilityText = "作业缺少频道或业务日期，不会导出。";
-  $("segmentDetailTitle").textContent = segment.title || `片段 ${segmentIndex + 1}`;
+  let eligibilityText = "璇ョ墖娈典細闅忛閬?Excel 瀵煎嚭銆?;
+  if (isMerge) eligibilityText = "璇ユ墜宸ュ悎骞剁粨鏋滀細浣滀负涓€鏉¤褰曢殢棰戦亾 Excel 瀵煎嚭锛屽師濮嬫垚鍛樹笉鍐嶅崟鐙鍑恒€?;
+  if (!segment.accepted) eligibilityText = "璇ョ墖娈典笉鏄渶缁堥噰鐢ㄧ粨鏋滐紝涓嶄細瀵煎嚭銆?;
+  else if (segment.ignored) eligibilityText = "璇ョ墖娈靛凡鏍囪涓哄拷鐣ワ紝涓嶄細瀵煎嚭銆?;
+  else if (isMember) eligibilityText = `璇ョ墖娈靛凡骞跺叆鎵嬪伐鍚堝苟鈥?{segment.active_merge_title || "鏈懡鍚?}鈥濓紝涓嶄細鍗曠嫭瀵煎嚭銆俙;
+  else if (!job.channel_id || !job.broadcast_date) eligibilityText = "浣滀笟缂哄皯棰戦亾鎴栦笟鍔℃棩鏈燂紝涓嶄細瀵煎嚭銆?;
+  $("segmentDetailTitle").textContent = segment.title || `鐗囨 ${segmentIndex + 1}`;
   $("segmentExportEligibility").textContent = eligibilityText;
   $("segmentExportEligibility").className = `export-eligibility ${eligible ? "is-exported" : "is-excluded"}`;
   $("segmentExportDetailGrid").innerHTML = fields.map(([excelField, systemField, value, kind]) => `
@@ -819,11 +827,11 @@ function openSegmentDetail(segmentIndex) {
   if (isMerge) {
     const members = segment.merge_members || [];
     mergeDetail.innerHTML = `
-      <div class="manual-merge-heading"><strong>手工合并 · ${segment.member_count} 条</strong><span>主条目提供内容字段，时间覆盖全部成员</span></div>
-      <ol>${members.map((member) => `<li class="${member.role === "primary" ? "is-primary" : ""}"><span>${member.role === "primary" ? "主条目" : "成员"}</span><strong>${escapeHtml(member.title || "未命名片段")}</strong><span class="mono">${escapeHtml(formatRealTime(member.absolute_start))} – ${escapeHtml(formatRealTime(member.absolute_end))}</span></li>`).join("")}</ol>`;
+      <div class="manual-merge-heading"><strong>鎵嬪伐鍚堝苟 路 ${segment.member_count} 鏉?/strong><span>涓绘潯鐩彁渚涘唴瀹瑰瓧娈碉紝鏃堕棿瑕嗙洊鍏ㄩ儴鎴愬憳</span></div>
+      <ol>${members.map((member) => `<li class="${member.role === "primary" ? "is-primary" : ""}"><span>${member.role === "primary" ? "涓绘潯鐩? : "鎴愬憳"}</span><strong>${escapeHtml(member.title || "鏈懡鍚嶇墖娈?)}</strong><span class="mono">${escapeHtml(formatRealTime(member.absolute_start))} 鈥?${escapeHtml(formatRealTime(member.absolute_end))}</span></li>`).join("")}</ol>`;
     mergeDetail.hidden = false;
   } else if (isMember) {
-    mergeDetail.innerHTML = `<div class="manual-merge-heading"><strong>已并入手工合并</strong><span>${escapeHtml(segment.active_merge_title || "未命名合并结果")} · 共 ${segment.active_merge_member_count || 0} 条</span></div>`;
+    mergeDetail.innerHTML = `<div class="manual-merge-heading"><strong>宸插苟鍏ユ墜宸ュ悎骞?/strong><span>${escapeHtml(segment.active_merge_title || "鏈懡鍚嶅悎骞剁粨鏋?)} 路 鍏?${segment.active_merge_member_count || 0} 鏉?/span></div>`;
     mergeDetail.hidden = false;
   } else {
     mergeDetail.innerHTML = "";
@@ -840,9 +848,9 @@ function previewSegment(segmentIndex) {
   const sourceChanged = video.getAttribute("src") !== segment.segment_url;
   if (sourceChanged) video.pause();
   state.previewUrl = segment.segment_url;
-  $("previewTitle").textContent = segment.title || `片段 ${segmentIndex + 1}`;
+  $("previewTitle").textContent = segment.title || `鐗囨 ${segmentIndex + 1}`;
   $("previewTime").textContent = `${formatRealTime(segment.absolute_start)} - ${formatRealTime(segment.absolute_end)} | ${formatSeconds(segment.global_start)} - ${formatSeconds(segment.global_end)}`;
-  $("previewStatus").textContent = "正在加载媒体信息...";
+  $("previewStatus").textContent = "姝ｅ湪鍔犺浇濯掍綋淇℃伅...";
   $("previewStatus").className = "preview-status";
   $("openPreviewExternally").href = segment.segment_url;
   $("openPreviewExternally").hidden = false;
@@ -861,7 +869,7 @@ function previewSegment(segmentIndex) {
   });
   video.play().catch(() => {
     if (video.getAttribute("src")) {
-      $("previewStatus").textContent = "媒体已就绪";
+      $("previewStatus").textContent = "濯掍綋宸插氨缁?;
       $("previewStatus").className = "preview-status ready";
     }
   });
@@ -880,9 +888,9 @@ function resetPreview() {
   $("openPreviewExternally").removeAttribute("href");
   $("openPreviewExternally").hidden = true;
   $("closePreviewButton").disabled = true;
-  $("previewTitle").textContent = "未选择片段";
+  $("previewTitle").textContent = "鏈€夋嫨鐗囨";
   $("previewTime").textContent = "";
-  $("previewStatus").textContent = "未选择片段";
+  $("previewStatus").textContent = "鏈€夋嫨鐗囨";
   $("previewStatus").className = "preview-status";
   document.querySelectorAll(".segment-row.is-active").forEach((row) => {
     row.classList.remove("is-active");
@@ -891,14 +899,14 @@ function resetPreview() {
 }
 
 function renderActions(job) {
-  $("detailActions").innerHTML = `<a class="button secondary small external-link" href="/api/jobs/${escapeHtml(job.id)}/result?download=true">下载 JSON</a>`;
+  $("detailActions").innerHTML = `<a class="button secondary small external-link" href="/api/jobs/${escapeHtml(job.id)}/result?download=true">涓嬭浇 JSON</a>`;
 }
 
 async function controlJob(jobId, action, button = null) {
   if (button) button.disabled = true;
   try {
     await api(`/api/jobs/${jobId}/${action}`, { method: "POST" });
-    showToast("作业状态已更新");
+    showToast("浣滀笟鐘舵€佸凡鏇存柊");
     await loadJobs();
   } catch (error) {
     showToast(error.message);
@@ -910,31 +918,31 @@ async function saveTimeReference() {
   const jobId = state.selectedJobId;
   const value = $("summaryRealTime").value;
   if (!jobId || !value) {
-    showToast("请填写完整的真实时间基准");
+    showToast("璇峰～鍐欏畬鏁寸殑鐪熷疄鏃堕棿鍩哄噯");
     return;
   }
   const button = $("saveTimeReferenceButton");
   button.disabled = true;
-  button.textContent = "保存中";
+  button.textContent = "淇濆瓨涓?;
   try {
     const result = await api(`/api/jobs/${jobId}/time-reference`, {
       method: "PATCH",
       body: JSON.stringify({ programStartTime: value })
     });
-    showToast(`时间基准已修正，已同步 ${result.updatedSegmentCount} 个片段`);
+    showToast(`鏃堕棿鍩哄噯宸蹭慨姝ｏ紝宸插悓姝?${result.updatedSegmentCount} 涓墖娈礰);
     await loadJobs();
     await loadDetail(jobId, false);
   } catch (error) {
     showToast(error.message);
   } finally {
     button.disabled = false;
-    button.textContent = "保存";
+    button.textContent = "淇濆瓨";
   }
 }
 
 function openCreate() {
   if (!state.channels.length) {
-    showToast("请先创建频道");
+    showToast("璇峰厛鍒涘缓棰戦亾");
     $("channelsDialog").showModal();
     return;
   }
@@ -964,7 +972,7 @@ async function submitChannel(event) {
 
 async function renameChannel(channelId) {
   const channel = state.channels.find((item) => item.id === channelId);
-  const name = window.prompt("新的频道名", channel?.name || "");
+  const name = window.prompt("鏂扮殑棰戦亾鍚?, channel?.name || "");
   if (!name || name.trim() === channel?.name) return;
   try {
     await api(`/api/channels/${channelId}`, {
@@ -978,7 +986,7 @@ async function renameChannel(channelId) {
 
 async function deleteChannel(channelId) {
   const channel = state.channels.find((item) => item.id === channelId);
-  if (!window.confirm(`删除频道“${channel?.name || ""}”？`)) return;
+  if (!window.confirm(`鍒犻櫎棰戦亾鈥?{channel?.name || ""}鈥濓紵`)) return;
   try {
     await api(`/api/channels/${channelId}`, { method: "DELETE" });
     await loadChannels();
@@ -1004,7 +1012,7 @@ async function submitResplit(event) {
   if (!target) return;
   const submit = $("submitResplitButton");
   submit.disabled = true;
-  submit.textContent = "提交中";
+  submit.textContent = "鎻愪氦涓?;
   try {
     const result = await api(`/api/jobs/${target.jobId}/windows/${target.windowIndex}/resplit`, {
       method: "POST",
@@ -1012,14 +1020,14 @@ async function submitResplit(event) {
     });
     $("resplitDialog").close();
     state.resplitTarget = null;
-    showToast(`新任务 ${result.taskId} 已进入重新拆分流程`);
+    showToast(`鏂颁换鍔?${result.taskId} 宸茶繘鍏ラ噸鏂版媶鍒嗘祦绋媊);
     await loadJobs();
   } catch (error) {
     $("resplitError").textContent = error.message;
     $("resplitError").hidden = false;
   } finally {
     submit.disabled = false;
-    submit.textContent = "确认重新拆分";
+    submit.textContent = "纭閲嶆柊鎷嗗垎";
   }
 }
 
@@ -1030,12 +1038,12 @@ async function openTailRebuild(target) {
     );
     state.tailRebuildTarget = { ...target, preview };
     $("tailRebuildWindow").textContent = String(preview.startWindowNumber);
-    $("tailRebuildKeepCount").textContent = `${preview.keptWindowCount} 个窗口`;
-    $("tailRebuildDeleteCount").textContent = `${preview.deletedWindowCount} 个窗口 / ${preview.deletedAttemptCount} 次 attempt / ${preview.deletedSegmentCount} 条结果`;
-    $("tailRebuildTaskCount").textContent = `${preview.oldTaskCount} 个（保留，不删除）`;
+    $("tailRebuildKeepCount").textContent = `${preview.keptWindowCount} 涓獥鍙;
+    $("tailRebuildDeleteCount").textContent = `${preview.deletedWindowCount} 涓獥鍙?/ ${preview.deletedAttemptCount} 娆?attempt / ${preview.deletedSegmentCount} 鏉＄粨鏋渀;
+    $("tailRebuildTaskCount").textContent = `${preview.oldTaskCount} 涓紙淇濈暀锛屼笉鍒犻櫎锛塦;
     $("tailRebuildMergeImpactRow").hidden = !preview.invalidatedMergeCount;
     $("tailRebuildMergeImpact").textContent = preview.invalidatedMergeCount
-      ? `${preview.invalidatedMergeCount} 组将因成员被删除而自动失效`
+      ? `${preview.invalidatedMergeCount} 缁勫皢鍥犳垚鍛樿鍒犻櫎鑰岃嚜鍔ㄥけ鏁坄
       : "";
     $("tailRebuildSourceStart").textContent = formatSeconds(preview.sourceStart);
     $("tailRebuildAbsoluteStart").textContent = preview.absoluteStart ? formatDate(preview.absoluteStart) : "-";
@@ -1055,7 +1063,7 @@ async function submitTailRebuild(event) {
   if (!target) return;
   const submit = $("submitTailRebuildButton");
   submit.disabled = true;
-    submit.textContent = "正在删除并重新入队";
+    submit.textContent = "姝ｅ湪鍒犻櫎骞堕噸鏂板叆闃?;
   try {
     await api(`/api/jobs/${target.jobId}/windows/${target.windowIndex}/tail-rebuild`, {
       method: "POST",
@@ -1066,21 +1074,21 @@ async function submitTailRebuild(event) {
     });
     $("tailRebuildDialog").close();
     state.tailRebuildTarget = null;
-    showToast(`已删除窗口 ${target.windowIndex + 1} 及之后的数据，作业已重新入队`);
+    showToast(`宸插垹闄ょ獥鍙?${target.windowIndex + 1} 鍙婁箣鍚庣殑鏁版嵁锛屼綔涓氬凡閲嶆柊鍏ラ槦`);
     await loadJobs();
   } catch (error) {
     $("tailRebuildError").textContent = error.message;
     $("tailRebuildError").hidden = false;
   } finally {
     submit.disabled = false;
-    submit.textContent = "确认删除并重跑";
+    submit.textContent = "纭鍒犻櫎骞堕噸璺?;
   }
 }
 
 async function acceptOverlap(target) {
   const confirmed = window.confirm(
-    `将接纳任务 ${target.taskId} 已保存的重拆结果，并保留后续窗口现有结果。\n\n` +
-    "交界处会保留时间重叠，不会再次调用 iSlice。是否继续？"
+    `灏嗘帴绾充换鍔?${target.taskId} 宸蹭繚瀛樼殑閲嶆媶缁撴灉锛屽苟淇濈暀鍚庣画绐楀彛鐜版湁缁撴灉銆俓n\n` +
+    "浜ょ晫澶勪細淇濈暀鏃堕棿閲嶅彔锛屼笉浼氬啀娆¤皟鐢?iSlice銆傛槸鍚︾户缁紵"
   );
   if (!confirmed) return;
   try {
@@ -1088,7 +1096,7 @@ async function acceptOverlap(target) {
       method: "POST",
       body: JSON.stringify({ taskId: target.taskId })
     });
-    showToast("已接纳重拆结果并保留跨窗口时间重叠");
+    showToast("宸叉帴绾抽噸鎷嗙粨鏋滃苟淇濈暀璺ㄧ獥鍙ｆ椂闂撮噸鍙?);
     await loadJobs();
     await loadDetail(target.jobId);
   } catch (error) {
@@ -1103,7 +1111,7 @@ async function submitCreate(event) {
   if (!payload.programStartTime) delete payload.programStartTime;
   const submit = $("submitCreateButton");
   submit.disabled = true;
-  submit.textContent = /^https?:\/\//i.test(payload.sourcePath) ? "下载中" : "创建中";
+  submit.textContent = /^https?:\/\//i.test(payload.sourcePath) ? "涓嬭浇涓? : "鍒涘缓涓?;
   try {
     let job;
     try {
@@ -1112,7 +1120,7 @@ async function submitCreate(event) {
       if (error.detail?.code !== "channel_date_exists") throw error;
       const channel = state.channels.find((item) => item.id === payload.channelId);
       const confirmed = window.confirm(
-        `频道“${channel?.name || ""}”在 ${payload.broadcastDate} 已有作业。\n\n覆盖后旧作业将转为历史记录，是否继续？`
+        `棰戦亾鈥?{channel?.name || ""}鈥濆湪 ${payload.broadcastDate} 宸叉湁浣滀笟銆俓n\n瑕嗙洊鍚庢棫浣滀笟灏嗚浆涓哄巻鍙茶褰曪紝鏄惁缁х画锛焋
       );
       if (!confirmed) return;
       payload.overwrite = true;
@@ -1121,7 +1129,7 @@ async function submitCreate(event) {
     $("createDialog").close();
     event.currentTarget.reset();
     state.jobPage = 1;
-    showToast(payload.overwrite ? "作业已覆盖" : "作业已创建");
+    showToast(payload.overwrite ? "浣滀笟宸茶鐩? : "浣滀笟宸插垱寤?);
     await loadJobs();
     await loadDetail(job.id, true);
   } catch (error) {
@@ -1129,7 +1137,7 @@ async function submitCreate(event) {
     $("createError").hidden = false;
   } finally {
     submit.disabled = false;
-    submit.textContent = "创建作业";
+    submit.textContent = "鍒涘缓浣滀笟";
   }
 }
 
@@ -1191,28 +1199,28 @@ $("segmentsBody").addEventListener("keydown", (event) => {
 });
 $("previewVideo").addEventListener("loadedmetadata", () => {
   if ($('previewVideo').paused) {
-    $("previewStatus").textContent = "媒体已就绪";
+    $("previewStatus").textContent = "濯掍綋宸插氨缁?;
     $("previewStatus").className = "preview-status ready";
   }
 });
 $("previewVideo").addEventListener("playing", () => {
-  $("previewStatus").textContent = "正在播放";
+  $("previewStatus").textContent = "姝ｅ湪鎾斁";
   $("previewStatus").className = "preview-status ready";
 });
 $("previewVideo").addEventListener("pause", () => {
   const video = $("previewVideo");
   if (video.getAttribute("src") && !video.ended) {
-    $("previewStatus").textContent = "已暂停";
+    $("previewStatus").textContent = "宸叉殏鍋?;
     $("previewStatus").className = "preview-status";
   }
 });
 $("previewVideo").addEventListener("ended", () => {
-  $("previewStatus").textContent = "播放结束";
+  $("previewStatus").textContent = "鎾斁缁撴潫";
   $("previewStatus").className = "preview-status";
 });
 $("previewVideo").addEventListener("error", () => {
   if (!$("previewVideo").getAttribute("src")) return;
-  $("previewStatus").textContent = "浏览器无法加载该片段，请使用新窗口打开。";
+  $("previewStatus").textContent = "娴忚鍣ㄦ棤娉曞姞杞借鐗囨锛岃浣跨敤鏂扮獥鍙ｆ墦寮€銆?;
   $("previewStatus").className = "preview-status error";
 });
 $("createForm").addEventListener("submit", submitCreate);
@@ -1280,8 +1288,9 @@ Promise.all([loadHealth(), loadChannels().then(loadJobs), loadISliceInstances()]
 const priorityButton = document.createElement("button");
 priorityButton.className = "button secondary";
 priorityButton.type = "button";
-priorityButton.textContent = "调度策略";
+priorityButton.textContent = "璋冨害绛栫暐";
 priorityButton.addEventListener("click", () => configureSchedulingPriority().catch((error) => showToast(error.message)));
 document.querySelector(".topbar-actions")?.insertBefore(priorityButton, $("openCreateButton"));
 window.setInterval(() => loadJobs().catch(() => {}), 5000);
 window.setInterval(() => loadHealth().catch(() => {}), 30000);
+
