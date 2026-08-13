@@ -396,21 +396,21 @@ async def wait_for_jobs_running(database: Database, expected: int) -> None:
 
 
 @pytest.mark.asyncio
-async def test_submission_gate_prefers_higher_job_completion() -> None:
+async def test_submission_gate_prefers_lower_completed_task_count() -> None:
     gate = _ISliceSubmissionGate()
     url = "http://islice.test"
     await gate.acquire(url, "holder", 0)
-    low = asyncio.create_task(gate.acquire(url, "low", 25))
+    low = asyncio.create_task(gate.acquire(url, "low", 1))
     await asyncio.sleep(0)
-    high = asyncio.create_task(gate.acquire(url, "high", 50))
+    high = asyncio.create_task(gate.acquire(url, "high", 3))
     await asyncio.sleep(0)
 
     await gate.release(url, "holder")
-    await asyncio.wait_for(high, timeout=1)
-    assert not low.done()
-    await gate.release(url, "high")
     await asyncio.wait_for(low, timeout=1)
+    assert not high.done()
     await gate.release(url, "low")
+    await asyncio.wait_for(high, timeout=1)
+    await gate.release(url, "high")
 
 
 @pytest.mark.asyncio
@@ -474,7 +474,7 @@ async def test_two_window_job_hands_tail_to_next_window(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_jobs_take_turns_at_71_percent_with_highest_completion_first(
+async def test_jobs_take_turns_at_71_percent_with_lowest_completed_count_first(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source.ts"
@@ -514,17 +514,20 @@ async def test_jobs_take_turns_at_71_percent_with_highest_completion_first(
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(islice.created.get(), timeout=0.05)
 
-        # A is 50% complete and B is 25% complete, so A wins even if both wait.
+        # A and B have one completed task each, so their queue order breaks the tie.
         islice.set_state(c0, "processing", 71)
-        a1 = await asyncio.wait_for(islice.created.get(), timeout=1)
-        assert a1 == "sh-job-a-w001-a1"
+        first_next = await asyncio.wait_for(islice.created.get(), timeout=1)
+        assert first_next in {"sh-job-a-w001-a1", "sh-job-b-w001-a1"}
 
-        # B cannot create its next task until A's latest task reaches 71%.
+        # The other job cannot submit until the first one's latest task reaches 71%.
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(islice.created.get(), timeout=0.05)
-        islice.set_state(a1, "processing", 71)
-        b1 = await asyncio.wait_for(islice.created.get(), timeout=1)
-        assert b1 == "sh-job-b-w001-a1"
+        islice.set_state(first_next, "processing", 71)
+        second_next = await asyncio.wait_for(islice.created.get(), timeout=1)
+        assert {first_next, second_next} == {
+            "sh-job-a-w001-a1",
+            "sh-job-b-w001-a1",
+        }
     finally:
         for task in tasks:
             task.cancel()
@@ -625,7 +628,9 @@ async def test_multiple_islices_enforce_capacity_and_priority_independently(
         # Releasing one instance must not affect the other instance's gate.
         clients[urls[0]].set_progress(sixth[urls[0]], 71)
         left_next = await asyncio.wait_for(clients[urls[0]].created.get(), timeout=10)
-        assert left_next == f"sh-{completed_job[urls[0]]}-w001-a1"
+        left_job = left_next[3:].rsplit("-w", 1)[0]
+        assert left_next.endswith("-w000-a1")
+        assert left_job in assigned[urls[0]] - {completed_job[urls[0]]}
         assert clients[urls[0]].states[left_next] == ("pending", 0.0)
         assert clients[urls[1]].created.empty()
         assert clients[urls[2]].created.empty()
@@ -633,10 +638,12 @@ async def test_multiple_islices_enforce_capacity_and_priority_independently(
         for url in urls[1:]:
             clients[url].set_progress(sixth[url], 71)
             next_task = await asyncio.wait_for(clients[url].created.get(), timeout=10)
-            assert next_task == f"sh-{completed_job[url]}-w001-a1"
+            next_job = next_task[3:].rsplit("-w", 1)[0]
+            assert next_task.endswith("-w000-a1")
+            assert next_job in assigned[url] - {completed_job[url]}
             assert clients[url].states[next_task] == ("pending", 0.0)
 
-        # The 50%-complete jobs won over each instance's untouched seventh job,
+        # Jobs with the fewest completed tasks win each instance's next turn,
         # and simulated processing never exceeded five tasks per iSlice.
         for url in urls:
             assert clients[url].max_processing == 5

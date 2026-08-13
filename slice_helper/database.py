@@ -1338,7 +1338,8 @@ class Database:
             candidates = await (
                 await db.execute(
                     "SELECT * FROM jobs WHERE status='pending_schedule' "
-                    "AND superseded_at IS NULL ORDER BY created_at, id"
+                    "AND superseded_at IS NULL "
+                    "ORDER BY current_window ASC, created_at ASC, id ASC"
                 )
             ).fetchall()
 

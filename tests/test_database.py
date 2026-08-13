@@ -231,6 +231,34 @@ async def test_database_assigns_multiple_jobs_to_the_same_islice(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_database_schedules_job_with_fewest_completed_tasks_first(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "state.db")
+    await database.initialize()
+    common = {
+        "source_path": str(tmp_path / "source.ts"),
+        "source_size": 10,
+        "source_mtime_ns": 20,
+        "source_duration": 14400.0,
+        "template_id": "general",
+        "language": "zh",
+        "channel_name": "",
+        "program_start_time": None,
+        "cut_mode": "copy",
+        "total_windows": 4,
+    }
+    await database.create_job({**common, "id": "older-ahead"})
+    await database.update_job("older-ahead", current_window=2, progress=50)
+    await database.create_job({**common, "id": "newer-behind"})
+    await database.update_job("newer-behind", current_window=1, progress=25)
+
+    claimed = await database.claim_schedulable_jobs(("http://islice.test",), 1)
+
+    assert [job["id"] for job in claimed] == ["newer-behind"]
+
+
+@pytest.mark.asyncio
 async def test_paused_job_keeps_assignment_without_reserving_islice(tmp_path: Path) -> None:
     database = Database(tmp_path / "state.db")
     await database.initialize()

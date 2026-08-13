@@ -49,7 +49,7 @@ class RebuildValidationError(RuntimeError):
 
 
 class _ISliceSubmissionGate:
-    """Progress-priority admission gate for pre-LLM work on each iSlice."""
+    """Prefer the job with the fewest completed tasks on each iSlice."""
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -93,9 +93,9 @@ class _ISliceSubmissionGate:
         queue = self._waiters[base_url]
         queue[:] = [item for item in queue if not item[3].cancelled()]
         if queue:
-            best_index = max(
+            best_index = min(
                 range(len(queue)),
-                key=lambda index: (queue[index][1], -queue[index][2]),
+                key=lambda index: (queue[index][1], queue[index][2]),
             )
             ticket, _priority, _sequence, future = queue.pop(best_index)
             self._holders[base_url] = ticket
@@ -617,7 +617,7 @@ class Orchestrator:
         gate_url = str(job["islice_base_url"])
         gate_released = False
         await self._await_submission_turn(
-            job_id, gate_url, task_id, float(job.get("progress") or 0)
+            job_id, gate_url, task_id, float(job.get("current_window") or 0)
         )
         try:
             await self.database.update_attempt(
@@ -1006,7 +1006,7 @@ class Orchestrator:
                         job_id,
                         gate_url,
                         gate_ticket,
-                        float(job.get("progress") or 0),
+                        float(job.get("current_window") or 0),
                     )
                 existing = await islice_client.ensure_task(attempt["task_id"], request)
                 await self._raise_if_control_requested(job_id)
