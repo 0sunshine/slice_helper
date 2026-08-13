@@ -218,6 +218,7 @@ function openTimeRefresh(jobId) {
   $("timeRefreshChannel").textContent = job.channel_name || "-";
   $("timeRefreshSource").textContent = sourceDisplay(job);
   $("timeRefreshCurrent").textContent = formatRealTime(job.program_start_time);
+  $("timeRefreshManualTime").value = toDateTimeLocal(job.program_start_time);
   $("timeRefreshError").hidden = true;
   $("timeRefreshError").textContent = "";
   $("timeRefreshDialog").showModal();
@@ -237,11 +238,12 @@ async function submitTimeRefresh(event) {
   submit.textContent = "识别中";
   $("timeRefreshError").hidden = true;
   try {
-    const result = await api(`/api/jobs/${job.id}/refresh-time-reference`, {
-      method: "POST"
-    });
+    const manualTime = $("timeRefreshManualTime").value;
+    const options = { method: "POST" };
+    if (manualTime) options.body = JSON.stringify({ programStartTime: manualTime });
+    const result = await api(`/api/jobs/${job.id}/refresh-time-reference`, options);
     closeTimeRefresh();
-    showToast(`首帧时间已更新，尝试 ${result.attemptCount} 次，同步 ${result.updatedSegmentCount} 个片段`);
+    showToast(result.manual ? `手动时间已保存，同步 ${result.updatedSegmentCount} 个片段` : `首帧时间已更新，尝试 ${result.attemptCount} 次，同步 ${result.updatedSegmentCount} 个片段`);
     await loadJobs();
   } catch (error) {
     $("timeRefreshError").textContent = error.message;

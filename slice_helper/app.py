@@ -36,6 +36,7 @@ from .models import (
     JobStatus,
     ISliceInstanceUpsert,
     SystemResetExecute,
+    TimeReferenceRefresh,
     SegmentUpdate,
     SegmentMergeCreate,
     SegmentMergePreviewRequest,
@@ -1256,8 +1257,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @application.post("/api/jobs/{job_id}/refresh-time-reference")
-    async def refresh_job_time_reference(request: Request, job_id: str):
+    async def refresh_job_time_reference(
+        request: Request, job_id: str, body: TimeReferenceRefresh | None = None
+    ):
         job = await _require_job(request, job_id)
+        if body and body.program_start_time is not None:
+            updated, segment_count = await request.app.state.database.update_time_reference(
+                job_id, body.program_start_time.isoformat(), source="manual_override",
+                reference_text=body.program_start_time.isoformat(), reference_error="",
+                warning=f"Time reference manually supplied/refreshed by operator: {body.program_start_time.isoformat()}",
+            )
+            if updated is None:
+                raise HTTPException(status_code=404, detail="Job not found")
+            await request.app.state.orchestrator.write_manifest(job_id)
+            request.app.state.orchestrator.notify()
+            return {"job": _public_job(updated), "updatedSegmentCount": segment_count, "attemptCount": 0, "manual": True}
         source = Path(job["source_path"])
         try:
             stat = source.stat()

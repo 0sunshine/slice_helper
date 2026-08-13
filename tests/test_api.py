@@ -155,6 +155,7 @@ def test_job_api_control_and_database_backed_chunk_route(
         assert 'id="tailRebuildDialog"' in home.text
         assert 'id="timeRefreshDialog"' in home.text
         assert 'id="timeRefreshForm"' in home.text
+        assert 'id="timeRefreshManualTime"' in home.text
         assert "确认从原片重新获取时间" in home.text
         assert "<th>首帧时间</th>" in home.text
         assert 'id="tailRebuildConfirmation"' in home.text
@@ -642,6 +643,13 @@ def test_refresh_time_reference_from_source_updates_results_and_preserves_on_fai
         unchanged = client.get(f"/api/jobs/{job_id}").json()["job"]
         assert unchanged["program_start_time"] == "2026-06-20T13:00:00"
         assert frame_path.read_bytes() == b"frame-2"
+        manual = client.post(
+            f"/api/jobs/{job_id}/refresh-time-reference",
+            json={"programStartTime": "2026-06-20T14:00:00+08:00"},
+        )
+        assert manual.status_code == 200
+        assert manual.json()["manual"] is True
+        assert manual.json()["job"]["time_reference_source"] == "manual_override"
 
 
 def test_missing_time_stops_until_page_correction_and_resyncs_real_times(

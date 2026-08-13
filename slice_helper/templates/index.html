@@ -225,6 +225,10 @@
           <div><dt>原片</dt><dd id="timeRefreshSource"></dd></div>
           <div><dt>当前时间</dt><dd id="timeRefreshCurrent" class="mono"></dd></div>
         </dl>
+        <label class="time-refresh-manual">手动填写/更正时间（可选）
+          <input id="timeRefreshManualTime" type="datetime-local" step="1">
+        </label>
+        <p class="muted">填写后将跳过 OCR，直接使用该时间；留空则重新 OCR。</p>
         <p class="confirm-warning">识别成功后会替换当前时间基准，并同步修正所有任务和片段的真实时间；识别失败则保留当前时间。</p>
         <p id="timeRefreshError" class="form-error" hidden></p>
       </div>

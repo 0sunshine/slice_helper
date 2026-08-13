@@ -293,6 +293,12 @@ class TimeReferenceUpdate(BaseModel):
     program_start_time: datetime = Field(alias="programStartTime")
 
 
+class TimeReferenceRefresh(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    program_start_time: datetime | None = Field(default=None, alias="programStartTime")
+
+
 class JobReviewUpdate(BaseModel):
     reviewed: bool
 
