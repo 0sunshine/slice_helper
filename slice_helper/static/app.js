@@ -23,7 +23,7 @@ async function configureSchedulingPriority() {
   const current = await api("/api/settings/scheduling-priority");
   const dialog = document.createElement("dialog");
   dialog.className = "instance-dialog";
-  dialog.innerHTML = `<form method="dialog"><div class="dialog-header"><h2>??????</h2><button class="icon-button" value="cancel" aria-label="??">?</button></div><p class="muted">???????????????????????????</p><label>????<select id="schedulingPriorityChoice"><option value="fewest_completed">???????</option><option value="most_completed">???????</option></select></label><div class="dialog-actions"><button class="button secondary" value="cancel">??</button><button id="saveSchedulingPriority" class="button primary" value="default">??</button></div></form>`;
+  dialog.innerHTML = `<form method="dialog"><div class="dialog-header"><h2>\u8c03\u5ea6\u4f18\u5148\u7b56\u7565</h2><button class="icon-button" value="cancel" aria-label="\u5173\u95ed">?</button></div><p class="muted">\u9009\u62e9\u540e\u7acb\u5373\u5bf9\u540e\u7eed\u8c03\u5ea6\u751f\u6548\uff0c\u5f53\u524d\u6b63\u5728\u6267\u884c\u7684\u4efb\u52a1\u4e0d\u53d7\u5f71\u54cd\u3002</p><label>\u8c03\u5ea6\u7b56\u7565<select id="schedulingPriorityChoice"><option value="fewest_completed">\u5b8c\u6210\u6570\u6700\u5c11\u4f18\u5148</option><option value="most_completed">\u5b8c\u6210\u6570\u6700\u591a\u4f18\u5148</option></select></label><div class="dialog-actions"><button class="button secondary" value="cancel">\u53d6\u6d88</button><button id="saveSchedulingPriority" class="button primary" value="default">\u4fdd\u5b58</button></div></form>`;
   document.body.append(dialog);
   const choice = dialog.querySelector("#schedulingPriorityChoice");
   choice.value = current.priority;
@@ -33,7 +33,7 @@ async function configureSchedulingPriority() {
     try {
       await api("/api/settings/scheduling-priority", { method: "PUT", body: JSON.stringify({ priority: choice.value }) });
       dialog.close();
-      showToast(choice.value === "fewest_completed" ? "???????????" : "???????????");
+      showToast(choice.value === "fewest_completed" ? "\u5df2\u5207\u6362\u4e3a\u5b8c\u6210\u6570\u6700\u5c11\u4f18\u5148" : "\u5df2\u5207\u6362\u4e3a\u5b8c\u6210\u6570\u6700\u591a\u4f18\u5148");
     } catch (error) { showToast(error.message); }
   });
   dialog.addEventListener("close", () => dialog.remove(), { once: true });
@@ -1289,7 +1289,7 @@ Promise.all([loadHealth(), loadChannels().then(loadJobs), loadISliceInstances()]
 const priorityButton = document.createElement("button");
 priorityButton.className = "button secondary";
 priorityButton.type = "button";
-priorityButton.textContent = "调度策略";
+priorityButton.textContent = "\u8c03\u5ea6\u7b56\u7565";
 priorityButton.addEventListener("click", () => configureSchedulingPriority().catch((error) => showToast(error.message)));
 document.querySelector(".topbar-actions")?.insertBefore(priorityButton, $("openCreateButton"));
 window.setInterval(() => loadJobs().catch(() => {}), 5000);
