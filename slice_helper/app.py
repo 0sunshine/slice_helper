@@ -351,34 +351,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if instance is None:
             raise HTTPException(status_code=404, detail="iSlice 实例不存在")
         old_url = str(instance["base_url"]).rstrip("/")
-        task_ids = await request.app.state.database.migration_task_ids(old_url)
-        active_state = await request.app.state.database.migration_active_state(old_url)
         client = ISliceClient(request.app.state.settings, base_url=body.base_url)
         try:
             online, message = await client.ping()
-            found: list[str] = []
-            missing: list[str] = []
-            if online:
-                for task_id in task_ids:
-                    try:
-                        info = await client.get_task_info(task_id)
-                    except Exception:
-                        info = None
-                    (found if info is not None else missing).append(task_id)
-            else:
-                missing = task_ids
             return {
-                "ready": bool(online) and not missing and not active_state["jobs"] and not active_state["attempts"],
+                "ready": bool(online),
                 "oldBaseUrl": old_url,
                 "newBaseUrl": body.base_url,
                 "sourceId": instance["source_id"],
-                "taskCount": len(task_ids),
-                "foundCount": len(found),
-                "missingCount": len(missing),
-                "missingTaskIds": missing[:50],
-                "activeJobs": active_state["jobs"][:50],
-                "activeAttempts": active_state["attempts"][:50],
-                "activeBlocker": bool(active_state["jobs"] or active_state["attempts"]),
+                "taskCount": 0,
+                "foundCount": 0,
+                "missingCount": 0,
+                "missingTaskIds": [],
+                "activeBlocker": False,
                 "newNode": {"online": online, "message": message},
                 "oldNode": {"online": False, "message": "旧节点不可访问，按迁移模式跳过"},
             }
