@@ -2042,7 +2042,7 @@ class Database:
                     JOIN attempts a ON a.window_id=w.id
                     WHERE j.status='paused'
                       AND j.superseded_at IS NULL
-                      AND w.status='polling'
+                      AND w.status IN ('ready', 'polling')
                       AND a.status='polling'
                       AND COALESCE(a.submitted_at, '')<>''
                       AND a.attempt_no=(

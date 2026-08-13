@@ -122,6 +122,7 @@ class Orchestrator:
         self._scheduling_priority = "fewest_completed"
         self._submission_gate = _ISliceSubmissionGate(lambda: self._scheduling_priority)
         self._gate_monitors: dict[str, asyncio.Task[None]] = {}
+        self._paused_drains: dict[str, asyncio.Task[None]] = {}
         self._resplit_tasks: dict[tuple[str, int], asyncio.Task[None]] = {}
         self._resplit_lock = asyncio.Lock()
         self._rebuild_lock = asyncio.Lock()
@@ -155,10 +156,7 @@ class Orchestrator:
             job_id = str(item["job_id"])
             if job_id in self._active:
                 continue
-            task = asyncio.create_task(
-                self._drain_paused_job(job_id, int(item["window_index"])),
-                name=f"paused-poll-{item['task_id']}",
-            )
+            task = self._create_paused_drain(job_id, int(item["window_index"]), str(item["task_id"]))
             self._active[job_id] = task
             task.add_done_callback(
                 lambda _task, key=job_id: self._job_finished(key)
@@ -173,9 +171,14 @@ class Orchestrator:
                 await self._scheduler_task
         for task in self._active.values():
             task.cancel()
+        for task in self._paused_drains.values():
+            task.cancel()
         if self._active:
             await asyncio.gather(*self._active.values(), return_exceptions=True)
         self._active.clear()
+        if self._paused_drains:
+            await asyncio.gather(*self._paused_drains.values(), return_exceptions=True)
+        self._paused_drains.clear()
         for task in self._resplit_tasks.values():
             task.cancel()
         if self._resplit_tasks:
@@ -907,12 +910,34 @@ class Orchestrator:
             window = await self.database.get_window(job_id, window_index)
             if not job or not window or job["status"] != JobStatus.PAUSED.value:
                 return
-            await self._process_window(job, window, self._islice_client(job))
+            await self._process_window(job, window, self._islice_client(job), drain=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.exception("Paused job %s polling failed", job_id)
             await self._pause_job(job_id, str(exc))
+
+    def _create_paused_drain(
+        self, job_id: str, window_index: int, task_id: str = ""
+    ) -> asyncio.Task[None]:
+        existing = self._paused_drains.get(job_id)
+        if existing and not existing.done():
+            return existing
+        task = asyncio.create_task(
+            self._drain_paused_job(job_id, window_index),
+            name=f"paused-poll-{task_id or job_id}",
+        )
+        self._paused_drains[job_id] = task
+        task.add_done_callback(
+            lambda done, key=job_id: self._paused_drain_finished(key, done)
+        )
+        return task
+
+    def _paused_drain_finished(self, job_id: str, task: asyncio.Task[None]) -> None:
+        if self._paused_drains.get(job_id) is task:
+            self._paused_drains.pop(job_id, None)
+        if not task.cancelled() and task.exception():
+            logger.error("Paused drain for job %s failed", job_id, exc_info=task.exception())
 
     async def _honor_control_request(self, job: dict[str, Any]) -> bool:
         if job["status"] == JobStatus.STOP_REQUESTED.value or job["stop_requested"]:
@@ -945,6 +970,8 @@ class Orchestrator:
         job: dict[str, Any],
         window: dict[str, Any],
         islice_client: ISliceClient,
+        *,
+        drain: bool = False,
     ) -> bool:
         job_id = job["id"]
         index = int(window["window_index"])
@@ -986,7 +1013,7 @@ class Orchestrator:
             error_message="",
         )
         window = await self.database.get_window(job_id, index) or window
-        if await self._control_requested(job_id):
+        if not drain and await self._control_requested(job_id):
             return False
 
         attempt_items = await self.database.get_attempts(window["id"])
@@ -1020,7 +1047,7 @@ class Orchestrator:
                 else max(attempts, default=0) + 1
             )
             attempt_no = first_attempt_no
-            if await self._control_requested(job_id):
+            if not drain and await self._control_requested(job_id):
                 return False
             attempt = attempts.get(attempt_no)
             if not attempt:
@@ -1042,7 +1069,10 @@ class Orchestrator:
             )
             failure_message = ""
             try:
-                if not gate_released:
+                # A paused drain is reconciliation work for an already-submitted
+                # task. It must query iSlice immediately; waiting behind the
+                # submission gate can leave a completed task stale indefinitely.
+                if not drain and not gate_released:
                     await self._await_submission_turn(
                         job_id,
                         gate_url,
@@ -1050,7 +1080,8 @@ class Orchestrator:
                         float(job.get("current_window") or 0),
                         int(attempt["id"]),
                     )
-                await self._raise_if_control_requested(job_id)
+                if not drain:
+                    await self._raise_if_control_requested(job_id)
                 existing = await islice_client.ensure_task(attempt["task_id"], request)
                 service_status, service_progress = self._task_progress(existing)
                 attempt_fields: dict[str, Any] = {
@@ -1115,10 +1146,12 @@ class Orchestrator:
                         finished_at=utc_now(),
                     )
             except JobControlRequested:
-                if not gate_released:
-                    self._start_gate_monitor(
-                        gate_url, gate_ticket, islice_client
-                    )
+                if attempt.get("submitted_at"):
+                    # The job is paused at a safe point, but an already-submitted
+                    # iSlice task must still be polled and reconciled to the DB.
+                    self._create_paused_drain(job_id, index, gate_ticket)
+                elif not gate_released:
+                    self._start_gate_monitor(gate_url, gate_ticket, islice_client)
                 return False
             except (ISliceError, TimeoutError) as exc:
                 failure_message = str(exc)
