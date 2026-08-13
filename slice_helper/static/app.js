@@ -302,12 +302,14 @@ async function loadDetail(jobId, scroll) {
     state.selectedSegmentIds.clear();
   }
   state.selectedJobId = jobId;
-  const [detail, segments] = await Promise.all([
+  const [detail, segments, archiveStatus] = await Promise.all([
     api(`/api/jobs/${jobId}`),
-    api(`/api/jobs/${jobId}/segments?acceptedOnly=${$("acceptedOnly").checked}`)
+    api(`/api/jobs/${jobId}/segments?acceptedOnly=${$("acceptedOnly").checked}`),
+    api(`/api/jobs/${jobId}/archive-status`).catch(() => ({ status: "unavailable" }))
   ]);
   state.detail = detail;
   state.segments = segments;
+  state.archiveStatus = archiveStatus;
   if (state.previewUrl && !segments.some((segment) => segment.segment_url === state.previewUrl)) {
     resetPreview();
   }
@@ -347,6 +349,9 @@ function renderDetail() {
   $("detailError").hidden = !job.error_message;
   $("detailError").textContent = job.error_message || "";
   $("detailWarnings").innerHTML = (job.warnings || []).map((warning) => `<p>${escapeHtml(warning)}</p>`).join("");
+  const archiveStatus = state.archiveStatus || {};
+  const archiveLabel = {ready: "已归档，可在 iSlice 清理后继续预览", pending: "归档处理中，暂不建议清理 iSlice", error: "归档存在异常，请先处理", unavailable: "归档状态暂不可用", not_applicable: "暂无可归档任务"}[archiveStatus.status] || "归档状态未知";
+  $("archiveStatus").textContent = `归档状态：${archiveLabel}`;
   renderActions(job);
 
   const latestAttempts = new Map();
@@ -477,6 +482,9 @@ function renderSegments() {
         : `<span class="status-pill warn">${escapeHtml(segment.reason || "舍弃")}</span>`;
     if (isMember) statusMarkup = `<span class="status-pill merged">已并入手工合并</span>`;
     if (isMerge) statusMarkup = `<span class="status-pill merged">手工合并${segment.ignored ? " · 忽略" : ""}</span>`;
+    if (segment.archive_status === "ready") statusMarkup += '<span class="status-pill ok archive-state-pill">已归档</span>';
+    else if (segment.archive_status === "pending") statusMarkup += '<span class="status-pill warn archive-state-pill">归档中</span>';
+    else if (segment.archive_status === "error") statusMarkup += '<span class="status-pill bad archive-state-pill">归档异常</span>';
     let actions = `<button class="button secondary small segment-detail" data-segment-index="${segmentIndex}" type="button">详情</button>`;
     if (isMerge) {
       actions += `<button class="button secondary small edit-segment" data-segment-index="${segmentIndex}" type="button">编辑</button><button class="button danger small cancel-merge" data-merge-id="${escapeHtml(segment.merge_id)}" type="button">取消合并</button>`;

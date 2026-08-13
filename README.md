@@ -40,7 +40,7 @@ cp .env.example .env
 - `DATA_DIR`：SQLite、原始响应和结果 JSON，默认 `./data`
 - `TEMP_DIR`：临时小时 TS，默认 `./temp`
 - `FFMPEG_PATH`、`FFPROBE_PATH`：可执行文件名或绝对路径
-- `MAX_ACTIVE_JOBS`：不同源文件的全局并发数，默认 `15`
+- `MAX_ACTIVE_JOBS`：不同源文件的全局并发数，默认 `30`
 - `POLL_INTERVAL_SECONDS`：iSlice 轮询间隔，默认 `15`
 - `PIPELINE_PROGRESS_THRESHOLD`：同一 iSlice 的当前子任务达到该进度后，把下一次子任务提交机会交给等待队列中的另一个长文件作业，默认 `71`。单个作业内部始终严格串行，必须等当前窗口拆条完成并确定交接点后，才能排队提交下一窗口。
 - 每个窗口每次调度只提交一个 iSlice 子任务；子任务失败、提交异常或等待超时后立即暂停作业，不自动创建新的 attempt。手动恢复作业时才会创建下一次 attempt

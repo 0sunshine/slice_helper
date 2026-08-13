@@ -162,6 +162,7 @@ def test_job_api_control_and_database_backed_chunk_route(
         assert 'id="manageChannelsButton"' in home.text
         assert 'id="createISliceBaseUrl"' in home.text
         assert 'id="isliceFilter"' in home.text
+        assert 'archive-status' in home.text or '归档' in home.text
         assert 'id="jobPageInfo"' in home.text
         app_js = client.get("/static/app.js")
         styles_css = client.get("/static/styles.css")

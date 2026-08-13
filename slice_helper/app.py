@@ -149,6 +149,62 @@ def _public_segment(row: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+async def _resolve_archive_media(
+    database: Database,
+    archive_catalog: ArchiveCatalogReader,
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Resolve segment media through the archive catalog, with iSlice fallback."""
+    instances = await database.list_islice_instances()
+    by_url = {
+        str(item.get("base_url") or "").rstrip("/"): item for item in instances
+    }
+    task_rows: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        task_id = str(row.get("task_id") or "")
+        base_url = str(row.get("islice_base_url") or "").rstrip("/")
+        if task_id and base_url:
+            task_rows.setdefault((base_url, task_id), []).append(row)
+    resolved: dict[tuple[str, str], dict[int, dict[str, Any]]] = {}
+    errors: dict[tuple[str, str], str] = {}
+    for key in task_rows:
+        base_url, task_id = key
+        instance = by_url.get(base_url)
+        if not instance:
+            errors[key] = "未找到对应的 iSlice 归档配置"
+            continue
+        try:
+            preview = await archive_catalog.read_task_preview(instance, task_id)
+            resolved[key] = {
+                int(item.get("sourceIndex")): item
+                for item in preview.get("segments") or []
+                if isinstance(item, dict) and item.get("sourceIndex") is not None
+            }
+            for row in task_rows[key]:
+                row["archive_status"] = "ready"
+                row["archive_revision_digest"] = preview.get("revisionDigest") or ""
+                row["archive_url"] = preview.get("archiveUrl") or ""
+        except ArchivePreviewError as exc:
+            errors[key] = str(exc)
+    for row in rows:
+        key = (
+            str(row.get("islice_base_url") or "").rstrip("/"),
+            str(row.get("task_id") or ""),
+        )
+        source_index = int(row.get("source_index") or 0)
+        archived = resolved.get(key, {}).get(source_index)
+        if archived:
+            row["segment_url"] = archived.get("segmentUrl") or row.get("segment_url") or ""
+            row["cover_img_url"] = archived.get("coverImgUrl") or row.get("cover_img_url") or ""
+            row["archive_status"] = "ready"
+        elif key in errors:
+            row["archive_status"] = "pending" if "不存在" in errors[key] or "尚未" in errors[key] else "error"
+            row["archive_error"] = errors[key]
+        else:
+            row.setdefault("archive_status", "not_applicable")
+    return rows
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     configured = settings or Settings.from_env()
 
@@ -414,6 +470,49 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         except ArchivePreviewError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @application.get("/api/islice-instances/{instance_id}/archive-readiness")
+    async def archive_readiness(request: Request, instance_id: str):
+        instance = await request.app.state.database.get_islice_instance(instance_id)
+        if instance is None:
+            raise HTTPException(status_code=404, detail="iSlice 实例不存在")
+        base_url = str(instance.get("base_url") or "").rstrip("/")
+        jobs = await request.app.state.database.list_jobs(limit=100000)
+        scoped = [
+            job for job in jobs
+            if str(job.get("islice_base_url") or "").rstrip("/") == base_url
+            and not job.get("superseded_at")
+        ]
+        task_ids: set[str] = set()
+        for job in scoped:
+            attempts = await request.app.state.database.get_attempts_for_job(str(job["id"]))
+            task_ids.update(
+                str(row.get("task_id") or "")
+                for row in attempts
+                if row.get("task_id")
+                and (
+                    str(row.get("status") or "") == "completed"
+                    or str(row.get("service_status") or "") == "completed"
+                )
+            )
+        items: list[dict[str, Any]] = []
+        for task_id in sorted(task_ids):
+            try:
+                preview = await request.app.state.archive_catalog.read_task_preview(instance, task_id)
+                media = preview.get("segments") or []
+                missing = sum(1 for row in media if not row.get("segmentUrl"))
+                items.append({"taskId": task_id, "status": "ready" if not missing else "missing_media", "missingMedia": missing})
+            except ArchivePreviewError as exc:
+                items.append({"taskId": task_id, "status": "pending", "error": str(exc)})
+        failed = [item for item in items if item["status"] != "ready"]
+        return {
+            "instanceId": instance_id,
+            "baseUrl": base_url,
+            "jobCount": len(scoped),
+            "taskCount": len(items),
+            "ready": not failed,
+            "items": items,
+        }
 
     @application.post("/api/system-reset/preview")
     async def preview_system_reset(request: Request):
@@ -930,7 +1029,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not await request.app.state.database.get_job(job_id):
             raise HTTPException(status_code=404, detail="Job not found")
         rows = await request.app.state.database.get_segments(job_id, accepted_only=accepted_only)
+        rows = await _resolve_archive_media(
+            request.app.state.database, request.app.state.archive_catalog, rows
+        )
         return [_public_segment(row) for row in rows]
+
+    @application.get("/api/jobs/{job_id}/archive-status")
+    async def job_archive_status(request: Request, job_id: str):
+        job = await request.app.state.database.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        rows = await request.app.state.database.get_segments(job_id, accepted_only=False)
+        rows = await _resolve_archive_media(
+            request.app.state.database, request.app.state.archive_catalog, rows
+        )
+        by_task: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            task_id = str(row.get("task_id") or "")
+            if not task_id:
+                continue
+            item = by_task.setdefault(
+                task_id,
+                {"taskId": task_id, "status": "ready", "segments": 0, "errors": []},
+            )
+            item["segments"] += 1
+            status = str(row.get("archive_status") or "pending")
+            if status != "ready":
+                item["status"] = "error" if status == "error" else "pending"
+                if row.get("archive_error") and row["archive_error"] not in item["errors"]:
+                    item["errors"].append(row["archive_error"])
+        items = list(by_task.values())
+        return {
+            "jobId": job_id,
+            "status": "ready" if items and all(item["status"] == "ready" for item in items) else ("pending" if items else "not_applicable"),
+            "tasks": items,
+        }
 
     @application.patch("/api/jobs/{job_id}/segments/{segment_id}")
     async def update_segment(

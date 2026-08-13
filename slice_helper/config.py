@@ -89,7 +89,7 @@ class Settings:
             temp_dir=resolve_dir("TEMP_DIR", "temp"),
             ffmpeg_path=os.getenv("FFMPEG_PATH", "ffmpeg"),
             ffprobe_path=os.getenv("FFPROBE_PATH", "ffprobe"),
-            max_active_jobs=_env_int("MAX_ACTIVE_JOBS", 15),
+            max_active_jobs=_env_int("MAX_ACTIVE_JOBS", 30),
             poll_interval_seconds=_env_float("POLL_INTERVAL_SECONDS", 15.0),
             window_timeout_seconds=_env_float("WINDOW_TIMEOUT_SECONDS", 21600.0),
             ffmpeg_timeout_seconds=_env_float("FFMPEG_TIMEOUT_SECONDS", 7200.0),

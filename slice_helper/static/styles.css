@@ -45,6 +45,8 @@ main { width: 100%; }
 .section-heading > div { display: flex; align-items: center; gap: 8px; }
 .subsection-heading { margin: 24px 0 10px; }
 .filter-label, .segments-heading label { display: flex; align-items: center; gap: 8px; color: #59615b; }
+.archive-state-pill { margin-left: 4px; }
+.archive-status { margin: 10px 0 0; color: #59615b; font-size: 13px; }
 .job-filters { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 9px; }
 .job-filters input, .job-filters select { min-height: 34px; }
 .segments-controls, .segment-pagination { display: flex; align-items: center; gap: 8px; }

@@ -2243,7 +2243,7 @@ class Database:
         self, job_id: str, accepted_only: bool = False
     ) -> list[dict[str, Any]]:
         query = """
-            SELECT s.*, w.window_index,
+            SELECT s.*, w.window_index, j.islice_base_url,
                    mm.merge_id AS active_merge_id,
                    mm.member_order AS merge_member_order,
                    mm.role AS merge_role,
@@ -2253,6 +2253,7 @@ class Database:
                    sm.global_start AS active_merge_global_start
             FROM segments s
             JOIN windows w ON w.id=s.window_id
+            JOIN jobs j ON j.id=s.job_id
             LEFT JOIN segment_merge_members mm
               ON mm.segment_id=s.id AND mm.active=1
             LEFT JOIN segment_merges sm
@@ -2297,6 +2298,10 @@ class Database:
                 members_by_merge.get(merge_id, []),
                 key=lambda item: int(item["merge_member_order"]),
             )
+            primary = next(
+                (item for item in members if item.get("merge_role") == "primary"),
+                members[0] if members else None,
+            )
             merge_starts[merge_id] = float(merge["global_start"])
             merges.append(
                 {
@@ -2307,7 +2312,6 @@ class Database:
                     "window_index": min(
                         (int(item["window_index"]) for item in members), default=0
                     ),
-                    "source_index": -1,
                     "accepted": 1,
                     "ignored": int(merge["ignored"]),
                     "reason": "manual merge",
@@ -2330,7 +2334,9 @@ class Database:
                     "segment_url": "",
                     "cover_img_url": "",
                     "attempt_id": None,
-                    "task_id": "",
+                    "task_id": primary.get("task_id", "") if primary else "",
+                    "islice_base_url": primary.get("islice_base_url", "") if primary else "",
+                    "source_index": primary.get("source_index", -1) if primary else -1,
                     "raw_json": "{}",
                     "record_kind": "merge",
                     "manual_merge": 1,
