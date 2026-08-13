@@ -91,6 +91,7 @@ function renderInstances() {
       </dl>
       <div class="instance-actions">
         <button class="button secondary small edit-instance" data-id="${item.id}" type="button">编辑</button>
+        <button class="button warning small migrate-instance" data-id="${item.id}" type="button">迁移服务</button>
         <button class="button secondary small check-agent" data-id="${item.id}" type="button" ${item.ssh_host ? "" : "disabled"}>检查</button>
         <button class="button primary small deploy-agent" data-id="${item.id}" type="button" ${item.ssh_host ? "" : "disabled"}>部署/拉起</button>
         <button class="button danger small delete-instance" data-id="${item.id}" type="button" ${item.job_count ? "disabled" : ""}>删除</button>
@@ -433,6 +434,21 @@ function updateArchiveNamespace() {
   $("instanceCatalogUrl").value = `http://192.168.6.200:18080/sources/${sourceId}/catalog.json`;
 }
 
+function openMigration(item) {
+  $("migrationInstanceId").value = item.id;
+  $("migrationBaseUrl").value = item.base_url;
+  $("migrationSshHost").value = item.ssh_host || "";
+  $("migrationSshPort").value = item.ssh_port || 22;
+  $("migrationSshUsername").value = item.ssh_username || "root";
+  $("migrationSshPassword").value = "";
+  $("migrationAgentPath").value = item.agent_install_path || "";
+  $("migrationDatabasePath").value = item.islice_database_path || "";
+  $("migrationStorageRoot").value = item.storage_root || "";
+  $("migrationResult").hidden = true;
+  $("migrationDialog").dataset.ready = "";
+  $("migrationDialog").showModal();
+}
+
 $("instanceSourceId").addEventListener("change", updateArchiveNamespace);
 
 $("instanceForm").addEventListener("submit", async (event) => {
@@ -478,6 +494,8 @@ $("instanceForm").addEventListener("submit", async (event) => {
 $("instanceCards").addEventListener("click", async (event) => {
   const edit = event.target.closest(".edit-instance");
   if (edit) return openInstance(state.instances.find((item) => item.id === edit.dataset.id));
+  const migrate = event.target.closest(".migrate-instance");
+  if (migrate) return openMigration(state.instances.find((item) => item.id === migrate.dataset.id));
   const check = event.target.closest(".check-agent");
   if (check) {
     check.disabled = true;
@@ -500,7 +518,19 @@ $("instanceCards").addEventListener("click", async (event) => {
   catch (error) { toast(error.message, true); }
 });
 
+function migrationValues() { return { baseUrl: $("migrationBaseUrl").value, sshHost: $("migrationSshHost").value, sshPort: Number($("migrationSshPort").value), sshUsername: $("migrationSshUsername").value, sshPassword: $("migrationSshPassword").value || null, agentInstallPath: $("migrationAgentPath").value, isliceDatabasePath: $("migrationDatabasePath").value, storageRoot: $("migrationStorageRoot").value }; }
+function invalidateMigrationValidation() { $("migrationDialog").dataset.ready = ""; $("migrationResult").hidden = true; }
+for (const id of ["migrationBaseUrl", "migrationSshHost", "migrationSshPort", "migrationSshUsername", "migrationSshPassword", "migrationAgentPath", "migrationDatabasePath", "migrationStorageRoot"]) $(id).addEventListener("input", invalidateMigrationValidation);
+async function validateMigration() {
+  try { const payload = await request(`/api/islice-instances/${$("migrationInstanceId").value}/migration/validate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(migrationValues()) }); $("migrationResult").textContent = payload.ready ? `校验通过：找到全部 ${payload.taskCount} 个历史任务，可以迁移。` : `校验失败：找到 ${payload.foundCount}/${payload.taskCount} 个历史任务。`; $("migrationResult").hidden = false; $("migrationDialog").dataset.ready = payload.ready ? "1" : ""; } catch (error) { $("migrationResult").textContent = error.message; $("migrationResult").hidden = false; }
+}
+async function executeMigration(event) { event.preventDefault(); if ($("migrationDialog").dataset.ready !== "1") return validateMigration(); if (!confirm("确认迁移？旧节点不会被连接或删除，历史作业地址将切换到新节点。")) return; try { const result = await request(`/api/islice-instances/${$("migrationInstanceId").value}/migration/execute`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(migrationValues()) }); $("migrationDialog").close(); toast(`迁移完成，已更新 ${result.instance.migratedJobCount} 个历史作业`); await loadInstances(); await loadBackups(); } catch (error) { $("migrationResult").textContent = error.message; $("migrationResult").hidden = false; } }
+
 $("addInstance").addEventListener("click", () => openInstance());
+$("migrationForm").addEventListener("submit", executeMigration);
+$("validateMigration").addEventListener("click", validateMigration);
+$("closeMigration").addEventListener("click", () => $("migrationDialog").close());
+$("cancelMigration").addEventListener("click", () => $("migrationDialog").close());
 $("closeInstanceDialog").addEventListener("click", () => $("instanceDialog").close());
 $("cancelInstance").addEventListener("click", () => $("instanceDialog").close());
 $("refreshBackup").addEventListener("click", async () => { await loadInstances(); await loadBackups(); });

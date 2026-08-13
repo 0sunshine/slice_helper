@@ -162,6 +162,23 @@ class Database:
                     executed_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS islice_migrations (
+                    id TEXT PRIMARY KEY,
+                    instance_id TEXT NOT NULL REFERENCES islice_instances(id),
+                    source_id TEXT NOT NULL,
+                    old_base_url TEXT NOT NULL,
+                    new_base_url TEXT NOT NULL,
+                    task_count INTEGER NOT NULL DEFAULT 0,
+                    missing_task_count INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    validation_json TEXT NOT NULL DEFAULT '{}',
+                    old_config_json TEXT NOT NULL DEFAULT '{}',
+                    new_config_json TEXT NOT NULL DEFAULT '{}',
+                    error_message TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY,
                     source_path TEXT NOT NULL,
@@ -631,6 +648,23 @@ class Database:
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(21, ?)",
                 (utc_now(),),
             )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(22, ?)",
+                (utc_now(),),
+            )
+            migration_columns = {
+                row["name"]
+                for row in await (await db.execute("PRAGMA table_info(islice_migrations)")).fetchall()
+            }
+            for column in ("old_config_json", "new_config_json"):
+                if column not in migration_columns:
+                    await db.execute(
+                        f"ALTER TABLE islice_migrations ADD COLUMN {column} TEXT NOT NULL DEFAULT '{{}}'"
+                    )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(23, ?)",
+                (utc_now(),),
+            )
             await db.commit()
 
     @staticmethod
@@ -1035,6 +1069,167 @@ class Database:
             ).fetchone()
             await db.commit()
         return self._public_islice_instance(dict(row))
+
+    async def migration_task_ids(self, old_base_url: str, limit: int = 100) -> list[str]:
+        async with self.connect() as db:
+            rows = await (
+                await db.execute(
+                    """SELECT DISTINCT a.task_id FROM attempts a
+                       JOIN windows w ON w.id=a.window_id JOIN jobs j ON j.id=w.job_id
+                       WHERE j.islice_base_url=? AND a.task_id<>''
+                       ORDER BY a.submitted_at DESC LIMIT ?""",
+                    (old_base_url.rstrip("/"), limit),
+                )
+            ).fetchall()
+        return [str(row["task_id"]) for row in rows]
+
+    async def migration_active_state(self, old_base_url: str) -> dict[str, Any]:
+        """Return jobs/attempts that are still live on the old service.
+
+        A migration changes the URL used by the orchestrator.  Existing in-process
+        workers cannot safely be rebound, so the API refuses a migration while any
+        old-node work is still active.
+        """
+        active_job_statuses = (
+            "probing", "running", "pause_requested", "stop_requested",
+        )
+        placeholders = ",".join("?" for _ in active_job_statuses)
+        async with self.connect() as db:
+            jobs = await (
+                await db.execute(
+                    f"""SELECT id,status,channel_name,broadcast_date FROM jobs
+                        WHERE islice_base_url=? AND superseded_at IS NULL
+                          AND status IN ({placeholders})
+                        ORDER BY created_at,id""",
+                    (old_base_url.rstrip("/"), *active_job_statuses),
+                )
+            ).fetchall()
+            attempts = await (
+                await db.execute(
+                    """SELECT a.task_id,a.status,w.job_id,w.window_index
+                       FROM attempts a JOIN windows w ON w.id=a.window_id
+                       JOIN jobs j ON j.id=w.job_id
+                       WHERE j.islice_base_url=? AND a.status IN
+                         ('submitted','polling','resplit_queued','resplitting')
+                       ORDER BY a.id""",
+                    (old_base_url.rstrip("/"),),
+                )
+            ).fetchall()
+        return {"jobs": [dict(row) for row in jobs], "attempts": [dict(row) for row in attempts]}
+
+    async def get_islice_migration(self, instance_id: str, migration_id: str) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            row = await (
+                await db.execute(
+                    "SELECT * FROM islice_migrations WHERE id=? AND instance_id=?",
+                    (migration_id, instance_id),
+                )
+            ).fetchone()
+        return dict(row) if row else None
+
+    async def migrate_islice_instance(
+        self, instance_id: str, record: dict[str, Any], validation: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        current = await self.get_islice_instance_secret(instance_id)
+        if current is None:
+            return None
+        old_url = str(current["base_url"]).rstrip("/")
+        new_url = str(record["base_url"]).rstrip("/")
+        old_config = {
+            key: current.get(key, "") for key in (
+                "source_id", "name", "base_url", "archive_catalog_url", "schedulable",
+                "ssh_host", "ssh_port", "ssh_username", "ssh_password_encrypted", "ssh_host_key_sha256",
+                "agent_install_path", "islice_database_path", "storage_root",
+                "archive_remote_host", "archive_remote_user", "archive_remote_root",
+                "archive_http_base", "archive_ssh_key", "archive_known_hosts",
+            )
+        }
+        now = utc_now()
+        migration_id = uuid.uuid4().hex
+        password = record.get("ssh_password_encrypted")
+        encrypted = password if password is not None else current.get("ssh_password_encrypted", "")
+        fields = {
+                "base_url": new_url,
+                "ssh_host": record["ssh_host"], "ssh_port": int(record.get("ssh_port") or 22),
+                "ssh_username": record["ssh_username"], "ssh_password_encrypted": encrypted,
+                "ssh_host_key_sha256": "",
+                "agent_install_path": record["agent_install_path"],
+                "islice_database_path": record["islice_database_path"],
+                "storage_root": record["storage_root"],
+                "agent_status": "unconfigured", "agent_last_error": "", "updated_at": now,
+        }
+        new_config = {key: fields.get(key, current.get(key, "")) for key in old_config}
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                "UPDATE islice_instances SET " + ", ".join(f"{key}=:{key}" for key in fields) + " WHERE id=:instance_id",
+                {**fields, "instance_id": instance_id},
+            )
+            cursor = await db.execute(
+                "UPDATE jobs SET islice_base_url=?, updated_at=? WHERE islice_base_url=?",
+                (new_url, now, old_url),
+            )
+            await db.execute(
+                """INSERT INTO islice_migrations
+                   (id,instance_id,source_id,old_base_url,new_base_url,task_count,
+                    missing_task_count,status,validation_json,old_config_json,new_config_json,created_at,completed_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (migration_id, instance_id, current["source_id"], old_url, new_url,
+                 int(validation.get("taskCount") or 0), int(validation.get("missingCount") or 0),
+                 "completed", json.dumps(validation, ensure_ascii=False),
+                 json.dumps(old_config, ensure_ascii=False), json.dumps(new_config, ensure_ascii=False), now, now),
+            )
+            updated = await (await db.execute("SELECT * FROM islice_instances WHERE id=?", (instance_id,))).fetchone()
+            await db.commit()
+        result = self._public_islice_instance(dict(updated))
+        result["migratedJobCount"] = int(cursor.rowcount)
+        result["migrationId"] = migration_id
+        result["oldBaseUrl"] = old_url
+        return result
+
+    async def rollback_islice_migration(self, instance_id: str, migration_id: str) -> dict[str, Any] | None:
+        migration = await self.get_islice_migration(instance_id, migration_id)
+        if migration is None or migration.get("status") != "completed":
+            return None
+        try:
+            old_config = json.loads(migration.get("old_config_json") or "{}")
+        except (TypeError, ValueError):
+            old_config = {}
+        if not old_config.get("base_url"):
+            raise ValueError("迁移记录缺少旧配置快照，无法回滚")
+        current = await self.get_islice_instance_secret(instance_id)
+        if current is None:
+            return None
+        old_url = str(old_config["base_url"]).rstrip("/")
+        new_url = str(migration["new_base_url"]).rstrip("/")
+        now = utc_now()
+        fields = {key: old_config.get(key, current.get(key, "")) for key in (
+            "source_id", "name", "base_url", "archive_catalog_url", "schedulable",
+            "ssh_host", "ssh_port", "ssh_username", "ssh_password_encrypted", "ssh_host_key_sha256",
+            "agent_install_path", "islice_database_path", "storage_root",
+            "archive_remote_host", "archive_remote_user", "archive_remote_root",
+            "archive_http_base", "archive_ssh_key", "archive_known_hosts",
+        )}
+        fields.update({"ssh_host_key_sha256": "", "agent_status": "unconfigured", "agent_last_error": "", "updated_at": now})
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                "UPDATE islice_instances SET " + ", ".join(f"{k}=:{k}" for k in fields) + " WHERE id=:instance_id",
+                {**fields, "instance_id": instance_id},
+            )
+            cursor = await db.execute(
+                "UPDATE jobs SET islice_base_url=?, updated_at=? WHERE islice_base_url=?",
+                (old_url, now, new_url),
+            )
+            await db.execute(
+                "UPDATE islice_migrations SET status='rolled_back',completed_at=? WHERE id=?",
+                (now, migration_id),
+            )
+            updated = await (await db.execute("SELECT * FROM islice_instances WHERE id=?", (instance_id,))).fetchone()
+            await db.commit()
+        result = self._public_islice_instance(dict(updated))
+        result.update({"rollbackId": migration_id, "rolledBackJobCount": int(cursor.rowcount), "newBaseUrl": new_url})
+        return result
 
     async def update_agent_health(
         self,

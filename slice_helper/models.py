@@ -278,6 +278,44 @@ class ISliceInstanceUpsert(BaseModel):
         return self
 
 
+class ISliceMigrationRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    base_url: str = Field(alias="baseUrl", min_length=8, max_length=2048)
+    ssh_host: str = Field(alias="sshHost", min_length=1, max_length=255)
+    ssh_port: int = Field(default=22, alias="sshPort", ge=1, le=65535)
+    ssh_username: str = Field(alias="sshUsername", min_length=1, max_length=128)
+    ssh_password: str | None = Field(default=None, alias="sshPassword", max_length=1024)
+    agent_install_path: str = Field(alias="agentInstallPath", min_length=1, max_length=2048)
+    islice_database_path: str = Field(alias="isliceDatabasePath", min_length=1, max_length=2048)
+    storage_root: str = Field(alias="storageRoot", min_length=1, max_length=2048)
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        parsed = urlsplit(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("baseUrl must be an HTTP URL")
+        return normalized
+
+    @field_validator("ssh_host", "ssh_username")
+    @classmethod
+    def normalize_migration_text(cls, value: str) -> str:
+        value = value.strip()
+        if any(char in value for char in ("\x00", "\r", "\n")):
+            raise ValueError("migration values cannot contain control characters")
+        return value
+
+    @field_validator("agent_install_path", "islice_database_path", "storage_root")
+    @classmethod
+    def validate_migration_path(cls, value: str) -> str:
+        value = value.strip().rstrip("/")
+        if not value.startswith("/"):
+            raise ValueError("migration paths must be absolute Linux paths")
+        return value
+
+
 class SystemResetExecute(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 

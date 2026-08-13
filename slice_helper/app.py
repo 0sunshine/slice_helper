@@ -25,7 +25,7 @@ from .archive_status import ArchiveCatalogReader, ArchivePreviewError
 from .config import Settings
 from .database import Database
 from .excel_export import build_channel_workbook, safe_export_filename
-from .islice import ISlicePool
+from .islice import ISliceClient, ISlicePool
 from .media import MediaError, MediaService
 from .models import (
     CONTENT_TYPES,
@@ -35,6 +35,7 @@ from .models import (
     JobCreate,
     JobStatus,
     ISliceInstanceUpsert,
+    ISliceMigrationRequest,
     SystemResetExecute,
     TimeReferenceRefresh,
     SegmentUpdate,
@@ -341,6 +342,78 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         request.app.state.orchestrator.notify()
         return instance
+
+    @application.post("/api/islice-instances/{instance_id}/migration/validate")
+    async def validate_islice_migration(
+        request: Request, instance_id: str, body: ISliceMigrationRequest
+    ):
+        instance = await request.app.state.database.get_islice_instance(instance_id)
+        if instance is None:
+            raise HTTPException(status_code=404, detail="iSlice 实例不存在")
+        old_url = str(instance["base_url"]).rstrip("/")
+        task_ids = await request.app.state.database.migration_task_ids(old_url)
+        active_state = await request.app.state.database.migration_active_state(old_url)
+        client = ISliceClient(request.app.state.settings, base_url=body.base_url)
+        try:
+            online, message = await client.ping()
+            found: list[str] = []
+            missing: list[str] = []
+            if online:
+                for task_id in task_ids:
+                    try:
+                        info = await client.get_task_info(task_id)
+                    except Exception:
+                        info = None
+                    (found if info is not None else missing).append(task_id)
+            else:
+                missing = task_ids
+            return {
+                "ready": bool(online) and not missing and not active_state["jobs"] and not active_state["attempts"],
+                "oldBaseUrl": old_url,
+                "newBaseUrl": body.base_url,
+                "sourceId": instance["source_id"],
+                "taskCount": len(task_ids),
+                "foundCount": len(found),
+                "missingCount": len(missing),
+                "missingTaskIds": missing[:50],
+                "activeJobs": active_state["jobs"][:50],
+                "activeAttempts": active_state["attempts"][:50],
+                "activeBlocker": bool(active_state["jobs"] or active_state["attempts"]),
+                "newNode": {"online": online, "message": message},
+                "oldNode": {"online": False, "message": "旧节点不可访问，按迁移模式跳过"},
+            }
+        finally:
+            await client.close()
+
+    @application.post("/api/islice-instances/{instance_id}/migration/execute")
+    async def execute_islice_migration(
+        request: Request, instance_id: str, body: ISliceMigrationRequest
+    ):
+        validation = await validate_islice_migration(request, instance_id, body)
+        if not validation["ready"]:
+            raise HTTPException(status_code=409, detail={"code": "migration_not_ready", "validation": validation})
+        record = body.model_dump()
+        password = record.pop("ssh_password", None)
+        if password:
+            record["ssh_password_encrypted"] = request.app.state.service_manager.cipher.encrypt(password)
+        updated = await request.app.state.database.migrate_islice_instance(instance_id, record, validation)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="iSlice 实例不存在")
+        await request.app.state.islice.reconcile(await request.app.state.database.all_islice_urls())
+        request.app.state.orchestrator.notify()
+        return {"status": "completed", "validation": validation, "instance": updated}
+
+    @application.post("/api/islice-instances/{instance_id}/migration/rollback/{migration_id}")
+    async def rollback_islice_migration(request: Request, instance_id: str, migration_id: str):
+        try:
+            result = await request.app.state.database.rollback_islice_migration(instance_id, migration_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if result is None:
+            raise HTTPException(status_code=404, detail="迁移记录不存在或已回滚")
+        await request.app.state.islice.reconcile(await request.app.state.database.all_islice_urls())
+        request.app.state.orchestrator.notify()
+        return {"status": "rolled_back", "instance": result}
 
     @application.post("/api/islice-instances/{instance_id}/deploy-agent")
     async def deploy_archive_agent(request: Request, instance_id: str):

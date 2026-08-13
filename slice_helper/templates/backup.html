@@ -105,6 +105,24 @@
     </form>
   </dialog>
 
+  <dialog id="migrationDialog" class="instance-dialog">
+    <form id="migrationForm" method="dialog">
+      <div class="dialog-header"><h2>迁移 iSlice 服务</h2><button id="closeMigration" class="icon-button" type="button">×</button></div>
+      <p class="confirm-warning">旧节点不可访问模式：系统只校验新节点。sourceId、归档目录和历史 task ID 保持不变。</p>
+      <input id="migrationInstanceId" type="hidden">
+      <div class="form-grid instance-form-grid">
+        <label class="full">新 iSlice API 地址<input id="migrationBaseUrl" required></label>
+        <label>新机器 SSH 主机<input id="migrationSshHost" required></label><label>SSH 端口<input id="migrationSshPort" type="number" value="22" required></label>
+        <label>SSH 用户<input id="migrationSshUsername" required></label><label>SSH 密码<input id="migrationSshPassword" type="password"></label>
+        <label class="full">代理安装目录<input id="migrationAgentPath" required></label>
+        <label class="full">iSlice 数据库路径<input id="migrationDatabasePath" required></label>
+        <label class="full">iSlice storage 路径<input id="migrationStorageRoot" required></label>
+      </div>
+      <p id="migrationResult" class="form-error" hidden></p>
+      <div class="dialog-actions"><button id="cancelMigration" class="button secondary" type="button">取消</button><button id="validateMigration" class="button secondary" type="button">校验新节点</button><button class="button primary" type="submit">确认迁移</button></div>
+    </form>
+  </dialog>
+
   <dialog id="archivePreviewDialog" class="archive-preview-dialog">
     <div class="dialog-header">
       <div><h2 id="archivePreviewTitle">归档任务预览</h2><small id="archivePreviewSource" class="muted mono"></small></div>
