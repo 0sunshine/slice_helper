@@ -1526,6 +1526,59 @@ class Database:
             await db.commit()
         return value
 
+    async def active_submission_attempts(
+        self, base_url: str, *, exclude_attempt_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Return submitted non-terminal attempts that still occupy an iSlice gate.
+
+        This is persisted coordination for the per-iSlice 71% gate.  The in-memory
+        asyncio gate is not enough after a process restart, and paused jobs may
+        still have a task running on iSlice.
+        """
+        params: list[Any] = [base_url.rstrip("/")]
+        exclude_clause = ""
+        if exclude_attempt_id is not None:
+            exclude_clause = " AND a.id<>?"
+            params.append(exclude_attempt_id)
+        async with self.connect() as db:
+            rows = await (
+                await db.execute(
+                    """
+                    SELECT a.id,a.task_id,a.status,a.service_status,a.progress,
+                           a.submitted_at,w.job_id,w.window_index
+                    FROM attempts a
+                    JOIN windows w ON w.id=a.window_id
+                    JOIN jobs j ON j.id=w.job_id
+                    WHERE j.islice_base_url=?
+                      AND j.superseded_at IS NULL
+                      AND a.status IN ('submitted','polling','resplitting')
+                      AND COALESCE(a.submitted_at,'')<>''
+                      AND COALESCE(a.progress,0)<100
+                    """ + exclude_clause + " ORDER BY a.id",
+                    params,
+                )
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    async def active_submission_job_count(self) -> int:
+        """Count distinct jobs with a submitted, non-terminal iSlice task."""
+        async with self.connect() as db:
+            row = await (
+                await db.execute(
+                    """
+                    SELECT COUNT(DISTINCT w.job_id) AS value
+                    FROM attempts a
+                    JOIN windows w ON w.id=a.window_id
+                    JOIN jobs j ON j.id=w.job_id
+                    WHERE j.superseded_at IS NULL
+                      AND a.status IN ('submitted','polling','resplitting')
+                      AND COALESCE(a.submitted_at,'')<>''
+                      AND COALESCE(a.progress,0)<100
+                    """
+                )
+            ).fetchone()
+        return int(row["value"] or 0)
+
     async def claim_schedulable_jobs(
         self,
         urls: tuple[str, ...],
@@ -1555,11 +1608,22 @@ class Database:
             active_rows = await (
                 await db.execute(
                     f"""
-                    SELECT j.islice_base_url, COUNT(*) AS job_count
+                    SELECT j.islice_base_url, COUNT(DISTINCT j.id) AS job_count
                     FROM jobs j
-                    WHERE j.status IN ({active_placeholders})
-                      AND j.islice_base_url<>''
+                    WHERE j.islice_base_url<>''
                       AND j.superseded_at IS NULL
+                      AND (
+                          j.status IN ({active_placeholders})
+                          OR EXISTS (
+                              SELECT 1
+                              FROM attempts a
+                              JOIN windows w ON w.id=a.window_id
+                              WHERE w.job_id=j.id
+                                AND a.status IN ('submitted','polling','resplitting')
+                                AND COALESCE(a.submitted_at,'')<>''
+                                AND COALESCE(a.progress,0)<100
+                          )
+                      )
                     GROUP BY j.islice_base_url
                     """,
                     active_statuses,

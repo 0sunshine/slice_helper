@@ -293,6 +293,37 @@ async def test_paused_job_keeps_assignment_without_reserving_islice(tmp_path: Pa
     )
 
 
+@pytest.mark.asyncio
+async def test_paused_submitted_attempt_reserves_islice(tmp_path: Path) -> None:
+    database = Database(tmp_path / "state.db")
+    await database.initialize()
+    common = {
+        "source_path": str(tmp_path / "source.ts"),
+        "source_size": 10,
+        "source_mtime_ns": 20,
+        "source_duration": 60.0,
+        "template_id": "general",
+        "language": "zh",
+        "channel_name": "",
+        "program_start_time": None,
+        "cut_mode": "copy",
+        "total_windows": 1,
+    }
+    await database.create_job({**common, "id": "paused-job", "status": "paused", "islice_base_url": "http://islice-a.test"})
+    window = await database.upsert_window("paused-job", 0, 0, 60)
+    attempt = await database.create_attempt(window["id"], 1, "task-paused")
+    await database.update_attempt(
+        attempt["id"], status="polling", service_status="processing",
+        progress=20, submitted_at="2026-08-13T00:00:00+00:00",
+    )
+    await database.create_job({**common, "id": "new-job"})
+    claimed = await database.claim_schedulable_jobs(
+        ("http://islice-a.test", "http://islice-b.test"), 1
+    )
+    assert [job["id"] for job in claimed] == ["new-job"]
+    assert claimed[0]["islice_base_url"] == "http://islice-b.test"
+
+
 def merge_segment(
     source_index: int,
     start: float,

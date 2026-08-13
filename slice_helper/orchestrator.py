@@ -789,7 +789,14 @@ class Orchestrator:
 
     async def _scheduler_loop(self) -> None:
         while not self._stopping:
-            capacity = self.settings.max_active_jobs - len(self._active)
+            persisted_active = await self.database.active_submission_job_count()
+            in_process_active = len(self._active)
+            # A paused job can still own a live iSlice task while it is being
+            # drained by a gate monitor, so it is not necessarily present in
+            # _active. Count it before admitting more jobs.
+            capacity = self.settings.max_active_jobs - max(
+                in_process_active, persisted_active
+            )
             if capacity > 0:
                 schedulable_urls = await self.database.schedulable_islice_urls()
                 configured_urls = await self.database.all_islice_urls()
@@ -1041,6 +1048,7 @@ class Orchestrator:
                         gate_url,
                         gate_ticket,
                         float(job.get("current_window") or 0),
+                        int(attempt["id"]),
                     )
                 await self._raise_if_control_requested(job_id)
                 existing = await islice_client.ensure_task(attempt["task_id"], request)
@@ -1276,6 +1284,7 @@ class Orchestrator:
         base_url: str,
         ticket: str,
         priority: float,
+        exclude_attempt_id: int | None = None,
     ) -> None:
         waiter = asyncio.create_task(
             self._submission_gate.acquire(base_url, ticket, priority),
@@ -1288,6 +1297,25 @@ class Orchestrator:
                     break
                 await self._raise_if_control_requested(job_id)
             await waiter
+            # Re-check persisted state after the in-memory gate.  This closes the
+            # restart/pause gap where another task is already running on iSlice
+            # but no longer exists in this process's asyncio gate.
+            while True:
+                blockers = await self.database.active_submission_attempts(
+                    base_url, exclude_attempt_id=exclude_attempt_id
+                )
+                blockers = [
+                    item
+                    for item in blockers
+                    if not self._pipeline_ready(
+                        str(item.get("service_status") or ""),
+                        float(item.get("progress") or 0),
+                    )
+                ]
+                if not blockers:
+                    break
+                await self._raise_if_control_requested(job_id)
+                await asyncio.sleep(1.0)
         except BaseException:
             waiter.cancel()
             with contextlib.suppress(asyncio.CancelledError):
