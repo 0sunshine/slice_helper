@@ -316,6 +316,12 @@ class ISliceMigrationRequest(BaseModel):
         return value
 
 
+class SchedulingPriorityUpdate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    priority: str = Field(alias="priority", pattern=r"^(fewest_completed|most_completed)$")
+
+
 class SystemResetExecute(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 

@@ -18,6 +18,18 @@ const statusNames = {
 };
 
 const $ = (id) => document.getElementById(id);
+
+async function configureSchedulingPriority() {
+  const current = await api("/api/settings/scheduling-priority");
+  const value = prompt("调度优先策略：fewest_completed=完成数最少优先，most_completed=完成数最多优先", current.priority);
+  if (value === null || value === current.priority) return;
+  if (!["fewest_completed", "most_completed"].includes(value.trim())) {
+    showToast("请输入 fewest_completed 或 most_completed");
+    return;
+  }
+  await api("/api/settings/scheduling-priority", { method: "PUT", body: JSON.stringify({ priority: value.trim() }) });
+  showToast(value.trim() === "fewest_completed" ? "已切换为完成数最少优先" : "已切换为完成数最多优先");
+}
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (character) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;"
 })[character]);
@@ -1265,5 +1277,11 @@ $("nextSegmentPage").addEventListener("click", () => {
 });
 
 Promise.all([loadHealth(), loadChannels().then(loadJobs), loadISliceInstances()]).catch((error) => showToast(error.message));
+const priorityButton = document.createElement("button");
+priorityButton.className = "button secondary";
+priorityButton.type = "button";
+priorityButton.textContent = "调度策略";
+priorityButton.addEventListener("click", () => configureSchedulingPriority().catch((error) => showToast(error.message)));
+document.querySelector(".topbar-actions")?.insertBefore(priorityButton, $("openCreateButton"));
 window.setInterval(() => loadJobs().catch(() => {}), 5000);
 window.setInterval(() => loadHealth().catch(() => {}), 30000);

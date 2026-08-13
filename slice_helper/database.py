@@ -179,6 +179,12 @@ class Database:
                     completed_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS system_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY,
                     source_path TEXT NOT NULL,
@@ -663,6 +669,14 @@ class Database:
                     )
             await db.execute(
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(23, ?)",
+                (utc_now(),),
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO system_settings(key,value,updated_at) VALUES('scheduling_priority','fewest_completed',?)",
+                (utc_now(),),
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(24, ?)",
                 (utc_now(),),
             )
             await db.commit()
@@ -1494,11 +1508,30 @@ class Database:
             )
             await db.commit()
 
+    async def get_scheduling_priority(self) -> str:
+        async with self.connect() as db:
+            row = await (await db.execute("SELECT value FROM system_settings WHERE key='scheduling_priority'")).fetchone()
+        return str(row["value"]) if row else "fewest_completed"
+
+    async def set_scheduling_priority(self, value: str) -> str:
+        if value not in {"fewest_completed", "most_completed"}:
+            raise ValueError("Unsupported scheduling priority")
+        now = utc_now()
+        async with self.connect() as db:
+            await db.execute(
+                "INSERT INTO system_settings(key,value,updated_at) VALUES('scheduling_priority',?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                (value, now),
+            )
+            await db.commit()
+        return value
+
     async def claim_schedulable_jobs(
         self,
         urls: tuple[str, ...],
         limit: int,
         configured_urls: tuple[str, ...] | None = None,
+        scheduling_priority: str = "fewest_completed",
     ) -> list[dict[str, Any]]:
         if limit < 1:
             return []
@@ -1532,11 +1565,12 @@ class Database:
                     active_statuses,
                 )
             ).fetchall()
+            order = "current_window ASC" if scheduling_priority == "fewest_completed" else "current_window DESC"
             candidates = await (
                 await db.execute(
                     "SELECT * FROM jobs WHERE status='pending_schedule' "
                     "AND superseded_at IS NULL "
-                    "ORDER BY current_window ASC, created_at ASC, id ASC"
+                    f"ORDER BY {order}, created_at ASC, id ASC"
                 )
             ).fetchall()
 

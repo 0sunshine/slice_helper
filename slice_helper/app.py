@@ -36,6 +36,7 @@ from .models import (
     JobStatus,
     ISliceInstanceUpsert,
     ISliceMigrationRequest,
+    SchedulingPriorityUpdate,
     SystemResetExecute,
     TimeReferenceRefresh,
     SegmentUpdate,
@@ -297,6 +298,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.get("/api/islice-instances")
     async def list_islice_instances(request: Request):
         return await request.app.state.database.list_islice_instances()
+
+    @application.get("/api/settings/scheduling-priority")
+    async def get_scheduling_priority(request: Request):
+        priority = await request.app.state.database.get_scheduling_priority()
+        return {"priority": priority}
+
+    @application.put("/api/settings/scheduling-priority")
+    async def update_scheduling_priority(request: Request, body: SchedulingPriorityUpdate):
+        priority = await request.app.state.database.set_scheduling_priority(body.priority)
+        request.app.state.orchestrator.set_scheduling_priority(priority)
+        request.app.state.orchestrator.notify()
+        return {"priority": priority}
 
     @application.post("/api/islice-instances", status_code=201)
     async def create_islice_instance(request: Request, body: ISliceInstanceUpsert):

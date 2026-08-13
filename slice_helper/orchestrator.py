@@ -51,13 +51,14 @@ class RebuildValidationError(RuntimeError):
 class _ISliceSubmissionGate:
     """Prefer the job with the fewest completed tasks on each iSlice."""
 
-    def __init__(self) -> None:
+    def __init__(self, priority_provider=None) -> None:
         self._lock = asyncio.Lock()
         self._holders: dict[str, str] = {}
         self._waiters: dict[
             str, list[tuple[str, float, int, asyncio.Future[None]]]
         ] = defaultdict(list)
         self._sequence = 0
+        self._priority_provider = priority_provider
 
     async def acquire(self, base_url: str, ticket: str, priority: float) -> None:
         loop = asyncio.get_running_loop()
@@ -93,10 +94,8 @@ class _ISliceSubmissionGate:
         queue = self._waiters[base_url]
         queue[:] = [item for item in queue if not item[3].cancelled()]
         if queue:
-            best_index = min(
-                range(len(queue)),
-                key=lambda index: (queue[index][1], queue[index][2]),
-            )
+            reverse = bool(self._priority_provider and self._priority_provider() == "most_completed")
+            best_index = max(range(len(queue)), key=lambda index: (queue[index][1], -queue[index][2])) if reverse else min(range(len(queue)), key=lambda index: (queue[index][1], queue[index][2]))
             ticket, _priority, _sequence, future = queue.pop(best_index)
             self._holders[base_url] = ticket
             future.set_result(None)
@@ -120,7 +119,8 @@ class Orchestrator:
         self.islice = islice
         self._scheduler_task: asyncio.Task[None] | None = None
         self._active: dict[str, asyncio.Task[None]] = {}
-        self._submission_gate = _ISliceSubmissionGate()
+        self._scheduling_priority = "fewest_completed"
+        self._submission_gate = _ISliceSubmissionGate(lambda: self._scheduling_priority)
         self._gate_monitors: dict[str, asyncio.Task[None]] = {}
         self._resplit_tasks: dict[tuple[str, int], asyncio.Task[None]] = {}
         self._resplit_lock = asyncio.Lock()
@@ -129,6 +129,7 @@ class Orchestrator:
         self._stopping = False
 
     async def start(self) -> None:
+        self._scheduling_priority = await self.database.get_scheduling_priority()
         interrupted = await self.database.recover_interrupted_resplits()
         await self.database.recover_jobs()
         paused_polls = await self.database.paused_jobs_with_polling_attempts()
@@ -188,6 +189,11 @@ class Orchestrator:
 
     def notify(self) -> None:
         self._wake.set()
+
+    def set_scheduling_priority(self, priority: str) -> None:
+        if priority not in {"fewest_completed", "most_completed"}:
+            raise ValueError("Unsupported scheduling priority")
+        self._scheduling_priority = priority
 
     async def preview_tail_rebuild(
         self, job_id: str, start_window_index: int
@@ -800,6 +806,7 @@ class Orchestrator:
                     schedulable_urls,
                     capacity,
                     configured_urls,
+                    self._scheduling_priority,
                 ):
                     job_id = job["id"]
                     if job_id in self._active:
