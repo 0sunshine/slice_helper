@@ -1709,6 +1709,33 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    async def paused_jobs_with_polling_attempts(self) -> list[dict[str, Any]]:
+        """Return submitted current-window attempts that must drain while paused."""
+        async with self.connect() as db:
+            rows = await (
+                await db.execute(
+                    """
+                    SELECT j.id AS job_id, w.id AS window_id, w.window_index,
+                           a.id AS attempt_id, a.task_id
+                    FROM jobs j
+                    JOIN windows w
+                      ON w.job_id=j.id AND w.window_index=j.current_window
+                    JOIN attempts a ON a.window_id=w.id
+                    WHERE j.status='paused'
+                      AND j.superseded_at IS NULL
+                      AND w.status='polling'
+                      AND a.status='polling'
+                      AND COALESCE(a.submitted_at, '')<>''
+                      AND a.attempt_no=(
+                          SELECT MAX(a2.attempt_no)
+                          FROM attempts a2 WHERE a2.window_id=w.id
+                      )
+                    ORDER BY j.created_at, j.id
+                    """
+                )
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     @staticmethod
     def _tail_token(
         job: dict[str, Any],

@@ -59,17 +59,19 @@ class PausingISlice:
         self.job_id = job_id
         self.resume = False
         self.pause_triggered = False
+        self.poll_count = 0
 
     async def ensure_task(self, _task_id, _request):
         return None
 
     async def get_task_info(self, task_id):
+        self.poll_count += 1
         if not self.resume and not self.pause_triggered:
             self.pause_triggered = True
             await self.database.update_job(
                 self.job_id, status="pause_requested", pause_requested=1
             )
-        if not self.resume:
+        if not self.resume and self.poll_count == 1:
             return {
                 "taskInfo": {
                 "taskId": task_id,
@@ -669,14 +671,16 @@ async def test_pause_is_honored_after_poll_and_resume_reuses_attempt(tmp_path: P
 
     job = await database.get_job("abc123")
     assert job["status"] == "paused"
+    assert job["current_window"] == 1
+    assert job["progress"] == 100
     window = (await database.get_windows("abc123"))[0]
-    assert window["status"] == "polling"
-    assert Path(window["chunk_path"]).is_file()
+    assert window["status"] == "completed"
     attempts = await database.get_attempts(window["id"])
     assert len(attempts) == 1
-    assert attempts[0]["status"] == "polling"
-    assert attempts[0]["service_status"] == "processing"
-    assert attempts[0]["progress"] == 37
+    assert attempts[0]["status"] == "completed"
+    assert attempts[0]["service_status"] == "completed"
+    assert attempts[0]["progress"] == 100
+    assert islice.poll_count >= 2
 
     islice.resume = True
     await database.update_job("abc123", status="queued", pause_requested=0)
@@ -687,6 +691,45 @@ async def test_pause_is_honored_after_poll_and_resume_reuses_attempt(tmp_path: P
     assert len(attempts) == 1
     assert attempts[0]["service_status"] == "completed"
     assert attempts[0]["progress"] == 100
+
+
+@pytest.mark.asyncio
+async def test_restart_resumes_polling_submitted_task_for_paused_job(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.ts"
+    source.write_bytes(b"source")
+    configured = make_settings(tmp_path)
+    database = Database(configured.database_path)
+    await database.initialize()
+    await create_job(database, source, duration=3600)
+    window = await database.upsert_window("abc123", 0, 0, 3600)
+    await database.update_window(window["id"], status="polling")
+    attempt = await database.create_attempt(
+        window["id"], 1, "sh-abc123-w000-a1"
+    )
+    await database.update_attempt(
+        attempt["id"],
+        status="polling",
+        service_status="processing",
+        progress=37,
+        submitted_at="2026-08-13T00:00:00+00:00",
+    )
+    await database.update_job("abc123", status="paused")
+    orchestrator = Orchestrator(configured, database, FakeMedia(), FakeISlice())
+
+    await orchestrator.start()
+    try:
+        await wait_for_current_window(database, "abc123", 1)
+        job = await database.get_job("abc123")
+        assert job["status"] == "paused"
+        assert (await database.get_window("abc123", 0))["status"] == "completed"
+        attempts = await database.get_attempts(window["id"])
+        assert len(attempts) == 1
+        assert attempts[0]["status"] == "completed"
+        assert attempts[0]["service_status"] == "completed"
+    finally:
+        await orchestrator.stop()
 
 
 @pytest.mark.asyncio

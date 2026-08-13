@@ -131,6 +131,7 @@ class Orchestrator:
     async def start(self) -> None:
         interrupted = await self.database.recover_interrupted_resplits()
         await self.database.recover_jobs()
+        paused_polls = await self.database.paused_jobs_with_polling_attempts()
         self._stopping = False
         self._scheduler_task = asyncio.create_task(self._scheduler_loop(), name="job-scheduler")
         for item in interrupted:
@@ -148,6 +149,18 @@ class Orchestrator:
             self._resplit_tasks[key] = task
             task.add_done_callback(
                 lambda done, task_key=key: self._resplit_finished(task_key, done)
+            )
+        for item in paused_polls:
+            job_id = str(item["job_id"])
+            if job_id in self._active:
+                continue
+            task = asyncio.create_task(
+                self._drain_paused_job(job_id, int(item["window_index"])),
+                name=f"paused-poll-{item['task_id']}",
+            )
+            self._active[job_id] = task
+            task.add_done_callback(
+                lambda _task, key=job_id: self._job_finished(key)
             )
 
     async def stop(self) -> None:
@@ -873,6 +886,20 @@ class Orchestrator:
             logger.exception("Job %s paused after an unexpected error", job_id)
             await self._pause_job(job_id, str(exc))
 
+    async def _drain_paused_job(self, job_id: str, window_index: int) -> None:
+        """Finish one already-submitted iSlice task without scheduling its successor."""
+        try:
+            job = await self.database.get_job(job_id)
+            window = await self.database.get_window(job_id, window_index)
+            if not job or not window or job["status"] != JobStatus.PAUSED.value:
+                return
+            await self._process_window(job, window, self._islice_client(job))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Paused job %s polling failed", job_id)
+            await self._pause_job(job_id, str(exc))
+
     async def _honor_control_request(self, job: dict[str, Any]) -> bool:
         if job["status"] == JobStatus.STOP_REQUESTED.value or job["stop_requested"]:
             await self.database.update_job(
@@ -1008,8 +1035,8 @@ class Orchestrator:
                         gate_ticket,
                         float(job.get("current_window") or 0),
                     )
-                existing = await islice_client.ensure_task(attempt["task_id"], request)
                 await self._raise_if_control_requested(job_id)
+                existing = await islice_client.ensure_task(attempt["task_id"], request)
                 service_status, service_progress = self._task_progress(existing)
                 attempt_fields: dict[str, Any] = {
                     "status": "polling",
@@ -1190,7 +1217,7 @@ class Orchestrator:
         deadline = time.monotonic() + self.settings.window_timeout_seconds
         consecutive_errors = 0
         while time.monotonic() < deadline:
-            await self._raise_if_control_requested(job_id)
+            await self._raise_if_stop_requested(job_id)
             try:
                 payload = await islice_client.get_task_info(task_id)
                 if payload is None:
@@ -1200,7 +1227,7 @@ class Orchestrator:
                 consecutive_errors += 1
                 if consecutive_errors >= 3:
                     raise
-                await self._sleep_with_control(
+                await self._sleep_with_stop(
                     job_id, self.RETRY_DELAYS[consecutive_errors - 1]
                 )
                 continue
@@ -1212,10 +1239,10 @@ class Orchestrator:
             )
             if self._pipeline_ready(service_status, service_progress):
                 await self._release_submission_turn(gate_url, gate_ticket)
-            await self._raise_if_control_requested(job_id)
+            await self._raise_if_stop_requested(job_id)
             if self._is_terminal(payload):
                 return payload
-            await self._sleep_with_control(job_id, self.settings.poll_interval_seconds)
+            await self._sleep_with_stop(job_id, self.settings.poll_interval_seconds)
         raise TimeoutError(f"Task {task_id} exceeded the window timeout")
 
     @staticmethod
@@ -1329,10 +1356,33 @@ class Orchestrator:
         if await self._control_requested(job_id):
             raise JobControlRequested
 
+    async def _raise_if_stop_requested(self, job_id: str) -> None:
+        job = await self.database.get_job(job_id)
+        if not job:
+            raise JobControlRequested
+        if job["status"] in {
+            JobStatus.STOP_REQUESTED.value,
+            JobStatus.STOPPED.value,
+        } or job["stop_requested"]:
+            if job["status"] != JobStatus.STOPPED.value:
+                await self.database.update_job(
+                    job_id, status=JobStatus.STOPPED.value, stop_requested=0
+                )
+            raise JobControlRequested
+
     async def _sleep_with_control(self, job_id: str, seconds: float) -> None:
         deadline = time.monotonic() + seconds
         while True:
             await self._raise_if_control_requested(job_id)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(1.0, remaining))
+
+    async def _sleep_with_stop(self, job_id: str, seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while True:
+            await self._raise_if_stop_requested(job_id)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
