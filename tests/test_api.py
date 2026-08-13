@@ -150,8 +150,8 @@ def test_job_api_control_and_database_backed_chunk_route(
         ):
             assert f'<option value="{content_type}">{content_type}</option>' in home.text
         assert 'id="summaryISlice"' in home.text
-        assert "/static/styles.css?v=0.17.4" in home.text
-        assert "/static/app.js?v=0.17.4" in home.text
+        assert "/static/styles.css?v=0.17.5" in home.text
+        assert "/static/app.js?v=0.17.5" in home.text
         assert 'id="tailRebuildDialog"' in home.text
         assert 'id="timeRefreshDialog"' in home.text
         assert 'id="timeRefreshForm"' in home.text
@@ -194,6 +194,9 @@ def test_job_api_control_and_database_backed_chunk_route(
         assert job["islice_base_url"] == "http://islice.test"
         assert job["channel_name"] == "测试频道"
         assert job["reviewed"] is False
+        listed_job = client.get("/api/jobs").json()["items"][0]
+        assert "current_task_id" in listed_job
+        assert "current_task_progress" in listed_job
 
         reviewed = client.patch(f"/api/jobs/{job_id}/review", json={"reviewed": True})
         assert reviewed.status_code == 200

@@ -93,6 +93,8 @@ input:focus, select:focus { outline: 2px solid #8cc4b3; outline-offset: 1px; }
 .actions-column { width: 290px; }
 .job-row-actions { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 5px; min-width: 260px; }
 .job-first-frame-time { min-width: 148px; white-space: nowrap; font-size: 12px; }
+.job-progress-cell { min-width: 190px; display: flex; flex-direction: column; gap: 4px; }
+.job-current-task { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 .reviewed-column, .reviewed-cell { width: 74px; min-width: 74px; text-align: center !important; }
 .review-checkbox { width: 18px; min-height: 18px; margin: 0; vertical-align: middle; accent-color: #176b57; }
 .filename { max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }

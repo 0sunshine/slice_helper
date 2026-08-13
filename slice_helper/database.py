@@ -1459,6 +1459,26 @@ class Database:
                            + (SELECT COUNT(*) FROM segment_merges sm
                               WHERE sm.job_id=j.id AND sm.status='active' AND sm.ignored=0)
                              AS accepted_segment_count
+                           ,(SELECT w.window_index
+                             FROM windows w
+                             WHERE w.job_id=j.id AND w.window_index=j.current_window
+                             LIMIT 1) AS current_task_window
+                           ,(SELECT a.task_id
+                             FROM attempts a JOIN windows w ON w.id=a.window_id
+                             WHERE w.job_id=j.id AND w.window_index=j.current_window
+                             ORDER BY a.attempt_no DESC LIMIT 1) AS current_task_id
+                           ,(SELECT a.status
+                             FROM attempts a JOIN windows w ON w.id=a.window_id
+                             WHERE w.job_id=j.id AND w.window_index=j.current_window
+                             ORDER BY a.attempt_no DESC LIMIT 1) AS current_task_status
+                           ,(SELECT a.service_status
+                             FROM attempts a JOIN windows w ON w.id=a.window_id
+                             WHERE w.job_id=j.id AND w.window_index=j.current_window
+                             ORDER BY a.attempt_no DESC LIMIT 1) AS current_task_service_status
+                           ,(SELECT a.progress
+                             FROM attempts a JOIN windows w ON w.id=a.window_id
+                             WHERE w.job_id=j.id AND w.window_index=j.current_window
+                             ORDER BY a.attempt_no DESC LIMIT 1) AS current_task_progress
                     FROM jobs j
                     LEFT JOIN channels c ON c.id=j.channel_id
                     WHERE {where_sql}

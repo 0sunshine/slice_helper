@@ -137,7 +137,7 @@ function renderJobs() {
       <td><span class="filename" title="${escapeHtml(sourceDisplay(job))}">${escapeHtml(sourceName(job))}</span><span class="muted mono">${escapeHtml(job.id.slice(0, 12))}</span></td>
       <td class="mono job-first-frame-time">${escapeHtml(formatRealTime(job.program_start_time))}</td>
       <td><span class="status-pill ${statusClass(job.status)}">${escapeHtml(statusNames[job.status] || job.status)}</span></td>
-      <td><span class="mini-progress"><span style="width:${Math.max(0, Math.min(100, job.progress || 0))}%"></span></span>${Number(job.progress || 0).toFixed(1)}%</td>
+      <td>${renderJobProgress(job)}</td>
       <td>${job.current_window}/${job.total_windows}</td>
       <td>${job.accepted_segment_count}</td>
       <td class="reviewed-cell"><input class="review-checkbox" data-job-id="${escapeHtml(job.id)}" type="checkbox" ${job.reviewed ? "checked" : ""} aria-label="${job.reviewed ? "取消" : "标记"}${escapeHtml(job.channel_name || sourceName(job))}已审核"></td>
@@ -156,6 +156,21 @@ function renderJobs() {
   $("jobPageInfo").textContent = `${state.jobPage} / ${state.jobTotalPages}`;
   $("previousJobPage").disabled = state.jobPage <= 1;
   $("nextJobPage").disabled = state.jobPage >= state.jobTotalPages;
+}
+
+function renderJobProgress(job) {
+  const overall = Math.max(0, Math.min(100, Number(job.progress || 0)));
+  const taskProgress = Math.max(0, Math.min(100, Number(job.current_task_progress || 0)));
+  const taskId = job.current_task_id || "";
+  const taskStatus = job.current_task_service_status || job.current_task_status || "";
+  const activeTask = ["pending", "submitting", "processing", "polling", "resplitting"].includes(taskStatus.toLowerCase());
+  const taskLabel = taskId && activeTask
+    ? `当前小任务 ${Number(job.current_task_window || 0) + 1}：${taskStatus} ${taskProgress.toFixed(1)}%`
+    : "暂无运行中的小任务";
+  return `<div class="job-progress-cell">
+    <span><span class="mini-progress"><span style="width:${overall}%"></span></span>${overall.toFixed(1)}%</span>
+    <span class="muted job-current-task" title="${escapeHtml(taskId)}">${escapeHtml(taskLabel)}</span>
+  </div>`;
 }
 
 function renderJobControlActions(job) {
