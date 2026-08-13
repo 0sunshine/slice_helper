@@ -1070,15 +1070,17 @@ class Database:
             await db.commit()
         return self._public_islice_instance(dict(row))
 
-    async def migration_task_ids(self, old_base_url: str, limit: int = 100) -> list[str]:
+    async def migration_task_ids(self, old_base_url: str, limit: int | None = None) -> list[str]:
         async with self.connect() as db:
+            limit_clause = " LIMIT ?" if limit is not None else ""
+            params: tuple[Any, ...] = (old_base_url.rstrip("/"),) if limit is None else (old_base_url.rstrip("/"), limit)
             rows = await (
                 await db.execute(
                     """SELECT DISTINCT a.task_id FROM attempts a
                        JOIN windows w ON w.id=a.window_id JOIN jobs j ON j.id=w.job_id
                        WHERE j.islice_base_url=? AND a.task_id<>''
-                       ORDER BY a.submitted_at DESC LIMIT ?""",
-                    (old_base_url.rstrip("/"), limit),
+                       ORDER BY a.submitted_at DESC""" + limit_clause,
+                    params,
                 )
             ).fetchall()
         return [str(row["task_id"]) for row in rows]
