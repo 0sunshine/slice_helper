@@ -180,7 +180,7 @@ class ISliceInstanceUpsert(BaseModel):
     @field_validator("source_id")
     @classmethod
     def validate_source_id(cls, value: str) -> str:
-        normalized = value.strip()
+        normalized = value.strip().lower()
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", normalized):
             raise ValueError("sourceId may only contain letters, numbers, dot, underscore and dash")
         return normalized
@@ -250,6 +250,32 @@ class ISliceInstanceUpsert(BaseModel):
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("archiveHttpBase must be an HTTP URL")
         return normalized
+
+    @model_validator(mode="after")
+    def validate_archive_namespace(self):
+        source_id = self.source_id
+        if self.archive_remote_root:
+            remote_source = self.archive_remote_root.rsplit("/", 1)[-1]
+            if remote_source != source_id:
+                raise ValueError(
+                    f"archiveRemoteRoot must end with /{source_id}; "
+                    "each iSlice service needs an isolated archive directory"
+                )
+        if self.archive_http_base:
+            http_source = urlsplit(self.archive_http_base).path.rstrip("/").rsplit("/", 1)[-1]
+            if http_source != source_id:
+                raise ValueError(
+                    f"archiveHttpBase must end with /{source_id}; "
+                    "each iSlice service needs an isolated HTTP namespace"
+                )
+        if self.archive_catalog_url:
+            catalog_path = urlsplit(self.archive_catalog_url).path.rstrip("/")
+            expected_suffix = f"/{source_id}/catalog.json"
+            if not catalog_path.endswith(expected_suffix):
+                raise ValueError(
+                    f"archiveCatalogUrl must end with {expected_suffix}"
+                )
+        return self
 
 
 class SystemResetExecute(BaseModel):

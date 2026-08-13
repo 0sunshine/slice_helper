@@ -13,6 +13,7 @@ from slice_helper.archive_agent import (
     build_manifest,
     commit_reset,
     prepare_reset,
+    main,
 )
 
 
@@ -170,6 +171,37 @@ def test_empty_result_url_archives_with_deletion_hold(tmp_path: Path) -> None:
     assert not manifest.deletion_eligible
     assert "Segment 2 has an empty segmentUrl" in manifest.warnings
     assert "Segment 2 has an empty coverImgUrl" in manifest.warnings
+
+
+def test_publish_catalog_command_is_available(tmp_path: Path, monkeypatch) -> None:
+    config = make_config(tmp_path)
+    config_path = tmp_path / "archiver.ini"
+    config_path.write_text(
+        "\n".join(
+            [
+                "[archiver]",
+                "source_id = islice-test",
+                "source_name = Test",
+                f"islice_database = {config.islice_database}",
+                f"storage_root = {config.storage_root}",
+                f"state_database = {config.state_database}",
+                f"manifest_root = {config.manifest_root}",
+                f"lock_path = {config.lock_path}",
+                "remote_host = archive.test",
+                "remote_user = codex",
+                "remote_root = /archive/sources/islice-test",
+                "remote_http_base = http://archive.test/sources/islice-test",
+                f"ssh_key = {config.ssh_key}",
+                f"known_hosts = {config.known_hosts}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    published = []
+    monkeypatch.setattr(Archiver, "publish_catalog", lambda self: published.append(True))
+
+    assert main(["--config", str(config_path), "publish-catalog"]) == 0
+    assert published == [True]
 
 
 def test_archive_then_delayed_delete_keeps_marker(tmp_path: Path) -> None:

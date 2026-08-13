@@ -251,17 +251,29 @@ class ServiceManager:
                 f"mv {shlex.quote(config + '.partial')} {shlex.quote(config)}",
             )
             checks = (
-                f"python3 {shlex.quote(script)} --version && command -v rsync >/dev/null && "
-                f"test -r {shlex.quote(str(instance['islice_database_path']))} && "
-                f"test -d {shlex.quote(str(instance['storage_root']))} && "
-                f"test -r {shlex.quote(str(instance['archive_ssh_key']))} && "
-                f"test -r {shlex.quote(str(instance['archive_known_hosts']))} && "
+                f"version=$(python3 {shlex.quote(script)} --version) || exit $?; "
+                "command -v rsync >/dev/null || { echo '未安装 rsync' >&2; exit 3; }; "
+                f"test -r {shlex.quote(str(instance['islice_database_path']))} || "
+                "{ echo 'iSlice 数据库不存在或当前 SSH 账号不可读' >&2; exit 3; }; "
+                f"test -d {shlex.quote(str(instance['storage_root']))} || "
+                "{ echo 'iSlice storage 目录不存在或当前 SSH 账号不可访问' >&2; exit 3; }; "
+                f"test -r {shlex.quote(str(instance['archive_ssh_key']))} || "
+                "{ echo '归档 SSH 私钥不存在或当前 SSH 账号不可读' >&2; exit 3; }; "
+                f"test -r {shlex.quote(str(instance['archive_known_hosts']))} || "
+                "{ echo 'known_hosts 不存在或当前 SSH 账号不可读' >&2; exit 3; }; "
                 f"ssh -i {shlex.quote(str(instance['archive_ssh_key']))} -o BatchMode=yes "
                 f"-o StrictHostKeyChecking=yes -o ConnectTimeout=10 "
                 f"-o UserKnownHostsFile={shlex.quote(str(instance['archive_known_hosts']))} "
-                f"{shlex.quote(str(instance['archive_remote_user']) + '@' + str(instance['archive_remote_host']))} true"
+                f"{shlex.quote(str(instance['archive_remote_user']) + '@' + str(instance['archive_remote_host']))} true "
+                "|| { echo '无法使用配置的私钥连接远端归档服务器' >&2; exit 3; }; "
+                "printf '%s\\n' \"$version\""
             )
             version = self._run(client, checks)
+            self._run(
+                client,
+                f"python3 {shlex.quote(script)} --config {shlex.quote(config)} publish-catalog",
+                timeout=60,
+            )
             pid_file = f"{root}/agent.pid"
             log_file = f"{root}/agent.log"
             stop = (

@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - the deployed agent runs on Linux
 
 
 logger = logging.getLogger("islice-archiver")
-ARCHIVER_AGENT_VERSION = "3.1"
+ARCHIVER_AGENT_VERSION = "3.2"
 TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 RESET_REQUEST_PATTERN = re.compile(r"^[0-9a-f]{32}$")
@@ -1567,6 +1567,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--verbose", action="store_true")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("run-once")
+    commands.add_parser(
+        "publish-catalog", help="publish the current catalog without scanning tasks"
+    )
     forever_parser = commands.add_parser("run-forever")
     forever_parser.add_argument("--interval", type=float, default=300.0)
     status_parser = commands.add_parser("status")
@@ -1618,6 +1621,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         state.initialize()
         if args.command == "run-once":
             Archiver(config, state=state).run_once()
+        elif args.command == "publish-catalog":
+            Archiver(config, state=state).publish_catalog()
         elif args.command == "run-forever":
             try:
                 Archiver(config, state=state).run_forever(args.interval)

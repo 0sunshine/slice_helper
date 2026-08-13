@@ -55,6 +55,8 @@ class ArchiveCatalogReader:
                 continue
             try:
                 response = await self.client.get(catalog_url)
+                if response.status_code == 404:
+                    raise ValueError("归档代理尚未发布 catalog，请先部署/拉起代理")
                 response.raise_for_status()
                 payload = response.json()
                 if not isinstance(payload, dict) or not isinstance(payload.get("tasks"), list):

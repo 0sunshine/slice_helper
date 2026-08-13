@@ -63,6 +63,7 @@ helper 不限制每台 iSlice 已绑定的长文件作业总数；新作业优�
 - 备份页按来源、状态和关键字筛选，逐个 task ID 显示归档状态、版本数、文件数、容量、清理时间和失败原因
 - 每个备份任务可直接预览。页面从远端归档读取 `segments.json`，把原 iSlice 媒体地址安全改写为归档 HTTP 地址，并在弹窗中播放视频；新版 catalog 同时支持选择重新拆条产生的历史归档版本
 - 多台 iSlice 的归档必须使用不同 `sourceId`，远端目录为 `archive/sources/{sourceId}`；相同 task ID 在不同来源之间互不冲突
+- 新增服务时页面会根据小写 `sourceId` 自动生成远端目录、HTTP 根地址和 catalog 地址；保存接口拒绝跨来源目录。代理部署成功后会立即发布空 catalog，因此尚无归档任务的新服务也显示为 0 条而不是 HTTP 404。
 - 重新拆条产生新内容时，归档代理先完整上传并校验新 Digest。只有 helper 当前引用已属于新版本时，旧 `tasks/{taskId}` 才原子改名到 `history/{taskId}/{oldDigest}`，新版本再占用原 task ID；冲突时新版本只存入 history，旧发布版本和本地文件均保留
 
 归档代理和 Nginx 的部署文件位于 `deploy/archive-agent/` 与 `deploy/nginx/`。该功能不调用 iSlice 重新拆条，也不修改 iSlice 业务代码。

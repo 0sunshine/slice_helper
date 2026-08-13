@@ -180,6 +180,8 @@ async def test_archive_catalog_errors_are_isolated_and_source_id_is_verified() -
                 200,
                 json={"source": {"id": "somebody-else"}, "tasks": []},
             )
+        if request.url.path == "/missing/catalog.json":
+            return httpx.Response(404)
         return httpx.Response(503)
 
     reader = ArchiveCatalogReader()
@@ -207,6 +209,13 @@ async def test_archive_catalog_errors_are_isolated_and_source_id_is_verified() -
             "archive_catalog_url": "",
             "schedulable": False,
         },
+        {
+            "source_id": "islice-missing",
+            "name": "Missing catalog",
+            "base_url": "http://islice-missing.test",
+            "archive_catalog_url": "http://archive.test/missing/catalog.json",
+            "schedulable": False,
+        },
     ]
     try:
         result = await reader.read(
@@ -215,9 +224,10 @@ async def test_archive_catalog_errors_are_isolated_and_source_id_is_verified() -
         )
     finally:
         await reader.close()
-    assert [source["online"] for source in result["sources"]] == [True, False, False]
+    assert [source["online"] for source in result["sources"]] == [True, False, False, False]
     assert "不匹配" in result["sources"][1]["error"]
     assert "未配置" in result["sources"][2]["error"]
+    assert "尚未发布 catalog" in result["sources"][3]["error"]
     assert result["tasks"][0]["context"]["job_id"] == "job-1"
 
 

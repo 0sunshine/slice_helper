@@ -3,8 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from slice_helper.database import Database
+from slice_helper.models import ISliceInstanceUpsert
 from slice_helper.service_manager import CredentialCipher, render_agent_config
 
 
@@ -56,6 +58,32 @@ def test_agent_config_uses_page_configured_install_directory(tmp_path: Path) -> 
     assert "storage_root = /srv/islice/storage" in config
     assert "remote_root = /archive/sources/islice-128" in config
     assert "systemd" not in config
+
+
+def test_service_normalizes_source_id_and_requires_isolated_archive_namespace() -> None:
+    model = ISliceInstanceUpsert.model_validate(
+        {
+            "sourceId": "iSlice-127",
+            "name": "iSlice 127",
+            "baseUrl": "http://192.168.104.127:8000",
+            "archiveCatalogUrl": "http://archive.test/sources/islice-127/catalog.json",
+            "archiveRemoteRoot": "/archive/sources/islice-127",
+            "archiveHttpBase": "http://archive.test/sources/islice-127",
+        }
+    )
+    assert model.source_id == "islice-127"
+
+    with pytest.raises(ValidationError, match="archiveRemoteRoot must end with /islice-127"):
+        ISliceInstanceUpsert.model_validate(
+            {
+                "sourceId": "islice-127",
+                "name": "iSlice 127",
+                "baseUrl": "http://192.168.104.127:8000",
+                "archiveCatalogUrl": "http://archive.test/sources/islice-127/catalog.json",
+                "archiveRemoteRoot": "/archive/sources/islice-128",
+                "archiveHttpBase": "http://archive.test/sources/islice-127",
+            }
+        )
 
 
 @pytest.mark.asyncio

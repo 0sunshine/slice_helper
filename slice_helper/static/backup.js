@@ -423,6 +423,18 @@ function openInstance(item = null) {
   $("instanceDialog").showModal();
 }
 
+function updateArchiveNamespace() {
+  if ($("instanceId").value) return;
+  const sourceId = $("instanceSourceId").value.trim().toLowerCase();
+  if (!sourceId) return;
+  $("instanceSourceId").value = sourceId;
+  $("instanceArchiveRemoteRoot").value = `/mpeg/mpeg2/codex/archive/sources/${sourceId}`;
+  $("instanceArchiveHttpBase").value = `http://192.168.6.200:18080/sources/${sourceId}`;
+  $("instanceCatalogUrl").value = `http://192.168.6.200:18080/sources/${sourceId}/catalog.json`;
+}
+
+$("instanceSourceId").addEventListener("change", updateArchiveNamespace);
+
 $("instanceForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const id = $("instanceId").value;
