@@ -1425,6 +1425,7 @@ class Database:
         status: str | None = None,
         channel_id: str | None = None,
         broadcast_date: str | None = None,
+        islice_base_url: str | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         where = ["j.superseded_at IS NULL"]
         params: list[Any] = []
@@ -1437,6 +1438,9 @@ class Database:
         if broadcast_date:
             where.append("j.broadcast_date=?")
             params.append(broadcast_date)
+        if islice_base_url:
+            where.append("j.islice_base_url=?")
+            params.append(islice_base_url.rstrip("/"))
         where_sql = " AND ".join(where)
         async with self.connect() as db:
             total_row = await (

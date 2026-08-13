@@ -116,6 +116,7 @@ async function loadJobs() {
   });
   if ($("statusFilter").value) query.set("status", $("statusFilter").value);
   if ($("channelFilter").value) query.set("channelId", $("channelFilter").value);
+  if ($("isliceFilter").value) query.set("isliceBaseUrl", $("isliceFilter").value);
   if ($("dateFilter").value) query.set("broadcastDate", $("dateFilter").value);
   const result = await api(`/api/jobs?${query}`);
   state.jobs = result.items;
@@ -268,7 +269,13 @@ async function loadChannels() {
 
 async function loadISliceInstances() {
   const selected = $("createISliceBaseUrl").value;
+  const selectedFilter = $("isliceFilter").value;
   state.isliceInstances = await api("/api/islice-instances");
+  const filterOptions = state.isliceInstances
+    .map((item) => `<option value="${escapeHtml(item.base_url)}">${escapeHtml(item.name || item.source_id || item.base_url)} (${escapeHtml(item.base_url)})</option>`)
+    .join("");
+  $("isliceFilter").innerHTML = `<option value="">全部节点</option>${filterOptions}`;
+  if (state.isliceInstances.some((item) => item.base_url === selectedFilter)) $("isliceFilter").value = selectedFilter;
   const options = state.isliceInstances.filter((item) => item.schedulable)
     .map((item) => `<option value="${escapeHtml(item.base_url)}">${escapeHtml(item.name || item.source_id)} (${escapeHtml(item.base_url)})</option>`).join("");
   $("createISliceBaseUrl").innerHTML = `<option value="">自动选择</option>${options}`;
@@ -1215,7 +1222,7 @@ $("summaryRealTime").addEventListener("keydown", (event) => {
     saveTimeReference();
   }
 });
-[$("statusFilter"), $("channelFilter"), $("dateFilter")].forEach((control) => control.addEventListener("change", () => {
+[$("statusFilter"), $("channelFilter"), $("isliceFilter"), $("dateFilter")].forEach((control) => control.addEventListener("change", () => {
   state.jobPage = 1;
   $("exportChannelButton").disabled = !$("channelFilter").value;
   loadJobs().catch((error) => showToast(error.message));

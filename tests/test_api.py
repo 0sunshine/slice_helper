@@ -161,6 +161,7 @@ def test_job_api_control_and_database_backed_chunk_route(
         assert "TS 路径或 HTTP 地址" in home.text
         assert 'id="manageChannelsButton"' in home.text
         assert 'id="createISliceBaseUrl"' in home.text
+        assert 'id="isliceFilter"' in home.text
         assert 'id="jobPageInfo"' in home.text
         app_js = client.get("/static/app.js")
         styles_css = client.get("/static/styles.css")
@@ -966,6 +967,15 @@ def test_channel_date_overwrite_pagination_and_excel_export(
         ).json()
         assert filtered["total"] == 1
         assert filtered["items"][0]["id"] == replacement_id
+
+        asyncio.run(database.update_job(replacement_id, islice_base_url="http://islice.test"))
+        by_islice = client.get(
+            "/api/jobs", params={"isliceBaseUrl": "http://islice.test/"}
+        ).json()
+        assert by_islice["total"] == 1
+        assert {item["islice_base_url"] for item in by_islice["items"]} == {
+            "http://islice.test"
+        }
 
         ignored_export = client.get(f"/api/channels/{channel_id}/export.xlsx")
         ignored_workbook = openpyxl.load_workbook(io.BytesIO(ignored_export.content))

@@ -852,6 +852,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         status: str | None = Query(default=None),
         channel_id: str | None = Query(default=None, alias="channelId"),
         broadcast_date: str | None = Query(default=None, alias="broadcastDate"),
+        islice_base_url: str | None = Query(default=None, alias="isliceBaseUrl"),
         page: int = Query(default=1, ge=1),
         page_size: int = Query(default=20, alias="pageSize", ge=1, le=100),
     ):
@@ -868,6 +869,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             status=status,
             channel_id=channel_id,
             broadcast_date=broadcast_date,
+            islice_base_url=islice_base_url.rstrip("/") if islice_base_url else None,
         )
         total_pages = max(1, (total + page_size - 1) // page_size)
         if page > total_pages:
@@ -878,6 +880,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status=status,
                 channel_id=channel_id,
                 broadcast_date=broadcast_date,
+                islice_base_url=islice_base_url.rstrip("/") if islice_base_url else None,
             )
         return {
             "items": [_public_job(job) for job in jobs],
