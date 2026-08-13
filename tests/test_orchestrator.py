@@ -733,6 +733,70 @@ async def test_restart_resumes_polling_submitted_task_for_paused_job(
 
 
 @pytest.mark.asyncio
+async def test_restart_polling_submitted_task_does_not_wait_on_submission_gate(
+    tmp_path: Path,
+) -> None:
+    """Persisted iSlice tasks must be polled even when another task holds the gate.
+
+    A restart reconstructs the in-process gate as empty, but the database still
+    contains all submitted attempts.  If an existing attempt is sent through
+    ``_await_submission_turn`` it waits for the other persisted attempts, while
+    those attempts wait in the same way: no GetTaskInfo call can ever happen.
+    """
+    source = tmp_path / "source.ts"
+    source.write_bytes(b"source")
+    configured = make_settings(tmp_path, duration_timeout=1)
+    database = Database(configured.database_path)
+    await database.initialize()
+    await create_job(database, source, duration=3600)
+    window = await database.upsert_window("abc123", 0, 0, 3600)
+    await database.update_window(window["id"], status="polling")
+    attempt = await database.create_attempt(window["id"], 1, "sh-abc123-w000-a1")
+    await database.update_attempt(
+        attempt["id"],
+        status="polling",
+        service_status="processing",
+        progress=13,
+        submitted_at="2026-08-13T00:00:00+00:00",
+    )
+    # Simulate another persisted task that would block a new submission.
+    other_job_id = "other-job"
+    stat = source.stat()
+    await database.create_job(
+        {
+            "id": other_job_id,
+            "status": "running",
+            "islice_base_url": "http://islice.test",
+            "source_path": str(source),
+            "source_size": stat.st_size,
+            "source_mtime_ns": stat.st_mtime_ns,
+            "source_duration": 3600,
+            "template_id": "general",
+            "language": "zh",
+            "channel_name": "",
+            "program_start_time": None,
+            "cut_mode": "copy",
+            "total_windows": 1,
+        }
+    )
+    other_window = await database.upsert_window(other_job_id, 0, 0, 3600)
+    other_attempt = await database.create_attempt(
+        other_window["id"], 1, "sh-other-job-w000-a1"
+    )
+    await database.update_attempt(
+        other_attempt["id"],
+        status="polling",
+        service_status="processing",
+        progress=13,
+        submitted_at="2026-08-13T00:00:00+00:00",
+    )
+
+    orchestrator = Orchestrator(configured, database, FakeMedia(), FakeISlice())
+    await asyncio.wait_for(orchestrator._process_job("abc123"), timeout=1)
+    assert (await database.get_window("abc123", 0))["status"] == "completed"
+
+
+@pytest.mark.asyncio
 async def test_tail_rebuild_keeps_old_tasks_and_uses_new_generation(tmp_path: Path) -> None:
     source = tmp_path / "source.ts"
     source.write_bytes(b"source")

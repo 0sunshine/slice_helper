@@ -1067,12 +1067,23 @@ class Orchestrator:
             gate_released = float(attempt.get("progress") or 0) >= (
                 self.settings.pipeline_progress_threshold
             )
+            # An attempt with submitted_at is an already-created iSlice task.
+            # It must be reconciled immediately after a helper restart (or after
+            # a pause).  Sending it through the submission gate is incorrect:
+            # the persisted gate quite correctly sees every other in-flight
+            # attempt as a blocker, while those attempts are themselves waiting
+            # at the same gate.  That creates a deadlock in which no task calls
+            # GetTaskInfo and progress can never advance.  The gate is only for
+            # admitting a *new* iSlice task; existing tasks are safe to poll in
+            # parallel and remain persisted blockers until they reach the
+            # pipeline threshold.
+            already_submitted = bool(attempt.get("submitted_at"))
             failure_message = ""
             try:
                 # A paused drain is reconciliation work for an already-submitted
                 # task. It must query iSlice immediately; waiting behind the
                 # submission gate can leave a completed task stale indefinitely.
-                if not drain and not gate_released:
+                if not drain and not already_submitted and not gate_released:
                     await self._await_submission_turn(
                         job_id,
                         gate_url,
