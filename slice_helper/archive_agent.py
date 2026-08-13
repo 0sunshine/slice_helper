@@ -1079,7 +1079,10 @@ class Archiver:
             self.state.rebase_current_paths(self.config.remote_root)
             self.discover()
             self.delete_due()
-            candidates = self.state.candidates(self.config.max_tasks_per_run)
+            # The task database is the source of truth. Scan all candidates on
+            # every five-minute cycle; storage itself is still copied per task
+            # only when its manifest changed, so this is not a storage-wide copy.
+            candidates = self.state.candidates(max(self.config.max_tasks_per_run, 100000))
             logger.info("Archive scan found %d task(s) ready for processing", len(candidates))
             for row in candidates:
                 self.archive(row)
