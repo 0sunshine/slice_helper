@@ -130,16 +130,20 @@ async def test_copy_cut_repairs_only_audio_after_validation_failure(
 
 
 @pytest.mark.asyncio
-async def test_copy_cut_fails_after_repaired_audio_is_still_invalid(
+async def test_copy_cut_reencodes_video_when_audio_repair_is_still_invalid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     media = MediaService(_test_settings(tmp_path))
     commands: list[tuple[str, ...]] = []
+    validation_calls = 0
 
     async def fake_run(*args: str, timeout: float) -> tuple[str, str]:
+        nonlocal validation_calls
         commands.append(args)
         if args[-1] == "-":
-            raise MediaError("still invalid")
+            validation_calls += 1
+            if validation_calls < 3:
+                raise MediaError("still invalid")
         Path(args[-1]).write_bytes(b"media")
         return "", ""
 
@@ -155,11 +159,11 @@ async def test_copy_cut_fails_after_repaired_audio_is_still_invalid(
     monkeypatch.setattr(media, "probe", fake_probe)
 
     target = tmp_path / "window.ts"
-    with pytest.raises(MediaError, match="video was not re-encoded"):
-        await media.cut(tmp_path / "source.ts", target, 0, 4, "copy")
+    await media.cut(tmp_path / "source.ts", target, 0, 4, "copy")
 
     cut_commands = [command for command in commands if command[-1] != "-"]
-    assert len(cut_commands) == 2
+    assert len(cut_commands) == 3
     assert "libx264" not in cut_commands[1]
-    assert not target.exists()
+    assert "libx264" in cut_commands[2]
+    assert target.exists()
     assert not (tmp_path / "window.partial.ts").exists()

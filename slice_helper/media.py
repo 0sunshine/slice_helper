@@ -94,7 +94,7 @@ class MediaService:
         partial = target.with_name(f"{target.stem}.partial{target.suffix}")
         partial.unlink(missing_ok=True)
 
-        async def render(*, repair_audio: bool = False) -> MediaProbe:
+        async def render(*, repair_audio: bool = False, reencode_video: bool = False) -> MediaProbe:
             partial.unlink(missing_ok=True)
             command = [
                 self.settings.ffmpeg_path,
@@ -117,7 +117,7 @@ class MediaService:
                 "-map",
                 "0:a:0?",
             ]
-            if str(mode) == CutMode.TRANSCODE.value:
+            if str(mode) == CutMode.TRANSCODE.value or reencode_video:
                 command.extend(
                     [
                         "-c:v",
@@ -170,10 +170,18 @@ class MediaService:
                 try:
                     result = await render(repair_audio=True)
                 except MediaError as repair_error:
-                    raise MediaError(
-                        "Chunk failed validation after audio repair; video was not "
-                        f"re-encoded: {repair_error}"
-                    ) from repair_error
+                    logger.warning(
+                        "Audio repair did not make the copied chunk valid; "
+                        "retrying with full video/audio re-encode: %s",
+                        repair_error,
+                    )
+                    try:
+                        result = await render(reencode_video=True)
+                    except MediaError as reencode_error:
+                        raise MediaError(
+                            "Chunk failed validation after full video/audio re-encode: "
+                            f"{reencode_error}"
+                        ) from reencode_error
             os.replace(partial, target)
             return await self.probe(target)
         except Exception:
