@@ -31,7 +31,6 @@ class Settings:
     temp_dir: Path
     ffmpeg_path: str
     ffprobe_path: str
-    max_active_jobs: int
     poll_interval_seconds: float
     window_timeout_seconds: float
     ffmpeg_timeout_seconds: float
@@ -40,6 +39,7 @@ class Settings:
     handoff_max_seconds: float = 3000.0
     pipeline_progress_threshold: float = 71.0
     islice_base_urls: tuple[str, ...] = ()
+    max_active_jobs_per_islice: int = 10
 
     @property
     def configured_islice_urls(self) -> tuple[str, ...]:
@@ -89,7 +89,6 @@ class Settings:
             temp_dir=resolve_dir("TEMP_DIR", "temp"),
             ffmpeg_path=os.getenv("FFMPEG_PATH", "ffmpeg"),
             ffprobe_path=os.getenv("FFPROBE_PATH", "ffprobe"),
-            max_active_jobs=_env_int("MAX_ACTIVE_JOBS", 30),
             poll_interval_seconds=_env_float("POLL_INTERVAL_SECONDS", 15.0),
             window_timeout_seconds=_env_float("WINDOW_TIMEOUT_SECONDS", 21600.0),
             ffmpeg_timeout_seconds=_env_float("FFMPEG_TIMEOUT_SECONDS", 7200.0),
@@ -97,4 +96,7 @@ class Settings:
                 "PIPELINE_PROGRESS_THRESHOLD", 71.0, minimum=1.0
             ),
             islice_base_urls=islice_urls,
+            max_active_jobs_per_islice=_env_int(
+                "MAX_ACTIVE_JOBS_PER_ISLICE", 10
+            ),
         )

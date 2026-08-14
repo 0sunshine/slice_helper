@@ -277,6 +277,38 @@ async def test_database_schedules_job_with_fewest_completed_tasks_first(
 
 
 @pytest.mark.asyncio
+async def test_database_caps_active_jobs_at_ten_per_islice(tmp_path: Path) -> None:
+    database = Database(tmp_path / "state.db")
+    await database.initialize()
+    urls = tuple(f"http://islice-{name}.test" for name in "abcd")
+    common = {
+        "source_path": str(tmp_path / "source.ts"),
+        "source_size": 10,
+        "source_mtime_ns": 20,
+        "source_duration": 60.0,
+        "template_id": "general",
+        "language": "zh",
+        "channel_name": "",
+        "program_start_time": None,
+        "cut_mode": "copy",
+        "total_windows": 1,
+    }
+    for index in range(43):
+        await database.create_job({**common, "id": f"job-{index:02d}"})
+
+    claimed = await database.claim_schedulable_jobs(urls, 43)
+
+    assert len(claimed) == 40
+    assert {
+        url: sum(job["islice_base_url"] == url for job in claimed) for url in urls
+    } == {url: 10 for url in urls}
+    pending = [
+        await database.get_job(f"job-{index:02d}") for index in range(40, 43)
+    ]
+    assert all(job and job["status"] == "pending_schedule" for job in pending)
+
+
+@pytest.mark.asyncio
 async def test_paused_job_keeps_assignment_without_reserving_islice(tmp_path: Path) -> None:
     database = Database(tmp_path / "state.db")
     await database.initialize()

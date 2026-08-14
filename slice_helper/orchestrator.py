@@ -792,31 +792,27 @@ class Orchestrator:
 
     async def _scheduler_loop(self) -> None:
         while not self._stopping:
-            persisted_active = await self.database.active_submission_job_count()
-            in_process_active = len(self._active)
-            # A paused job can still own a live iSlice task while it is being
-            # drained by a gate monitor, so it is not necessarily present in
-            # _active. Count it before admitting more jobs.
-            capacity = self.settings.max_active_jobs - max(
-                in_process_active, persisted_active
+            schedulable_urls = await self.database.schedulable_islice_urls()
+            configured_urls = await self.database.all_islice_urls()
+            if isinstance(self.islice, ISlicePool):
+                await self.islice.reconcile(configured_urls)
+            if not schedulable_urls and not configured_urls:
+                self._wake.clear()
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=1.0)
+                except TimeoutError:
+                    pass
+                continue
+            capacity = (
+                len(configured_urls) * self.settings.max_active_jobs_per_islice
             )
             if capacity > 0:
-                schedulable_urls = await self.database.schedulable_islice_urls()
-                configured_urls = await self.database.all_islice_urls()
-                if isinstance(self.islice, ISlicePool):
-                    await self.islice.reconcile(configured_urls)
-                if not schedulable_urls and not configured_urls:
-                    self._wake.clear()
-                    try:
-                        await asyncio.wait_for(self._wake.wait(), timeout=1.0)
-                    except TimeoutError:
-                        pass
-                    continue
                 for job in await self.database.claim_schedulable_jobs(
                     schedulable_urls,
                     capacity,
                     configured_urls,
-                    self._scheduling_priority,
+                    scheduling_priority=self._scheduling_priority,
+                    per_islice_limit=self.settings.max_active_jobs_per_islice,
                 ):
                     job_id = job["id"]
                     if job_id in self._active:

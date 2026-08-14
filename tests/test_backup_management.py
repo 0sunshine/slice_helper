@@ -26,7 +26,6 @@ def make_settings(tmp_path: Path) -> Settings:
         temp_dir=tmp_path / "temp",
         ffmpeg_path="ffmpeg",
         ffprobe_path="ffprobe",
-        max_active_jobs=2,
         poll_interval_seconds=0.01,
         window_timeout_seconds=1,
         ffmpeg_timeout_seconds=10,

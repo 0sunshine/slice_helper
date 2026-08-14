@@ -312,7 +312,6 @@ def make_settings(tmp_path: Path, duration_timeout: float = 2) -> Settings:
         temp_dir=tmp_path / "temp",
         ffmpeg_path="ffmpeg",
         ffprobe_path="ffprobe",
-        max_active_jobs=1,
         poll_interval_seconds=0.001,
         window_timeout_seconds=duration_timeout,
         ffmpeg_timeout_seconds=10,
@@ -429,7 +428,6 @@ async def test_two_window_job_hands_tail_to_next_window(tmp_path: Path) -> None:
         temp_dir=tmp_path / "temp",
         ffmpeg_path="ffmpeg",
         ffprobe_path="ffprobe",
-        max_active_jobs=1,
         poll_interval_seconds=0.001,
         window_timeout_seconds=2,
         ffmpeg_timeout_seconds=10,
@@ -481,7 +479,7 @@ async def test_jobs_take_turns_at_71_percent_with_lowest_completed_count_first(
 ) -> None:
     source = tmp_path / "source.ts"
     source.write_bytes(b"source")
-    configured = replace(make_settings(tmp_path), max_active_jobs=3)
+    configured = make_settings(tmp_path)
     database = Database(configured.database_path)
     await database.initialize()
     await create_named_job(database, source, "job-a", 7200)
@@ -550,7 +548,6 @@ async def test_multiple_islices_enforce_capacity_and_priority_independently(
     configured = replace(
         make_settings(tmp_path, duration_timeout=60),
         islice_base_urls=urls,
-        max_active_jobs=21,
     )
     database = Database(configured.database_path)
     await database.initialize()

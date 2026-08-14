@@ -40,12 +40,12 @@ cp .env.example .env
 - `DATA_DIR`：SQLite、原始响应和结果 JSON，默认 `./data`
 - `TEMP_DIR`：临时小时 TS，默认 `./temp`
 - `FFMPEG_PATH`、`FFPROBE_PATH`：可执行文件名或绝对路径
-- `MAX_ACTIVE_JOBS`：不同源文件的全局并发数，默认 `30`
+- `MAX_ACTIVE_JOBS_PER_ISLICE`：每个 iSlice 实例的活动作业上限，默认 `10`
 - `POLL_INTERVAL_SECONDS`：iSlice 轮询间隔，默认 `15`
 - `PIPELINE_PROGRESS_THRESHOLD`：同一 iSlice 的当前子任务达到该进度后，把下一次子任务提交机会交给等待队列中的另一个长文件作业，默认 `71`。单个作业内部始终严格串行，必须等当前窗口拆条完成并确定交接点后，才能排队提交下一窗口。
 - 每个窗口每次调度只提交一个 iSlice 子任务；子任务失败、提交异常或等待超时后立即暂停作业，不自动创建新的 attempt。手动恢复作业时才会创建下一次 attempt
 
-helper 不限制每台 iSlice 已绑定的长文件作业总数；新作业优先分配给当前活动作业较少的实例。同一实例上一个子任务达到 71% 或终态后，等待创建子任务的作业中总体完成度最高者优先；完成度相同则按进入等待队列的先后顺序。实际执行并发仍由 iSlice 控制。`MAX_ACTIVE_JOBS` 是所有实例合计的全局作业并发上限。
+helper 不设置全局活动作业上限；每个 iSlice 默认最多调度 10 个活动作业，总容量随已配置实例数动态变化。新作业优先分配给尚有容量且当前活动作业较少的实例。明确指定到满载实例的作业会保留在待调度状态，不会迁移到其他实例。同一实例上一个子任务达到 71% 或终态后，等待创建子任务的作业中总体完成度最高者优先；完成度相同则按进入等待队列的先后顺序。实际执行并发仍由 iSlice 控制。
 
 ## iSlice 服务与备份
 
@@ -106,7 +106,7 @@ chmod +x run.sh
 ./run.sh
 ```
 
-浏览器访问 `http://<host>:8090/`。生产运行必须保持单个 Uvicorn worker，作业并发由 `MAX_ACTIVE_JOBS` 控制。
+浏览器访问 `http://<host>:8090/`。生产运行必须保持单个 Uvicorn worker，作业容量按每个 iSlice 实例最多 10 个活动作业计算。
 
 ## 创建作业
 

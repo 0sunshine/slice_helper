@@ -1580,33 +1580,15 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    async def active_submission_job_count(self) -> int:
-        """Count distinct jobs with a submitted, non-terminal iSlice task."""
-        async with self.connect() as db:
-            row = await (
-                await db.execute(
-                    """
-                    SELECT COUNT(DISTINCT w.job_id) AS value
-                    FROM attempts a
-                    JOIN windows w ON w.id=a.window_id
-                    JOIN jobs j ON j.id=w.job_id
-                    WHERE j.superseded_at IS NULL
-                      AND a.status IN ('submitted','polling','resplitting')
-                      AND COALESCE(a.submitted_at,'')<>''
-                      AND COALESCE(a.progress,0)<100
-                    """
-                )
-            ).fetchone()
-        return int(row["value"] or 0)
-
     async def claim_schedulable_jobs(
         self,
         urls: tuple[str, ...],
         limit: int,
         configured_urls: tuple[str, ...] | None = None,
         scheduling_priority: str = "fewest_completed",
+        per_islice_limit: int = 10,
     ) -> list[dict[str, Any]]:
-        if limit < 1:
+        if limit < 1 or per_islice_limit < 1:
             return []
         normalized_urls = tuple(dict.fromkeys(url.rstrip("/") for url in urls))
         normalized_configured = tuple(
@@ -1658,10 +1640,12 @@ class Database:
                 )
             ).fetchall()
 
-            active_counts = {
-                row["islice_base_url"]: int(row["job_count"])
-                for row in active_rows
-            }
+            active_counts: dict[str, int] = {}
+            for row in active_rows:
+                url = str(row["islice_base_url"]).rstrip("/")
+                active_counts[url] = active_counts.get(url, 0) + int(
+                    row["job_count"]
+                )
             claimed: list[dict[str, Any]] = []
             for candidate_row in candidates:
                 candidate = dict(candidate_row)
@@ -1677,12 +1661,19 @@ class Database:
                             ),
                         )
                         continue
+                    if active_counts.get(assigned_url, 0) >= per_islice_limit:
+                        continue
                     selected_url = assigned_url
                 else:
-                    if not normalized_urls:
+                    available_urls = tuple(
+                        url
+                        for url in normalized_urls
+                        if active_counts.get(url, 0) < per_islice_limit
+                    )
+                    if not available_urls:
                         continue
                     selected_url = min(
-                        normalized_urls,
+                        available_urls,
                         key=lambda url: active_counts.get(url, 0),
                     )
 
