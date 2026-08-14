@@ -263,8 +263,35 @@ dialog::backdrop { background: #1c252180; }
 .backup-detail-cell { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .task-review-page { min-height: calc(100vh - 64px); background: #f4f5f2; }
 .task-review-band { min-height: calc(100vh - 64px); }
-.task-review-table { min-width: 1480px; }
+.task-review-heading { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: end; gap: 14px 24px; }
+.task-review-heading > div:first-child { align-self: center; }
+.task-review-heading .job-filters { width: 100%; display: grid; grid-template-columns: minmax(190px, 1.25fr) minmax(170px, 1fr) minmax(150px, .75fr) minmax(140px, .75fr) minmax(210px, 1fr); gap: 10px; }
+.task-review-heading .filter-label { min-width: 0; align-items: stretch; flex-direction: column; gap: 5px; font-size: 12px; }
+.task-review-heading .filter-label input, .task-review-heading .filter-label select { width: 100%; min-width: 0; }
+.task-review-list-scroll { max-height: calc(100vh - 238px); overflow: auto; }
+.task-review-table { min-width: 1360px; table-layout: fixed; }
+.task-review-table thead th { position: sticky; top: 0; z-index: 2; }
+.task-review-table th:nth-child(1) { width: 146px; }
+.task-review-table th:nth-child(2) { width: 226px; }
+.task-review-table th:nth-child(3) { width: 158px; }
+.task-review-table th:nth-child(4) { width: 164px; }
+.task-review-table th:nth-child(5) { width: 72px; }
+.task-review-table th:nth-child(6) { width: 72px; }
+.task-review-table th:nth-child(7) { width: 146px; }
+.task-review-table th:nth-child(8) { width: 120px; }
+.task-review-table th:nth-child(9) { width: 72px; }
+.task-review-table th:nth-child(10) { width: 220px; }
+.task-review-table td:nth-child(2), .task-review-table td:nth-child(3), .task-review-table td:nth-child(4) { overflow-wrap: anywhere; }
+.task-review-table th:nth-child(8), .task-review-table td:nth-child(8) { position: sticky; right: 292px; z-index: 3; box-shadow: -1px 0 #dfe3df; }
+.task-review-table th:nth-child(9), .task-review-table td:nth-child(9) { position: sticky; right: 220px; z-index: 3; }
+.task-review-table th:nth-child(10), .task-review-table td:nth-child(10) { position: sticky; right: 0; z-index: 3; box-shadow: -1px 0 #dfe3df; }
+.task-review-table th:nth-child(n+8) { background: #f5f7f5; }
+.task-review-table td:nth-child(n+8) { background: #fff; }
+.task-review-table tbody tr:hover td:nth-child(n+8) { background: #f6faf8; }
 .task-review-row { cursor: pointer; }
+.task-review-row.review-hold, .task-review-row.review-hold td:nth-child(n+8) { background: #fffaf0; }
+.task-review-row.review-approved, .task-review-row.review-approved td:nth-child(n+8) { background: #f1faf6; }
+.task-review-row.review-rejected, .task-review-row.review-rejected td:nth-child(n+8) { background: #fff5f3; }
 .task-review-row.review-hold { box-shadow: inset 4px 0 #c88a12; }
 .task-review-row.review-approved { box-shadow: inset 4px 0 #23836d; }
 .task-review-row.review-rejected { box-shadow: inset 4px 0 #b93b2f; }
@@ -275,15 +302,18 @@ dialog::backdrop { background: #1c252180; }
 .task-review-status.review-status-approved { color: #176b57; background: #eaf7f1; border-color: #8cc4b3; }
 .task-review-status.review-status-rejected { color: #92291f; background: #fff1ef; border-color: #e1a49d; }
 .task-ai-score { min-width: 72px; text-align: center !important; }
-.task-review-actions { min-width: 230px; display: inline-flex; align-items: center; gap: 5px; }
-.task-review-dialog { width: min(1320px, calc(100vw - 28px)); }
+.task-review-actions { width: 100%; display: inline-flex; align-items: center; gap: 5px; }
+.task-review-actions .button { padding-right: 6px; padding-left: 6px; white-space: nowrap; }
+.task-review-dialog { width: min(1320px, calc(100vw - 28px)); max-height: calc(100vh - 24px); overflow: hidden; }
+.task-review-dialog[open] { display: flex; flex-direction: column; }
+.task-review-dialog .dialog-header, .task-review-dialog .task-review-summary, .task-review-dialog .task-ai-review-form, .task-review-dialog .dialog-actions { flex: 0 0 auto; }
 .task-review-summary { margin: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-bottom: 1px solid #dfe3df; background: #eef1ee; gap: 1px; }
 .task-review-summary > div { min-width: 0; padding: 9px 12px; background: #fff; }
 .task-review-summary dt { color: #737b75; font-size: 11px; }
 .task-review-summary dd { margin: 4px 0 0; overflow-wrap: anywhere; }
-.task-review-dialog-body { min-height: 480px; max-height: min(61vh, 700px); display: grid; grid-template-columns: minmax(480px, 1.15fr) minmax(560px, 1fr); background: #f3f5f3; }
+.task-review-dialog-body { min-height: 280px; flex: 1 1 520px; display: grid; grid-template-columns: minmax(340px, 1.15fr) minmax(400px, 1fr); overflow: hidden; background: #f3f5f3; }
 .task-review-player { min-width: 0; padding: 12px; display: flex; flex-direction: column; background: #171a18; }
-.task-review-player video { width: 100%; min-height: 360px; max-height: 560px; flex: 1; background: #000; object-fit: contain; }
+.task-review-player video { width: 100%; min-height: 240px; max-height: 560px; flex: 1; background: #000; object-fit: contain; }
 .task-review-player-info { min-height: 64px; padding: 10px 2px 0; color: #e8ece9; display: flex; flex-direction: column; gap: 4px; }
 .task-review-player-info .mono, .task-review-player-info .muted { color: #aeb7b1; font-size: 12px; }
 .task-review-segments-panel { min-width: 0; padding: 12px; background: #fff; }
@@ -356,6 +386,11 @@ dialog::backdrop { background: #1c252180; }
 .reset-backup-result dd { overflow-wrap: anywhere; }
 .reset-warning-text { margin-top: 14px; color: #92291f; font-weight: 600; }
 
+@media (max-width: 1100px) {
+  .task-review-heading { grid-template-columns: 1fr; }
+  .task-review-heading .job-filters { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
 @media (max-width: 760px) {
   .topbar { align-items: flex-start; padding: 12px 14px; }
   .topbar-actions { flex-wrap: wrap; justify-content: flex-end; }
@@ -365,7 +400,11 @@ dialog::backdrop { background: #1c252180; }
   .archive-player-panel video { min-height: 220px; aspect-ratio: 16 / 9; }
   .archive-segments-panel { max-height: 360px; border-left: 0; border-top: 1px solid #d8ddd9; }
   .reset-danger-zone { align-items: flex-start; flex-direction: column; }
-  .task-review-heading { align-items: flex-start; flex-direction: column; }
+  .task-review-heading .job-filters { grid-template-columns: 1fr; }
+  .task-review-list-scroll { max-height: 58vh; min-height: 320px; }
+  .task-review-table { min-width: 950px; }
+  .task-review-table th:nth-child(8), .task-review-table td:nth-child(8) { position: sticky; right: 0; z-index: 3; box-shadow: -1px 0 #dfe3df; }
+  .task-review-table th:nth-child(9), .task-review-table td:nth-child(9), .task-review-table th:nth-child(10), .task-review-table td:nth-child(10) { display: none; }
   .task-review-summary { grid-template-columns: 1fr 1fr; }
   .task-review-dialog-body { min-height: 0; max-height: 66vh; grid-template-columns: 1fr; overflow-y: auto; }
   .task-review-player video { min-height: 220px; aspect-ratio: 16 / 9; }
