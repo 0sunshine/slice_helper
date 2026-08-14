@@ -320,8 +320,8 @@ dialog::backdrop { background: #1c252180; }
 .task-review-seek input:disabled { cursor: wait; opacity: .45; }
 .task-review-player-info { min-height: 64px; padding: 10px 2px 0; color: #e8ece9; display: flex; flex-direction: column; gap: 4px; }
 .task-review-player-info .mono, .task-review-player-info .muted { color: #aeb7b1; font-size: 12px; }
-.task-review-segments-panel { min-width: 0; padding: 12px; background: #fff; }
-.task-review-segments-scroll { height: 100%; overflow: auto; }
+.task-review-segments-panel { min-width: 0; min-height: 0; padding: 12px; overflow: hidden; display: flex; flex-direction: column; background: #fff; }
+.task-review-segments-scroll { min-height: 0; flex: 1; overflow: auto; scrollbar-gutter: stable; }
 .task-review-segments-table { min-width: 680px; table-layout: fixed; }
 .task-review-segments-table th:nth-child(1) { width: 42px; }
 .task-review-segments-table th:nth-child(2) { width: 260px; }
