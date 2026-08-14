@@ -150,8 +150,8 @@ def test_job_api_control_and_database_backed_chunk_route(
         ):
             assert f'<option value="{content_type}">{content_type}</option>' in home.text
         assert 'id="summaryISlice"' in home.text
-        assert "/static/styles.css?v=0.17.5" in home.text
-        assert "/static/app.js?v=0.17.5" in home.text
+        assert "/static/styles.css?v=0.18.0" in home.text
+        assert "/static/app.js?v=0.18.0" in home.text
         assert 'id="tailRebuildDialog"' in home.text
         assert 'id="timeRefreshDialog"' in home.text
         assert 'id="timeRefreshForm"' in home.text
@@ -1191,3 +1191,111 @@ def test_manual_segment_merge_api_manifest_and_excel(tmp_path: Path, monkeypatch
         restored = client.get(f"/api/jobs/{job_id}/segments").json()
         assert not any(item["record_kind"] == "merge" for item in restored)
         assert not any(item.get("active_merge_id") for item in restored)
+
+
+def test_completed_task_review_page_and_api(tmp_path: Path, monkeypatch) -> None:
+    async def no_start(_self):
+        return None
+
+    async def no_stop(_self):
+        return None
+
+    monkeypatch.setattr(Orchestrator, "start", no_start)
+    monkeypatch.setattr(Orchestrator, "stop", no_stop)
+    configured = make_settings(tmp_path)
+    source = tmp_path / "review-source.ts"
+    source.write_bytes(b"source")
+
+    with TestClient(create_app(configured)) as client:
+        page = client.get("/task-review")
+        assert page.status_code == 200
+        assert "iSlice 任务审核" in page.text
+        assert all(label in page.text for label in ("未审核", "暂保留", "通过", "不通过"))
+        assert "AI 审核评分" in page.text
+        assert "/static/task_review.js?v=0.18.0" in page.text
+        assert client.get("/static/task_review.js").status_code == 200
+        assert 'href="/task-review"' in client.get("/").text
+
+        channel_id = create_channel(client, "审核频道")
+        database = Database(configured.database_path)
+
+        async def seed() -> tuple[int, int]:
+            stat = source.stat()
+            await database.create_job(
+                {
+                    "id": "task-review-job", "status": "completed",
+                    "source_path": str(source), "source_size": stat.st_size,
+                    "source_mtime_ns": stat.st_mtime_ns, "source_duration": 7200,
+                    "islice_base_url": "http://islice.test", "template_id": "general",
+                    "language": "zh", "channel_id": channel_id,
+                    "channel_name": "审核频道", "broadcast_date": "2026-08-14",
+                    "program_start_time": "2026-08-14T08:00:00+08:00",
+                    "cut_mode": "copy", "total_windows": 2,
+                }
+            )
+            ids = []
+            for index, submitted in enumerate(
+                ("2026-08-14T01:00:00+00:00", "2026-08-14T02:00:00+00:00")
+            ):
+                window = await database.upsert_window(
+                    "task-review-job", index, index * 3600, (index + 1) * 3600
+                )
+                attempt = await database.create_attempt(window["id"], 1, f"task-review-{index}")
+                await database.update_attempt(
+                    attempt["id"], status="completed", service_status="completed",
+                    progress=100, submitted_at=submitted, finished_at=submitted,
+                )
+                await database.replace_window_segments(
+                    "task-review-job", window["id"], [{
+                        "source_index": 0, "accepted": 1, "ignored": 0, "reason": "",
+                        "local_start": 0, "local_end": 60,
+                        "global_start": index * 3600, "global_end": index * 3600 + 60,
+                        "absolute_start": f"2026-08-14T0{8 + index}:00:00+08:00",
+                        "absolute_end": f"2026-08-14T0{8 + index}:01:00+08:00",
+                        "title": f"审核片段 {index}", "content_type": "新闻",
+                        "news_event_type": "时政", "topic": "", "keywords_json": "[]",
+                        "summary": "", "segment_url": f"http://media.test/{index}.mp4",
+                        "cover_img_url": "", "raw_json": "{}",
+                    }]
+                )
+                ids.append(attempt["id"])
+            return ids[0], ids[1]
+
+        older_id, newer_id = asyncio.run(seed())
+        listed = client.get("/api/task-reviews").json()
+        assert listed["total"] == 2
+        assert [item["id"] for item in listed["items"]] == [newer_id, older_id]
+        assert listed["items"][0]["review_status"] == "unreviewed"
+        assert listed["items"][0]["ai_review_score"] is None
+        assert listed["items"][0]["ai_review_comment"] == ""
+
+        updated = client.patch(
+            f"/api/task-reviews/{newer_id}",
+            json={"reviewStatus": "hold", "aiReviewScore": 8.5,
+                  "aiReviewComment": "边界需要人工复核"},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["review_status"] == "hold"
+        assert updated.json()["ai_review_score"] == 8.5
+        assert updated.json()["ai_review_comment"] == "边界需要人工复核"
+        assert updated.json()["reviewed_at"]
+
+        filtered = client.get("/api/task-reviews", params={"reviewStatus": "hold"}).json()
+        assert [item["id"] for item in filtered["items"]] == [newer_id]
+        detail = client.get(f"/api/task-reviews/{newer_id}/segments")
+        assert detail.status_code == 200
+        assert [item["title"] for item in detail.json()["segments"]] == ["审核片段 1"]
+
+        cleared = client.patch(
+            f"/api/task-reviews/{newer_id}",
+            json={"aiReviewScore": None, "aiReviewComment": ""},
+        )
+        assert cleared.status_code == 200
+        assert cleared.json()["ai_review_score"] is None
+        assert cleared.json()["ai_review_comment"] == ""
+        assert client.patch(
+            f"/api/task-reviews/{newer_id}", json={"aiReviewScore": 10.1}
+        ).status_code == 422
+        assert client.patch(
+            f"/api/task-reviews/{newer_id}", json={"reviewStatus": "unknown"}
+        ).status_code == 422

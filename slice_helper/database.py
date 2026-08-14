@@ -83,6 +83,10 @@ class Database:
         "error_message",
         "submitted_at",
         "finished_at",
+        "review_status",
+        "reviewed_at",
+        "ai_review_score",
+        "ai_review_comment",
     }
     MERGE_FIELDS = {"title", "content_type", "ignored"}
 
@@ -396,6 +400,10 @@ class Database:
                 "service_status": "TEXT NOT NULL DEFAULT ''",
                 "progress": "REAL NOT NULL DEFAULT 0",
                 "submitted_at": "TEXT NOT NULL DEFAULT ''",
+                "review_status": "TEXT NOT NULL DEFAULT 'unreviewed'",
+                "reviewed_at": "TEXT",
+                "ai_review_score": "REAL",
+                "ai_review_comment": "TEXT NOT NULL DEFAULT ''",
             }
             needs_submitted_at_backfill = "submitted_at" not in attempt_columns
             for column, declaration in attempt_migrations.items():
@@ -677,6 +685,10 @@ class Database:
             )
             await db.execute(
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(24, ?)",
+                (utc_now(),),
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(25, ?)",
                 (utc_now(),),
             )
             await db.commit()
@@ -1788,6 +1800,153 @@ class Database:
                 )
             ).fetchall()
         return [dict(row) for row in rows], int(total_row["value"])
+
+    async def paginate_completed_tasks(
+        self,
+        *,
+        page: int,
+        page_size: int,
+        channel_id: str | None = None,
+        broadcast_date: str | None = None,
+        islice_base_url: str | None = None,
+        review_status: str | None = None,
+        query: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        where = [
+            "a.status='completed'",
+            "COALESCE(a.submitted_at, '')<>''",
+            "j.superseded_at IS NULL",
+        ]
+        params: list[Any] = []
+        if channel_id:
+            where.append("j.channel_id=?")
+            params.append(channel_id)
+        if broadcast_date:
+            where.append("j.broadcast_date=?")
+            params.append(broadcast_date)
+        if islice_base_url:
+            where.append("j.islice_base_url=?")
+            params.append(islice_base_url.rstrip("/"))
+        if review_status:
+            where.append("a.review_status=?")
+            params.append(review_status)
+        if query:
+            where.append(
+                "(a.task_id LIKE ? OR j.id LIKE ? OR COALESCE(c.name,j.channel_name,'') LIKE ? "
+                "OR j.source_path LIKE ? OR j.source_url LIKE ?)"
+            )
+            pattern = f"%{query.strip()}%"
+            params.extend([pattern] * 5)
+        where_sql = " AND ".join(where)
+        joins = """
+            FROM attempts a
+            JOIN windows w ON w.id=a.window_id
+            JOIN jobs j ON j.id=w.job_id
+            LEFT JOIN channels c ON c.id=j.channel_id
+        """
+        async with self.connect() as db:
+            total_row = await (
+                await db.execute(
+                    f"SELECT COUNT(*) AS value {joins} WHERE {where_sql}", params
+                )
+            ).fetchone()
+            rows = await (
+                await db.execute(
+                    f"""
+                    SELECT a.id,a.task_id,a.attempt_no,a.status,a.service_status,
+                           a.progress,a.submitted_at,a.finished_at,a.review_status,
+                           a.reviewed_at,a.ai_review_score,a.ai_review_comment,
+                           a.error_message,
+                           w.job_id,w.window_index,w.requested_start,w.nominal_end,
+                           w.handoff_start,w.status AS window_status,
+                           j.channel_id,COALESCE(c.name,j.channel_name) AS channel_name,
+                           j.broadcast_date,j.source_path,j.source_url,
+                           j.islice_base_url,j.status AS job_status,
+                           j.program_start_time AS job_program_start_time,
+                           (SELECT COUNT(*) FROM segments s WHERE s.attempt_id=a.id)
+                             AS segment_count,
+                           (SELECT COUNT(*) FROM segments s
+                            WHERE s.attempt_id=a.id AND s.accepted=1)
+                             AS accepted_segment_count,
+                           (SELECT COUNT(*) FROM segments s
+                            WHERE s.attempt_id=a.id AND s.ignored=1)
+                             AS ignored_segment_count
+                    {joins}
+                    WHERE {where_sql}
+                    ORDER BY a.submitted_at DESC,a.id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (*params, page_size, (page - 1) * page_size),
+                )
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for stored in rows:
+            row = dict(stored)
+            row["program_start_time"] = absolute_time(
+                row.pop("job_program_start_time"), float(row["requested_start"])
+            )
+            result.append(row)
+        return result, int(total_row["value"])
+
+    async def get_completed_task(self, attempt_id: int) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            row = await (
+                await db.execute(
+                    """
+                    SELECT a.*,w.job_id,w.window_index,w.requested_start,w.nominal_end,
+                           j.channel_id,j.channel_name,j.broadcast_date,j.source_path,
+                           j.source_url,j.islice_base_url,j.status AS job_status
+                    FROM attempts a
+                    JOIN windows w ON w.id=a.window_id
+                    JOIN jobs j ON j.id=w.job_id
+                    WHERE a.id=? AND a.status='completed'
+                    """,
+                    (attempt_id,),
+                )
+            ).fetchone()
+        return self._row(row)
+
+    async def update_task_review(
+        self, attempt_id: int, **fields: Any
+    ) -> dict[str, Any] | None:
+        allowed = {"review_status", "ai_review_score", "ai_review_comment"}
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"Unknown task review fields: {sorted(unknown)}")
+        if not fields:
+            return None
+        if "review_status" in fields:
+            fields["reviewed_at"] = (
+                None if fields["review_status"] == "unreviewed" else utc_now()
+            )
+        assignments = ",".join(f"{key}=?" for key in fields)
+        async with self.connect() as db:
+            row = await (
+                await db.execute(
+                    f"UPDATE attempts SET {assignments} "
+                    "WHERE id=? AND status='completed' RETURNING *",
+                    (*fields.values(), attempt_id),
+                )
+            ).fetchone()
+            await db.commit()
+        return self._row(row)
+
+    async def get_segments_for_attempt(self, attempt_id: int) -> list[dict[str, Any]]:
+        async with self.connect() as db:
+            rows = await (
+                await db.execute(
+                    """
+                    SELECT s.*,w.window_index,j.islice_base_url
+                    FROM segments s
+                    JOIN windows w ON w.id=s.window_id
+                    JOIN jobs j ON j.id=s.job_id
+                    WHERE s.attempt_id=?
+                    ORDER BY s.global_start,s.source_index,s.id
+                    """,
+                    (attempt_id,),
+                )
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     async def get_channel_export(self, channel_id: str) -> dict[str, Any] | None:
         channel = await self.get_channel(channel_id)

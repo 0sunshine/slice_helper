@@ -1285,7 +1285,13 @@ $("nextSegmentPage").addEventListener("click", () => {
   renderSegments();
 });
 
-Promise.all([loadHealth(), loadChannels().then(loadJobs), loadISliceInstances()]).catch((error) => showToast(error.message));
+Promise.all([loadHealth(), loadChannels().then(loadJobs), loadISliceInstances()])
+  .then(() => {
+    const requestedJobId = new URLSearchParams(window.location.search).get("jobId");
+    if (requestedJobId) return loadDetail(requestedJobId, true);
+    return null;
+  })
+  .catch((error) => showToast(error.message));
 const priorityButton = document.createElement("button");
 priorityButton.className = "button secondary";
 priorityButton.type = "button";

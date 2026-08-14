@@ -32,6 +32,7 @@ from .models import (
     ChannelCreate,
     ChannelUpdate,
     JobReviewUpdate,
+    TaskReviewUpdate,
     JobCreate,
     JobStatus,
     ISliceInstanceUpsert,
@@ -292,6 +293,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return templates.TemplateResponse(
             request=request,
             name="backup.html",
+            context={"version": application.version},
+        )
+
+    @application.get("/task-review", response_class=HTMLResponse, include_in_schema=False)
+    async def task_review_page(request: Request):
+        return templates.TemplateResponse(
+            request=request,
+            name="task_review.html",
             context={"version": application.version},
         )
 
@@ -1060,6 +1069,83 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "total": total,
             "totalPages": total_pages,
         }
+
+    @application.get("/api/task-reviews")
+    async def list_task_reviews(
+        request: Request,
+        channel_id: str | None = Query(default=None, alias="channelId"),
+        broadcast_date: str | None = Query(default=None, alias="broadcastDate"),
+        islice_base_url: str | None = Query(default=None, alias="isliceBaseUrl"),
+        review_status: str | None = Query(default=None, alias="reviewStatus"),
+        query: str | None = Query(default=None, max_length=200),
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=20, alias="pageSize", ge=1, le=100),
+    ):
+        if review_status and review_status not in {
+            "unreviewed", "hold", "approved", "rejected"
+        }:
+            raise HTTPException(status_code=400, detail="Unknown task review status")
+        if broadcast_date:
+            try:
+                date.fromisoformat(broadcast_date)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400, detail="业务日期格式应为 YYYY-MM-DD"
+                ) from exc
+        items, total = await request.app.state.database.paginate_completed_tasks(
+            page=page,
+            page_size=page_size,
+            channel_id=channel_id,
+            broadcast_date=broadcast_date,
+            islice_base_url=(islice_base_url.rstrip("/") if islice_base_url else None),
+            review_status=review_status,
+            query=query,
+        )
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        if page > total_pages:
+            page = total_pages
+            items, _ = await request.app.state.database.paginate_completed_tasks(
+                page=page,
+                page_size=page_size,
+                channel_id=channel_id,
+                broadcast_date=broadcast_date,
+                islice_base_url=(islice_base_url.rstrip("/") if islice_base_url else None),
+                review_status=review_status,
+                query=query,
+            )
+        return {
+            "items": items,
+            "page": page,
+            "pageSize": page_size,
+            "total": total,
+            "totalPages": total_pages,
+        }
+
+    @application.get("/api/task-reviews/{attempt_id}/segments")
+    async def get_task_review_segments(request: Request, attempt_id: int):
+        task = await request.app.state.database.get_completed_task(attempt_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Completed task not found")
+        rows = await request.app.state.database.get_segments_for_attempt(attempt_id)
+        rows = await _resolve_archive_media(
+            request.app.state.database, request.app.state.archive_catalog, rows
+        )
+        return {
+            "task": task,
+            "segments": [_public_segment(row) for row in rows],
+        }
+
+    @application.patch("/api/task-reviews/{attempt_id}")
+    async def update_task_review(
+        request: Request, attempt_id: int, body: TaskReviewUpdate
+    ):
+        fields = body.model_dump(exclude_unset=True)
+        if "ai_review_comment" in fields:
+            fields["ai_review_comment"] = fields["ai_review_comment"] or ""
+        updated = await request.app.state.database.update_task_review(attempt_id, **fields)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="Completed task not found")
+        return updated
 
     @application.get("/api/jobs/{job_id}")
     async def get_job(request: Request, job_id: str):

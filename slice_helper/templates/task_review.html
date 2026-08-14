@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>iSlice 任务审核</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}?v={{ version }}">
+</head>
+<body>
+  <header class="topbar">
+    <div><h1>iSlice 任务审核</h1><span class="version">v{{ version }}</span></div>
+    <div class="topbar-actions">
+      <a class="button secondary button-link" href="/">返回作业</a>
+      <a class="button secondary button-link" href="/backup">iSlice 与备份</a>
+      <button id="refreshTaskReviews" class="button primary" type="button">刷新</button>
+    </div>
+  </header>
+
+  <main class="task-review-page">
+    <section class="band task-review-band">
+      <div class="section-heading task-review-heading">
+        <div><h2>已完成任务</h2><span id="taskReviewCount" class="count">0</span></div>
+        <div class="job-filters">
+          <label class="filter-label">频道<select id="taskChannelFilter"><option value="">全部频道</option></select></label>
+          <label class="filter-label">iSlice<select id="taskISliceFilter"><option value="">全部节点</option></select></label>
+          <label class="filter-label">业务日期<input id="taskDateFilter" type="date"></label>
+          <label class="filter-label">审核状态<select id="taskReviewStatusFilter">
+            <option value="">全部状态</option>
+            <option value="unreviewed">未审核</option>
+            <option value="hold">暂保留</option>
+            <option value="approved">通过</option>
+            <option value="rejected">不通过</option>
+          </select></label>
+          <label class="filter-label">搜索<input id="taskReviewQuery" type="search" placeholder="task ID、频道或作业"></label>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table class="data-table task-review-table">
+          <thead><tr>
+            <th>下发时间</th><th>task ID</th><th>频道 / 日期</th><th>iSlice</th>
+            <th>窗口</th><th>片段</th><th>完成时间</th><th>人为审核</th><th>AI 评分</th><th>操作</th>
+          </tr></thead>
+          <tbody id="taskReviewBody"></tbody>
+        </table>
+      </div>
+      <div id="emptyTaskReviews" class="empty-state" hidden>没有符合条件的已完成任务</div>
+      <div class="jobs-pagination" aria-label="任务审核列表分页">
+        <span id="taskReviewPageSummary">共 0 条</span>
+        <label>每页<select id="taskReviewPageSize"><option value="20">20</option><option value="50">50</option><option value="100">100</option></select></label>
+        <button id="previousTaskReviewPage" class="icon-button pagination-button" type="button" aria-label="上一页">&lsaquo;</button>
+        <span id="taskReviewPageInfo">1 / 1</span>
+        <button id="nextTaskReviewPage" class="icon-button pagination-button" type="button" aria-label="下一页">&rsaquo;</button>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="taskReviewDialog" class="task-review-dialog">
+    <div class="dialog-header">
+      <div><h2 id="taskReviewDialogTitle">任务片段</h2><small id="taskReviewDialogSubtitle" class="muted mono"></small></div>
+      <button id="closeTaskReviewDialog" class="icon-button" type="button" aria-label="关闭">×</button>
+    </div>
+    <dl class="task-review-summary">
+      <div><dt>频道</dt><dd id="taskDialogChannel"></dd></div>
+      <div><dt>业务日期</dt><dd id="taskDialogDate"></dd></div>
+      <div><dt>窗口</dt><dd id="taskDialogWindow"></dd></div>
+      <div><dt>下发时间</dt><dd id="taskDialogSubmitted" class="mono"></dd></div>
+    </dl>
+    <div class="task-review-dialog-body">
+      <section class="task-review-player">
+        <video id="taskReviewVideo" controls preload="metadata"></video>
+        <div class="task-review-player-info">
+          <strong id="taskReviewSegmentTitle">请选择片段</strong>
+          <span id="taskReviewSegmentTime" class="mono"></span>
+          <span id="taskReviewVideoStatus" class="muted"></span>
+        </div>
+      </section>
+      <section class="task-review-segments-panel">
+        <div class="table-scroll task-review-segments-scroll">
+          <table class="data-table compact task-review-segments-table">
+            <thead><tr><th>#</th><th>标题</th><th>节目类型</th><th>起止时间</th><th>状态</th></tr></thead>
+            <tbody id="taskReviewSegmentsBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+    <form id="taskAIReviewForm" class="task-ai-review-form">
+      <label>AI 审核评分（0–10，可留空）<input id="taskAIReviewScore" type="number" min="0" max="10" step="0.1" inputmode="decimal"></label>
+      <label>AI 评论<textarea id="taskAIReviewComment" rows="3" maxlength="4000"></textarea></label>
+      <button id="saveTaskAIReview" class="button secondary" type="submit">保存 AI 审核</button>
+    </form>
+    <div class="dialog-actions">
+      <a id="openTaskSegmentVideo" class="button secondary button-link" href="#" target="_blank" rel="noopener" hidden>新窗口打开视频</a>
+      <a id="openTaskJob" class="button secondary button-link" href="/">打开所属作业</a>
+      <button id="resplitReviewedTask" class="button danger" type="button">重新拆分</button>
+      <button id="doneTaskReviewDialog" class="button primary" type="button">关闭</button>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="{{ url_for('static', path='/task_review.js') }}?v={{ version }}" defer></script>
+</body>
+</html>

@@ -4,6 +4,7 @@ from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
 import re
+from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -345,6 +346,35 @@ class TimeReferenceRefresh(BaseModel):
 
 class JobReviewUpdate(BaseModel):
     reviewed: bool
+
+
+class TaskReviewUpdate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    review_status: Literal["unreviewed", "hold", "approved", "rejected"] | None = Field(
+        default=None, alias="reviewStatus"
+    )
+    ai_review_score: float | None = Field(
+        default=None, alias="aiReviewScore", ge=0, le=10
+    )
+    ai_review_comment: str | None = Field(
+        default=None, alias="aiReviewComment", max_length=4000
+    )
+
+    @field_validator("ai_review_comment")
+    @classmethod
+    def normalize_ai_comment(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
+
+    @model_validator(mode="after")
+    def require_task_review_update(self):
+        if not self.model_fields_set.intersection(
+            {"review_status", "ai_review_score", "ai_review_comment"}
+        ):
+            raise ValueError("At least one task review field must be supplied")
+        if "review_status" in self.model_fields_set and self.review_status is None:
+            raise ValueError("reviewStatus cannot be null")
+        return self
 
 
 class SegmentUpdate(BaseModel):

@@ -38,7 +38,7 @@ async def test_database_persists_and_recovers_jobs(tmp_path: Path) -> None:
 
     async with database.connect() as db:
         versions = await (await db.execute("SELECT version FROM schema_version ORDER BY version")).fetchall()
-    assert [row["version"] for row in versions] == list(range(1, 25))
+    assert [row["version"] for row in versions] == list(range(1, 26))
     async with database.connect() as db:
         segment_columns = {
             row["name"]
@@ -55,6 +55,10 @@ async def test_database_persists_and_recovers_jobs(tmp_path: Path) -> None:
             for row in await (await db.execute("PRAGMA table_info(attempts)")).fetchall()
         }
     assert "submitted_at" in attempt_columns
+    assert "review_status" in attempt_columns
+    assert "reviewed_at" in attempt_columns
+    assert "ai_review_score" in attempt_columns
+    assert "ai_review_comment" in attempt_columns
     async with database.connect() as db:
         job_columns = {
             row["name"]
@@ -75,6 +79,9 @@ async def test_database_persists_and_recovers_jobs(tmp_path: Path) -> None:
     assert attempt["service_status"] == ""
     assert attempt["progress"] == 0
     assert attempt["submitted_at"] == ""
+    assert attempt["review_status"] == "unreviewed"
+    assert attempt["ai_review_score"] is None
+    assert attempt["ai_review_comment"] == ""
     await database.assign_legacy_jobs_with_attempts("http://islice-a.test/")
     assert (await database.get_job("job1"))["islice_base_url"] == "http://islice-a.test"
 
