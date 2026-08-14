@@ -1,6 +1,7 @@
 const state = {
   tasks: [], channels: [], instances: [], page: 1, pageSize: 20,
-  total: 0, totalPages: 1, selectedTask: null, segments: [], queryTimer: null
+  total: 0, totalPages: 1, selectedTask: null, segments: [], queryTimer: null,
+  isSeeking: false, pendingSeek: null
 };
 
 const $ = (id) => document.getElementById(id);
@@ -48,6 +49,29 @@ function formatSeconds(value) {
   const minutes = Math.floor((total % 3600) / 60);
   const seconds = Math.floor(total % 60);
   return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function formatMediaTime(value) {
+  if (!Number.isFinite(Number(value))) return "--:--:--";
+  return formatSeconds(value);
+}
+
+function configureSeek(duration, currentTime = 0) {
+  const seek = $("taskReviewSeek");
+  const safeDuration = Number.isFinite(Number(duration)) && Number(duration) > 0 ? Number(duration) : 0;
+  const safeCurrent = Math.min(Math.max(0, Number(currentTime) || 0), safeDuration || 0);
+  seek.max = String(safeDuration);
+  seek.value = String(safeCurrent);
+  seek.disabled = safeDuration <= 0;
+  $("taskReviewSeekCurrent").textContent = formatMediaTime(safeCurrent);
+  $("taskReviewSeekDuration").textContent = formatMediaTime(safeDuration || NaN);
+}
+
+function applyPendingSeek() {
+  const video = $("taskReviewVideo");
+  if (state.pendingSeek === null || video.readyState < 1 || !Number.isFinite(video.duration)) return;
+  video.currentTime = Math.min(Math.max(0, state.pendingSeek), video.duration);
+  state.pendingSeek = null;
 }
 
 function sourceName(task) {
@@ -194,12 +218,16 @@ function previewSegment(index) {
   const segment = state.segments[index];
   if (!segment?.segment_url) return;
   const video = $("taskReviewVideo");
+  const expectedDuration = Math.max(0, Number(segment.global_end) - Number(segment.global_start));
+  state.isSeeking = false;
+  state.pendingSeek = null;
+  configureSeek(expectedDuration);
   video.src = segment.segment_url;
   video.load();
   video.play().catch(() => {});
   $("taskReviewSegmentTitle").textContent = segment.title || `片段 ${index + 1}`;
   $("taskReviewSegmentTime").textContent = `${segment.absolute_start || formatSeconds(segment.global_start)} - ${segment.absolute_end || formatSeconds(segment.global_end)}`;
-  $("taskReviewVideoStatus").textContent = segment.archive_status === "ready" ? "已从归档读取" : "正在加载";
+  $("taskReviewVideoStatus").textContent = segment.archive_status === "ready" ? "正在读取归档视频" : "正在加载";
   $("openTaskSegmentVideo").href = segment.segment_url;
   $("openTaskSegmentVideo").hidden = false;
   document.querySelectorAll(".task-review-segment-row.is-active").forEach((row) => row.classList.remove("is-active"));
@@ -211,6 +239,9 @@ function resetVideo() {
   video.pause();
   video.removeAttribute("src");
   video.load();
+  state.isSeeking = false;
+  state.pendingSeek = null;
+  configureSeek(0);
   $("taskReviewSegmentTitle").textContent = "请选择片段";
   $("taskReviewSegmentTime").textContent = "";
   $("taskReviewVideoStatus").textContent = "";
@@ -303,6 +334,50 @@ $("taskReviewSegmentsBody").addEventListener("click", (event) => {
 $("taskReviewSegmentsBody").addEventListener("keydown", (event) => {
   const row = event.target.closest(".task-review-segment-row.is-previewable");
   if (row && ["Enter", " "].includes(event.key)) { event.preventDefault(); previewSegment(Number(row.dataset.segmentIndex)); }
+});
+$("taskReviewSeek").addEventListener("input", () => {
+  const target = Number($("taskReviewSeek").value);
+  state.isSeeking = true;
+  state.pendingSeek = target;
+  $("taskReviewSeekCurrent").textContent = formatMediaTime(target);
+  applyPendingSeek();
+});
+$("taskReviewSeek").addEventListener("change", () => {
+  state.pendingSeek = Number($("taskReviewSeek").value);
+  applyPendingSeek();
+  state.isSeeking = false;
+});
+$("taskReviewVideo").addEventListener("loadedmetadata", () => {
+  const video = $("taskReviewVideo");
+  const expected = Number($("taskReviewSeek").max);
+  configureSeek(Number.isFinite(video.duration) ? video.duration : expected, video.currentTime);
+  applyPendingSeek();
+});
+$("taskReviewVideo").addEventListener("durationchange", () => {
+  const video = $("taskReviewVideo");
+  if (Number.isFinite(video.duration) && video.duration > 0) {
+    configureSeek(video.duration, video.currentTime);
+  }
+});
+$("taskReviewVideo").addEventListener("timeupdate", () => {
+  if (state.isSeeking) return;
+  const video = $("taskReviewVideo");
+  const seek = $("taskReviewSeek");
+  seek.value = String(Math.min(video.currentTime, Number(seek.max) || video.currentTime));
+  $("taskReviewSeekCurrent").textContent = formatMediaTime(video.currentTime);
+});
+$("taskReviewVideo").addEventListener("canplay", () => {
+  $("taskReviewVideoStatus").textContent = "视频已就绪";
+});
+$("taskReviewVideo").addEventListener("seeking", () => {
+  $("taskReviewVideoStatus").textContent = "正在定位";
+});
+$("taskReviewVideo").addEventListener("seeked", () => {
+  state.isSeeking = false;
+  $("taskReviewVideoStatus").textContent = `已定位到 ${formatMediaTime($("taskReviewVideo").currentTime)}`;
+});
+$("taskReviewVideo").addEventListener("error", () => {
+  $("taskReviewVideoStatus").textContent = "视频加载失败";
 });
 $("taskAIReviewForm").addEventListener("submit", saveAIReview);
 $("resplitReviewedTask").addEventListener("click", () => state.selectedTask && resplitTask(state.selectedTask.id));

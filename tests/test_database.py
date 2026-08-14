@@ -38,7 +38,7 @@ async def test_database_persists_and_recovers_jobs(tmp_path: Path) -> None:
 
     async with database.connect() as db:
         versions = await (await db.execute("SELECT version FROM schema_version ORDER BY version")).fetchall()
-    assert [row["version"] for row in versions] == list(range(1, 26))
+    assert [row["version"] for row in versions] == list(range(1, 27))
     async with database.connect() as db:
         segment_columns = {
             row["name"]
@@ -59,6 +59,17 @@ async def test_database_persists_and_recovers_jobs(tmp_path: Path) -> None:
     assert "reviewed_at" in attempt_columns
     assert "ai_review_score" in attempt_columns
     assert "ai_review_comment" in attempt_columns
+    async with database.connect() as db:
+        attempt_indexes = {
+            row["name"]
+            for row in await (await db.execute("PRAGMA index_list(attempts)")).fetchall()
+        }
+        segment_indexes = {
+            row["name"]
+            for row in await (await db.execute("PRAGMA index_list(segments)")).fetchall()
+        }
+    assert "idx_attempts_status_submitted" in attempt_indexes
+    assert "idx_segments_attempt" in segment_indexes
     async with database.connect() as db:
         job_columns = {
             row["name"]

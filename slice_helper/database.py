@@ -263,6 +263,8 @@ class Database:
                     finished_at TEXT,
                     UNIQUE(window_id, attempt_no)
                 );
+                CREATE INDEX IF NOT EXISTS idx_attempts_status_submitted
+                    ON attempts(status, submitted_at DESC, id DESC);
 
                 CREATE TABLE IF NOT EXISTS segments (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -293,6 +295,8 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_segments_job_time
                     ON segments(job_id, accepted, global_start);
+                CREATE INDEX IF NOT EXISTS idx_segments_attempt
+                    ON segments(attempt_id);
 
                 CREATE TABLE IF NOT EXISTS segment_merges (
                     id TEXT PRIMARY KEY,
@@ -689,6 +693,10 @@ class Database:
             )
             await db.execute(
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(25, ?)",
+                (utc_now(),),
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(26, ?)",
                 (utc_now(),),
             )
             await db.commit()
