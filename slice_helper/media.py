@@ -94,7 +94,9 @@ class MediaService:
         partial = target.with_name(f"{target.stem}.partial{target.suffix}")
         partial.unlink(missing_ok=True)
 
-        async def render(*, repair_audio: bool = False, reencode_video: bool = False) -> MediaProbe:
+        async def render(
+            *, repair_audio: bool = False, validate_aac_bitstream: bool = True
+        ) -> MediaProbe:
             partial.unlink(missing_ok=True)
             command = [
                 self.settings.ffmpeg_path,
@@ -117,7 +119,7 @@ class MediaService:
                 "-map",
                 "0:a:0?",
             ]
-            if str(mode) == CutMode.TRANSCODE.value or reencode_video:
+            if str(mode) == CutMode.TRANSCODE.value:
                 command.extend(
                     [
                         "-c:v",
@@ -153,7 +155,9 @@ class MediaService:
                 raise MediaError(
                     f"Cut duration differs by more than 60s: expected {duration:.2f}, got {result.duration:.2f}"
                 )
-            await self.validate_for_islice(partial, result)
+            await self.validate_for_islice(
+                partial, result, check_aac_bitstream=validate_aac_bitstream
+            )
             return result
 
         try:
@@ -168,20 +172,19 @@ class MediaService:
                     initial_error,
                 )
                 try:
-                    result = await render(repair_audio=True)
-                except MediaError as repair_error:
-                    logger.warning(
-                        "Audio repair did not make the copied chunk valid; "
-                        "retrying with full video/audio re-encode: %s",
-                        repair_error,
+                    # The repaired output is already freshly encoded AAC in an
+                    # MPEG-TS container. Do not apply the MP4-oriented
+                    # aac_adtstoasc probe to it; that filter can reject valid
+                    # repaired TS packets with "Invalid argument".
+                    result = await render(
+                        repair_audio=True, validate_aac_bitstream=False
                     )
-                    try:
-                        result = await render(reencode_video=True)
-                    except MediaError as reencode_error:
-                        raise MediaError(
-                            "Chunk failed validation after full video/audio re-encode: "
-                            f"{reencode_error}"
-                        ) from reencode_error
+                except MediaError as repair_error:
+                    raise MediaError(
+                        "Chunk failed validation after audio repair; "
+                        "automatic video re-encoding is disabled: "
+                        f"{repair_error}"
+                    ) from repair_error
             os.replace(partial, target)
             return await self.probe(target)
         except Exception:
@@ -189,7 +192,11 @@ class MediaService:
             raise
 
     async def validate_for_islice(
-        self, path: Path, probe: MediaProbe | None = None
+        self,
+        path: Path,
+        probe: MediaProbe | None = None,
+        *,
+        check_aac_bitstream: bool = True,
     ) -> None:
         media_probe = probe or await self.probe(path)
         command = [
@@ -209,7 +216,7 @@ class MediaService:
         ]
         # iSlice writes MP4 segments. Scanning every AAC packet through the same
         # ADTS conversion catches malformed packets that metadata-only ffprobe misses.
-        if media_probe.audio_codec == "aac":
+        if check_aac_bitstream and media_probe.audio_codec == "aac":
             command.extend(["-bsf:a", "aac_adtstoasc"])
         command.extend(["-f", "null", "-"])
         try:
