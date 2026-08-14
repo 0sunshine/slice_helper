@@ -167,8 +167,15 @@ class ArchiveCatalogReader:
             ),
             None,
         )
+        # A catalog can be regenerated on a replacement node and temporarily
+        # omit tasks that were archived by the previous node.  The archive
+        # namespace is immutable, so probe the deterministic task directory
+        # before declaring the old completed window unavailable.
+        direct_archive_url = ""
         if task is None:
-            raise ArchivePreviewError("归档 catalog 中不存在该任务")
+            catalog_root = self._catalog_root(catalog_url)
+            direct_archive_url = f"{catalog_root}/tasks/{quote(task_id, safe='')}"
+            task = {}
 
         selected_digest = revision_digest or str(task.get("manifest_digest") or "")
         archive_url = str(task.get("archive_url") or "")
@@ -189,6 +196,8 @@ class ArchiveCatalogReader:
                 raise ArchivePreviewError("旧版 catalog 没有该历史版本的预览地址，请先升级并运行归档代理")
 
         catalog_root = self._catalog_root(catalog_url)
+        if not archive_url and direct_archive_url:
+            archive_url = direct_archive_url
         if not archive_url:
             archive_url = (
                 f"{catalog_root}/download/{quote(task_id, safe='')}"
