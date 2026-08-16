@@ -122,6 +122,36 @@ class TerminalFailingISlice:
         }
 
 
+class RecoveringPollISlice:
+    def __init__(self, failures: int = 5) -> None:
+        self.failures = failures
+        self.calls = 0
+
+    async def ensure_task(self, _task_id, _request):
+        return None
+
+    async def get_task_info(self, task_id):
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise ISliceError("GetTaskInfo returned HTTP 500")
+        return {
+            "taskInfo": {
+                "taskId": task_id,
+                "status": "completed",
+                "progress": 100,
+                "videoPath": "unused",
+            },
+            "segments": [
+                {"startTime": 0, "endTime": 3600, "title": "recovered"}
+            ],
+        }
+
+
+class SubmittedRecoveringPollISlice(RecoveringPollISlice):
+    async def ensure_task(self, _task_id, _request):
+        raise AssertionError("a submitted task must not be ensured again")
+
+
 class ResplitISlice:
     def __init__(self, *, terminal_status: str = "completed") -> None:
         self.terminal_status = terminal_status
@@ -713,7 +743,9 @@ async def test_restart_resumes_polling_submitted_task_for_paused_job(
         submitted_at="2026-08-13T00:00:00+00:00",
     )
     await database.update_job("abc123", status="paused")
-    orchestrator = Orchestrator(configured, database, FakeMedia(), FakeISlice())
+    islice = SubmittedRecoveringPollISlice(failures=5)
+    orchestrator = Orchestrator(configured, database, FakeMedia(), islice)
+    orchestrator.RETRY_DELAYS = (0.001,)
 
     await orchestrator.start()
     try:
@@ -725,6 +757,8 @@ async def test_restart_resumes_polling_submitted_task_for_paused_job(
         assert len(attempts) == 1
         assert attempts[0]["status"] == "completed"
         assert attempts[0]["service_status"] == "completed"
+        assert attempts[0]["error_message"] == ""
+        assert islice.calls == 6
     finally:
         await orchestrator.stop()
 
@@ -1110,6 +1144,32 @@ async def test_terminal_islice_failure_pauses_without_automatic_retry(tmp_path: 
     assert attempts[0]["service_status"] == "failed"
     assert attempts[0]["error_message"] == "internal retries exhausted"
     assert attempts[0]["raw_response_path"]
+
+
+@pytest.mark.asyncio
+async def test_submitted_task_keeps_polling_through_repeated_http_errors(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.ts"
+    source.write_bytes(b"source")
+    configured = make_settings(tmp_path)
+    database = Database(configured.database_path)
+    await database.initialize()
+    await create_job(database, source, duration=3600)
+    islice = RecoveringPollISlice(failures=5)
+    orchestrator = Orchestrator(configured, database, FakeMedia(), islice)
+    orchestrator.RETRY_DELAYS = (0.001,)
+
+    await orchestrator._process_job("abc123")
+
+    job = await database.get_job("abc123")
+    window = (await database.get_windows("abc123"))[0]
+    attempt = (await database.get_attempts(window["id"]))[0]
+    assert job["status"] == "completed"
+    assert window["status"] == "completed"
+    assert attempt["status"] == "completed"
+    assert attempt["error_message"] == ""
+    assert islice.calls == 6
 
 
 @pytest.mark.asyncio

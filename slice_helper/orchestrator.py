@@ -1089,8 +1089,20 @@ class Orchestrator:
                     )
                 if not drain:
                     await self._raise_if_control_requested(job_id)
-                existing = await islice_client.ensure_task(attempt["task_id"], request)
-                service_status, service_progress = self._task_progress(existing)
+                # A persisted submitted attempt must never go through ensure_task
+                # again.  Besides avoiding an accidental re-create, this sends all
+                # GetTaskInfo failures through _poll's durable retry loop instead of
+                # treating a temporary iSlice outage as a terminal submission error.
+                existing = (
+                    None
+                    if already_submitted
+                    else await islice_client.ensure_task(attempt["task_id"], request)
+                )
+                if already_submitted:
+                    service_status = str(attempt.get("service_status") or "")
+                    service_progress = float(attempt.get("progress") or 0)
+                else:
+                    service_status, service_progress = self._task_progress(existing)
                 attempt_fields: dict[str, Any] = {
                     "status": "polling",
                     "service_status": service_status,
@@ -1278,12 +1290,22 @@ class Orchestrator:
                 if payload is None:
                     raise ISliceError("Task disappeared from iSlice")
                 consecutive_errors = 0
-            except ISliceError:
+            except ISliceError as exc:
                 consecutive_errors += 1
-                if consecutive_errors >= 3:
-                    raise
+                message = (
+                    f"GetTaskInfo temporarily unavailable; retrying "
+                    f"(consecutive failures: {consecutive_errors}): {exc}"
+                )
+                await self.database.update_attempt(
+                    attempt_id,
+                    status="polling",
+                    error_message=message,
+                )
+                if consecutive_errors == 1 or consecutive_errors % 10 == 0:
+                    logger.warning("Task %s polling failed; will retry: %s", task_id, exc)
+                retry_index = min(consecutive_errors - 1, len(self.RETRY_DELAYS) - 1)
                 await self._sleep_with_stop(
-                    job_id, self.RETRY_DELAYS[consecutive_errors - 1]
+                    job_id, self.RETRY_DELAYS[retry_index]
                 )
                 continue
             service_status, service_progress = self._task_progress(payload)
@@ -1291,6 +1313,7 @@ class Orchestrator:
                 attempt_id,
                 service_status=service_status,
                 progress=service_progress,
+                error_message="",
             )
             if self._pipeline_ready(service_status, service_progress):
                 await self._release_submission_turn(gate_url, gate_ticket)
