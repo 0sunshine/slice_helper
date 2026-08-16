@@ -21,6 +21,10 @@ class MediaError(RuntimeError):
     pass
 
 
+class FastSeekError(MediaError):
+    """The input-side seek produced an empty or wrongly sized chunk."""
+
+
 class MediaService:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -95,7 +99,10 @@ class MediaService:
         partial.unlink(missing_ok=True)
 
         async def render(
-            *, repair_audio: bool = False, validate_aac_bitstream: bool = True
+            *,
+            repair_audio: bool = False,
+            validate_aac_bitstream: bool = True,
+            accurate_seek: bool = False,
         ) -> MediaProbe:
             partial.unlink(missing_ok=True)
             command = [
@@ -108,17 +115,26 @@ class MediaService:
                 "+discardcorrupt",
                 "-err_detect",
                 "ignore_err",
-                "-ss",
-                f"{start:.3f}",
-                "-i",
-                str(source),
-                "-t",
-                f"{duration:.3f}",
-                "-map",
-                "0:v:0",
-                "-map",
-                "0:a:0?",
             ]
+            if not accurate_seek:
+                command.extend(["-ss", f"{start:.3f}"])
+            command.extend(["-i", str(source)])
+            if accurate_seek:
+                # MPEG-TS PTS wraps roughly every 26.5 hours. Input-side
+                # seeking can return an empty chunk when a long recording
+                # crosses that boundary. Output-side seeking scans the
+                # timeline in order and remains correct across the wrap.
+                command.extend(["-ss", f"{start:.3f}"])
+            command.extend(
+                [
+                    "-t",
+                    f"{duration:.3f}",
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "0:a:0?",
+                ]
+            )
             if str(mode) == CutMode.TRANSCODE.value:
                 command.extend(
                     [
@@ -150,19 +166,37 @@ class MediaService:
             command.extend(["-f", "mpegts", str(partial)])
 
             await self._run(*command, timeout=self.settings.ffmpeg_timeout_seconds)
-            result = await self.probe(partial)
+            try:
+                result = await self.probe(partial)
+            except MediaError as exc:
+                if not accurate_seek:
+                    raise FastSeekError(str(exc)) from exc
+                raise
             if abs(result.duration - duration) > 60.0:
-                raise MediaError(
-                    f"Cut duration differs by more than 60s: expected {duration:.2f}, got {result.duration:.2f}"
+                error = (
+                    "Cut duration differs by more than 60s: "
+                    f"expected {duration:.2f}, got {result.duration:.2f}"
                 )
+                if not accurate_seek:
+                    raise FastSeekError(error)
+                raise MediaError(error)
             await self.validate_for_islice(
                 partial, result, check_aac_bitstream=validate_aac_bitstream
             )
             return result
 
         try:
+            accurate_seek = False
             try:
-                result = await render()
+                try:
+                    result = await render()
+                except FastSeekError as fast_seek_error:
+                    accurate_seek = True
+                    logger.warning(
+                        "Fast chunk seek failed; retrying with sequential accurate seek: %s",
+                        fast_seek_error,
+                    )
+                    result = await render(accurate_seek=True)
             except MediaError as initial_error:
                 if str(mode) != CutMode.COPY.value:
                     raise
@@ -177,7 +211,9 @@ class MediaService:
                     # aac_adtstoasc probe to it; that filter can reject valid
                     # repaired TS packets with "Invalid argument".
                     result = await render(
-                        repair_audio=True, validate_aac_bitstream=False
+                        repair_audio=True,
+                        validate_aac_bitstream=False,
+                        accurate_seek=accurate_seek,
                     )
                 except MediaError as repair_error:
                     raise MediaError(

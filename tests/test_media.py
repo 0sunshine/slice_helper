@@ -128,6 +128,45 @@ async def test_copy_cut_repairs_only_audio_after_validation_failure(
 
 
 @pytest.mark.asyncio
+async def test_copy_cut_retries_with_accurate_seek_after_empty_fast_cut(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    media = MediaService(_test_settings(tmp_path))
+    commands: list[tuple[str, ...]] = []
+    probe_calls = 0
+
+    async def fake_run(*args: str, timeout: float) -> tuple[str, str]:
+        commands.append(args)
+        if args[-1] != "-":
+            Path(args[-1]).write_bytes(b"media")
+        return "", ""
+
+    async def fake_probe(_path: Path) -> MediaProbe:
+        nonlocal probe_calls
+        probe_calls += 1
+        return MediaProbe(
+            duration=0.04 if probe_calls == 1 else 4_042.9,
+            format_name="mpegts",
+            video_codec="h264",
+            audio_codec="aac",
+        )
+
+    monkeypatch.setattr(media, "_run", fake_run)
+    monkeypatch.setattr(media, "probe", fake_probe)
+
+    target = tmp_path / "window.ts"
+    await media.cut(tmp_path / "source.ts", target, 53_557.1, 57_600.0, "copy")
+
+    cut_commands = [command for command in commands if command[-1] != "-"]
+    assert len(cut_commands) == 2
+    assert cut_commands[0].index("-ss") < cut_commands[0].index("-i")
+    assert cut_commands[1].index("-ss") > cut_commands[1].index("-i")
+    assert ("-c", "copy") in list(zip(cut_commands[1], cut_commands[1][1:]))
+    assert "libx264" not in cut_commands[1]
+    assert target.is_file()
+
+
+@pytest.mark.asyncio
 async def test_copy_cut_fails_after_repaired_audio_is_still_invalid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
