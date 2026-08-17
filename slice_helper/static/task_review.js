@@ -112,6 +112,7 @@ async function loadTasks() {
   if ($("taskISliceFilter").value) params.set("isliceBaseUrl", $("taskISliceFilter").value);
   if ($("taskDateFilter").value) params.set("broadcastDate", $("taskDateFilter").value);
   if ($("taskReviewStatusFilter").value) params.set("reviewStatus", $("taskReviewStatusFilter").value);
+  if ($("taskContentTypeFilter").value) params.set("contentType", $("taskContentTypeFilter").value);
   if ($("taskReviewQuery").value.trim()) params.set("query", $("taskReviewQuery").value.trim());
   const result = await api(`/api/task-reviews?${params}`);
   state.tasks = result.items;
@@ -202,6 +203,7 @@ function segmentStatus(segment) {
 }
 
 function renderSegments() {
+  $("taskReviewSegmentCount").textContent = `共 ${state.segments.length} 条`;
   $("taskReviewSegmentsBody").innerHTML = state.segments.map((segment, index) => {
     const start = segment.absolute_start || formatSeconds(segment.global_start);
     const end = segment.absolute_end || formatSeconds(segment.global_end);
@@ -212,6 +214,7 @@ function renderSegments() {
       <td>${segmentStatus(segment)}</td>
     </tr>`;
   }).join("") || '<tr><td class="empty-table-row" colspan="5">该任务没有可显示的片段</td></tr>';
+  document.querySelector(".task-review-segments-scroll").scrollTop = 0;
 }
 
 function previewSegment(index) {
@@ -295,7 +298,7 @@ async function resplitTask(attemptId) {
 }
 
 $("refreshTaskReviews").addEventListener("click", () => loadTasks().catch((error) => showToast(error.message, true)));
-[$("taskChannelFilter"), $("taskISliceFilter"), $("taskDateFilter"), $("taskReviewStatusFilter")].forEach((control) => control.addEventListener("change", () => {
+[$("taskChannelFilter"), $("taskISliceFilter"), $("taskDateFilter"), $("taskReviewStatusFilter"), $("taskContentTypeFilter")].forEach((control) => control.addEventListener("change", () => {
   state.page = 1; loadTasks().catch((error) => showToast(error.message, true));
 }));
 $("taskReviewQuery").addEventListener("input", () => {

@@ -1809,6 +1809,7 @@ class Database:
         broadcast_date: str | None = None,
         islice_base_url: str | None = None,
         review_status: str | None = None,
+        content_type: str | None = None,
         query: str | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         where = [
@@ -1829,6 +1830,12 @@ class Database:
         if review_status:
             where.append("a.review_status=?")
             params.append(review_status)
+        if content_type:
+            where.append(
+                "EXISTS (SELECT 1 FROM segments sf "
+                "WHERE sf.attempt_id=a.id AND sf.content_type=?)"
+            )
+            params.append(content_type)
         if query:
             where.append(
                 "(a.task_id LIKE ? OR j.id LIKE ? OR COALESCE(c.name,j.channel_name,'') LIKE ? "

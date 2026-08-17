@@ -301,7 +301,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return templates.TemplateResponse(
             request=request,
             name="task_review.html",
-            context={"version": application.version},
+            context={"version": application.version, "content_types": CONTENT_TYPES},
         )
 
     @application.get("/api/islice-instances")
@@ -1077,6 +1077,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         broadcast_date: str | None = Query(default=None, alias="broadcastDate"),
         islice_base_url: str | None = Query(default=None, alias="isliceBaseUrl"),
         review_status: str | None = Query(default=None, alias="reviewStatus"),
+        content_type: str | None = Query(default=None, alias="contentType"),
         query: str | None = Query(default=None, max_length=200),
         page: int = Query(default=1, ge=1),
         page_size: int = Query(default=20, alias="pageSize", ge=1, le=100),
@@ -1085,6 +1086,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "unreviewed", "hold", "approved", "rejected"
         }:
             raise HTTPException(status_code=400, detail="Unknown task review status")
+        if content_type and content_type not in CONTENT_TYPES:
+            raise HTTPException(status_code=400, detail="Unknown content type")
         if broadcast_date:
             try:
                 date.fromisoformat(broadcast_date)
@@ -1099,6 +1102,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             broadcast_date=broadcast_date,
             islice_base_url=(islice_base_url.rstrip("/") if islice_base_url else None),
             review_status=review_status,
+            content_type=content_type,
             query=query,
         )
         total_pages = max(1, (total + page_size - 1) // page_size)
@@ -1111,6 +1115,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 broadcast_date=broadcast_date,
                 islice_base_url=(islice_base_url.rstrip("/") if islice_base_url else None),
                 review_status=review_status,
+                content_type=content_type,
                 query=query,
             )
         return {

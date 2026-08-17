@@ -149,8 +149,8 @@ def test_job_api_control_and_database_backed_chunk_route(
         ):
             assert f'<option value="{content_type}">{content_type}</option>' in home.text
         assert 'id="summaryISlice"' in home.text
-        assert "/static/styles.css?v=0.18.5" in home.text
-        assert "/static/app.js?v=0.18.5" in home.text
+        assert "/static/styles.css?v=0.18.6" in home.text
+        assert "/static/app.js?v=0.18.6" in home.text
         assert 'id="tailRebuildDialog"' in home.text
         assert 'id="timeRefreshDialog"' in home.text
         assert 'id="timeRefreshForm"' in home.text
@@ -1211,8 +1211,17 @@ def test_completed_task_review_page_and_api(tmp_path: Path, monkeypatch) -> None
         assert "iSlice 任务审核" in page.text
         assert all(label in page.text for label in ("未审核", "暂保留", "通过", "不通过"))
         assert "AI 审核评分" in page.text
-        assert "/static/task_review.js?v=0.18.5" in page.text
+        assert 'id="taskContentTypeFilter"' in page.text
+        assert all(
+            content_type in page.text
+            for content_type in (
+                "新闻", "电视剧", "电影", "综艺", "少儿", "体育", "纪录片",
+                "科教", "文艺", "生活服务", "商业广告", "公益广告", "电视购物", "其他",
+            )
+        )
+        assert "/static/task_review.js?v=0.18.6" in page.text
         assert 'id="taskReviewSeek"' in page.text
+        assert 'id="taskReviewSegmentCount"' in page.text
         assert client.get("/static/task_review.js").status_code == 200
         assert 'href="/task-review"' in client.get("/").text
 
@@ -1252,7 +1261,8 @@ def test_completed_task_review_page_and_api(tmp_path: Path, monkeypatch) -> None
                         "global_start": index * 3600, "global_end": index * 3600 + 60,
                         "absolute_start": f"2026-08-14T0{8 + index}:00:00+08:00",
                         "absolute_end": f"2026-08-14T0{8 + index}:01:00+08:00",
-                        "title": f"审核片段 {index}", "content_type": "新闻",
+                        "title": f"审核片段 {index}",
+                        "content_type": "新闻" if index == 0 else "电视剧",
                         "news_event_type": "时政", "topic": "", "keywords_json": "[]",
                         "summary": "", "segment_url": f"http://media.test/{index}.mp4",
                         "cover_img_url": "", "raw_json": "{}",
@@ -1282,6 +1292,14 @@ def test_completed_task_review_page_and_api(tmp_path: Path, monkeypatch) -> None
 
         filtered = client.get("/api/task-reviews", params={"reviewStatus": "hold"}).json()
         assert [item["id"] for item in filtered["items"]] == [newer_id]
+        filtered_by_type = client.get(
+            "/api/task-reviews", params={"contentType": "电视剧"}
+        ).json()
+        assert filtered_by_type["total"] == 1
+        assert [item["id"] for item in filtered_by_type["items"]] == [newer_id]
+        assert client.get(
+            "/api/task-reviews", params={"contentType": "未知类型"}
+        ).status_code == 400
         detail = client.get(f"/api/task-reviews/{newer_id}/segments")
         assert detail.status_code == 200
         assert [item["title"] for item in detail.json()["segments"]] == ["审核片段 1"]
