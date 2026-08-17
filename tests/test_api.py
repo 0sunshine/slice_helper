@@ -149,8 +149,8 @@ def test_job_api_control_and_database_backed_chunk_route(
         ):
             assert f'<option value="{content_type}">{content_type}</option>' in home.text
         assert 'id="summaryISlice"' in home.text
-        assert "/static/styles.css?v=0.18.6" in home.text
-        assert "/static/app.js?v=0.18.6" in home.text
+        assert "/static/styles.css?v=0.18.7" in home.text
+        assert "/static/app.js?v=0.18.7" in home.text
         assert 'id="tailRebuildDialog"' in home.text
         assert 'id="timeRefreshDialog"' in home.text
         assert 'id="timeRefreshForm"' in home.text
@@ -1219,9 +1219,12 @@ def test_completed_task_review_page_and_api(tmp_path: Path, monkeypatch) -> None
                 "科教", "文艺", "生活服务", "商业广告", "公益广告", "电视购物", "其他",
             )
         )
-        assert "/static/task_review.js?v=0.18.6" in page.text
+        assert "/static/task_review.js?v=0.18.7" in page.text
         assert 'id="taskReviewSeek"' in page.text
         assert 'id="taskReviewSegmentCount"' in page.text
+        assert 'id="taskSegmentEditDialog"' in page.text
+        assert 'id="taskSegmentEditForm"' in page.text
+        assert 'id="restoreTaskSegmentEdit"' in page.text
         assert client.get("/static/task_review.js").status_code == 200
         assert 'href="/task-review"' in client.get("/").text
 
@@ -1303,6 +1306,42 @@ def test_completed_task_review_page_and_api(tmp_path: Path, monkeypatch) -> None
         detail = client.get(f"/api/task-reviews/{newer_id}/segments")
         assert detail.status_code == 200
         assert [item["title"] for item in detail.json()["segments"]] == ["审核片段 1"]
+        detail_by_type = client.get(
+            f"/api/task-reviews/{newer_id}/segments",
+            params={"contentType": "电视剧"},
+        )
+        assert [item["title"] for item in detail_by_type.json()["segments"]] == [
+            "审核片段 1"
+        ]
+        assert client.get(
+            f"/api/task-reviews/{newer_id}/segments",
+            params={"contentType": "新闻"},
+        ).json()["segments"] == []
+        assert client.get(
+            f"/api/task-reviews/{newer_id}/segments",
+            params={"contentType": "未知类型"},
+        ).status_code == 400
+
+        segment_id = detail_by_type.json()["segments"][0]["id"]
+        edited = client.patch(
+            f"/api/jobs/task-review-job/segments/{segment_id}",
+            json={"title": "审核页修改", "contentType": "电影", "ignored": True},
+        )
+        assert edited.status_code == 200
+        assert edited.json()["title"] == "审核页修改"
+        assert edited.json()["content_type"] == "电影"
+        assert edited.json()["ignored"] is True
+        assert client.get(
+            f"/api/task-reviews/{newer_id}/segments",
+            params={"contentType": "电视剧"},
+        ).json()["segments"] == []
+        edited_detail = client.get(
+            f"/api/task-reviews/{newer_id}/segments",
+            params={"contentType": "电影"},
+        ).json()["segments"]
+        assert [(item["title"], item["ignored"]) for item in edited_detail] == [
+            ("审核页修改", True)
+        ]
 
         cleared = client.patch(
             f"/api/task-reviews/{newer_id}",

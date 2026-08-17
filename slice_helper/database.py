@@ -1937,19 +1937,26 @@ class Database:
             await db.commit()
         return self._row(row)
 
-    async def get_segments_for_attempt(self, attempt_id: int) -> list[dict[str, Any]]:
+    async def get_segments_for_attempt(
+        self, attempt_id: int, *, content_type: str | None = None
+    ) -> list[dict[str, Any]]:
+        where = "s.attempt_id=?"
+        params: list[Any] = [attempt_id]
+        if content_type:
+            where += " AND s.content_type=?"
+            params.append(content_type)
         async with self.connect() as db:
             rows = await (
                 await db.execute(
-                    """
+                    f"""
                     SELECT s.*,w.window_index,j.islice_base_url
                     FROM segments s
                     JOIN windows w ON w.id=s.window_id
                     JOIN jobs j ON j.id=s.job_id
-                    WHERE s.attempt_id=?
+                    WHERE {where}
                     ORDER BY s.global_start,s.source_index,s.id
                     """,
-                    (attempt_id,),
+                    params,
                 )
             ).fetchall()
         return [dict(row) for row in rows]

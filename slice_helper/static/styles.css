@@ -327,16 +327,18 @@ dialog::backdrop { background: #1c252180; }
 .task-review-segments-scroll::-webkit-scrollbar { width: 13px; height: 13px; }
 .task-review-segments-scroll::-webkit-scrollbar-thumb { border: 3px solid #f4f6f4; border-radius: 10px; background: #87928b; }
 .task-review-segments-scroll::-webkit-scrollbar-track { background: #f4f6f4; }
-.task-review-segments-table { min-width: 680px; table-layout: fixed; }
+.task-review-segments-table { min-width: 760px; table-layout: fixed; }
 .task-review-segments-table th:nth-child(1) { width: 42px; }
 .task-review-segments-table th:nth-child(2) { width: 260px; }
 .task-review-segments-table th:nth-child(3) { width: 84px; }
 .task-review-segments-table th:nth-child(4) { width: 224px; }
 .task-review-segments-table th:nth-child(5) { width: 70px; }
+.task-review-segments-table th:nth-child(6) { width: 72px; }
 .task-review-segments-table td:nth-child(2) { overflow-wrap: anywhere; }
 .task-review-segments-table thead th { position: sticky; top: 0; z-index: 1; }
 .task-review-segment-row.is-previewable { cursor: pointer; }
 .task-review-segment-row.is-active { background: #e3f4ec; box-shadow: inset 3px 0 #23836d; }
+.task-review-segment-edit { padding-right: 7px !important; padding-left: 7px !important; }
 .task-ai-review-form { padding: 12px 20px; display: grid; grid-template-columns: 190px minmax(320px, 1fr) auto; align-items: end; gap: 12px; border-top: 1px solid #dfe3df; background: #fafbf9; }
 .task-ai-review-form label { min-width: 0; display: flex; flex-direction: column; gap: 5px; color: #4f5751; font-size: 12px; }
 .task-ai-review-form input { min-height: 34px; }

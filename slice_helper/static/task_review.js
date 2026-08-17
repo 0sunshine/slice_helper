@@ -1,6 +1,7 @@
 const state = {
   tasks: [], channels: [], instances: [], page: 1, pageSize: 20,
   total: 0, totalPages: 1, selectedTask: null, segments: [], queryTimer: null,
+  segmentContentType: "", segmentEditTarget: null,
   isSeeking: false, pendingSeek: null
 };
 
@@ -11,6 +12,10 @@ const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (character
 const reviewLabels = {
   unreviewed: "未审核", hold: "暂保留", approved: "通过", rejected: "不通过"
 };
+const CONTENT_TYPES = [
+  "新闻", "电视剧", "电影", "综艺", "少儿", "体育", "纪录片", "科教",
+  "文艺", "生活服务", "商业广告", "公益广告", "电视购物", "其他"
+];
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -177,7 +182,12 @@ async function saveReviewStatus(select) {
 }
 
 async function openTaskReview(attemptId) {
-  const payload = await api(`/api/task-reviews/${attemptId}/segments`);
+  state.segmentContentType = $("taskContentTypeFilter").value;
+  const params = new URLSearchParams();
+  if (state.segmentContentType) params.set("contentType", state.segmentContentType);
+  const query = params.toString();
+  const suffix = query ? `?${query}` : "";
+  const payload = await api(`/api/task-reviews/${attemptId}/segments${suffix}`);
   state.selectedTask = { ...state.tasks.find((item) => item.id === attemptId), ...payload.task };
   state.segments = payload.segments;
   const task = state.selectedTask;
@@ -203,18 +213,128 @@ function segmentStatus(segment) {
 }
 
 function renderSegments() {
-  $("taskReviewSegmentCount").textContent = `共 ${state.segments.length} 条`;
-  $("taskReviewSegmentsBody").innerHTML = state.segments.map((segment, index) => {
+  const visibleSegments = state.segments
+    .map((segment, index) => ({ segment, index }))
+    .filter(({ segment }) => !state.segmentContentType || segment.content_type === state.segmentContentType);
+  $("taskReviewSegmentCount").textContent = state.segmentContentType
+    ? `共 ${visibleSegments.length} 条（仅显示${state.segmentContentType}）`
+    : `共 ${visibleSegments.length} 条`;
+  $("taskReviewSegmentsBody").innerHTML = visibleSegments.map(({ segment, index }, displayIndex) => {
     const start = segment.absolute_start || formatSeconds(segment.global_start);
     const end = segment.absolute_end || formatSeconds(segment.global_end);
     return `<tr class="task-review-segment-row ${segment.segment_url ? "is-previewable" : ""}" data-segment-index="${index}" tabindex="${segment.segment_url ? "0" : "-1"}">
-      <td>${index + 1}</td><td><strong>${escapeHtml(segment.title || `片段 ${index + 1}`)}</strong></td>
+      <td>${displayIndex + 1}</td><td><strong>${escapeHtml(segment.title || `片段 ${displayIndex + 1}`)}</strong></td>
       <td>${escapeHtml(segment.content_type || "-")}</td>
       <td class="mono"><span>${escapeHtml(start)}</span><small class="table-subtext">${escapeHtml(end)}</small></td>
       <td>${segmentStatus(segment)}</td>
+      <td><button class="button secondary small task-review-segment-edit" data-segment-index="${index}" type="button">编辑</button></td>
     </tr>`;
-  }).join("") || '<tr><td class="empty-table-row" colspan="5">该任务没有可显示的片段</td></tr>';
+  }).join("") || `<tr><td class="empty-table-row" colspan="6">${state.segmentContentType ? `该任务没有${escapeHtml(state.segmentContentType)}类型的片段` : "该任务没有可显示的片段"}</td></tr>`;
   document.querySelector(".task-review-segments-scroll").scrollTop = 0;
+}
+
+function openTaskSegmentEdit(index) {
+  const segment = state.segments[index];
+  if (!segment || !state.selectedTask) return;
+  state.segmentEditTarget = { index, id: segment.id, restoredFromTask: false };
+  $("taskSegmentEditTitle").value = segment.title || "";
+  const currentType = segment.content_type || "";
+  const currentOption = $("taskSegmentEditContentTypeCurrent");
+  currentOption.value = "";
+  if (CONTENT_TYPES.includes(currentType)) {
+    currentOption.textContent = "保持当前值";
+    $("taskSegmentEditContentType").value = currentType;
+  } else {
+    currentOption.textContent = `保持当前（${currentType || "未填写"}）`;
+    $("taskSegmentEditContentType").value = "";
+  }
+  $("taskSegmentEditIgnored").checked = Boolean(segment.ignored);
+  $("taskSegmentEditRestoreHint").hidden = true;
+  $("taskSegmentEditError").hidden = true;
+  $("taskSegmentEditDialog").showModal();
+}
+
+async function restoreTaskSegmentEdit() {
+  const target = state.segmentEditTarget;
+  const jobId = state.selectedTask?.job_id;
+  if (!target || !jobId) return;
+  const button = $("restoreTaskSegmentEdit");
+  button.disabled = true;
+  button.textContent = "读取中";
+  $("taskSegmentEditError").hidden = true;
+  try {
+    const taskValues = await api(`/api/jobs/${jobId}/segments/${target.id}/task-values`);
+    $("taskSegmentEditTitle").value = taskValues.title || "";
+    const taskType = taskValues.contentType || "";
+    const currentOption = $("taskSegmentEditContentTypeCurrent");
+    if (CONTENT_TYPES.includes(taskType)) {
+      currentOption.value = "";
+      currentOption.textContent = "保持当前值";
+      $("taskSegmentEditContentType").value = taskType;
+    } else {
+      currentOption.value = taskType;
+      currentOption.textContent = `任务原值（${taskType || "未填写"}）`;
+      $("taskSegmentEditContentType").value = taskType;
+    }
+    target.restoredFromTask = true;
+    $("taskSegmentEditRestoreHint").textContent = "已从任务信息填入原始标题和节目类型，点击保存后生效。";
+    $("taskSegmentEditRestoreHint").hidden = false;
+  } catch (error) {
+    $("taskSegmentEditError").textContent = error.message;
+    $("taskSegmentEditError").hidden = false;
+  } finally {
+    button.disabled = false;
+    button.textContent = "还原";
+  }
+}
+
+async function submitTaskSegmentEdit(event) {
+  event.preventDefault();
+  const target = state.segmentEditTarget;
+  const jobId = state.selectedTask?.job_id;
+  if (!target || !jobId) return;
+  const submit = $("submitTaskSegmentEdit");
+  submit.disabled = true;
+  submit.textContent = "保存中";
+  $("taskSegmentEditError").hidden = true;
+  try {
+    const payload = {
+      title: $("taskSegmentEditTitle").value,
+      ignored: $("taskSegmentEditIgnored").checked
+    };
+    if (target.restoredFromTask) payload.restoredFromTask = true;
+    if ($("taskSegmentEditContentType").value || target.restoredFromTask) {
+      payload.contentType = $("taskSegmentEditContentType").value;
+    }
+    const updated = await api(`/api/jobs/${jobId}/segments/${target.id}`, {
+      method: "PATCH", body: JSON.stringify(payload)
+    });
+    const current = state.segments[target.index];
+    if (current) {
+      const resolvedMedia = {
+        segment_url: current.segment_url,
+        cover_img_url: current.cover_img_url,
+        archive_status: current.archive_status,
+        archive_error: current.archive_error
+      };
+      state.segments[target.index] = { ...current, ...updated, ...resolvedMedia };
+    }
+    if ($("taskReviewSegmentTitle").dataset.segmentId === String(target.id)) {
+      $("taskReviewSegmentTitle").textContent = updated.title || `片段 ${target.index + 1}`;
+    }
+    $("taskSegmentEditDialog").close();
+    state.segmentEditTarget = null;
+    renderSegments();
+    const filteredOut = state.segmentContentType && updated.content_type !== state.segmentContentType;
+    showToast(filteredOut ? "结果已保存；该片段不再符合当前节目类型筛选" : (updated.ignored ? "结果已标记为忽略" : "结果已保存"));
+    loadTasks().catch((error) => showToast(`结果已保存，但任务列表刷新失败：${error.message}`, true));
+  } catch (error) {
+    $("taskSegmentEditError").textContent = error.message;
+    $("taskSegmentEditError").hidden = false;
+  } finally {
+    submit.disabled = false;
+    submit.textContent = "保存";
+  }
 }
 
 function previewSegment(index) {
@@ -229,6 +349,7 @@ function previewSegment(index) {
   video.load();
   video.play().catch(() => {});
   $("taskReviewSegmentTitle").textContent = segment.title || `片段 ${index + 1}`;
+  $("taskReviewSegmentTitle").dataset.segmentId = String(segment.id);
   $("taskReviewSegmentTime").textContent = `${segment.absolute_start || formatSeconds(segment.global_start)} - ${segment.absolute_end || formatSeconds(segment.global_end)}`;
   $("taskReviewVideoStatus").textContent = segment.archive_status === "ready" ? "正在读取归档视频" : "正在加载";
   $("openTaskSegmentVideo").href = segment.segment_url;
@@ -246,6 +367,7 @@ function resetVideo() {
   state.pendingSeek = null;
   configureSeek(0);
   $("taskReviewSegmentTitle").textContent = "请选择片段";
+  delete $("taskReviewSegmentTitle").dataset.segmentId;
   $("taskReviewSegmentTime").textContent = "";
   $("taskReviewVideoStatus").textContent = "";
   $("openTaskSegmentVideo").hidden = true;
@@ -331,10 +453,13 @@ $("taskReviewBody").addEventListener("click", (event) => {
   if (trigger) openTaskReview(Number(trigger.dataset.attemptId)).catch((error) => showToast(error.message, true));
 });
 $("taskReviewSegmentsBody").addEventListener("click", (event) => {
+  const edit = event.target.closest(".task-review-segment-edit");
+  if (edit) { openTaskSegmentEdit(Number(edit.dataset.segmentIndex)); return; }
   const row = event.target.closest(".task-review-segment-row.is-previewable");
   if (row) previewSegment(Number(row.dataset.segmentIndex));
 });
 $("taskReviewSegmentsBody").addEventListener("keydown", (event) => {
+  if (event.target.closest("button")) return;
   const row = event.target.closest(".task-review-segment-row.is-previewable");
   if (row && ["Enter", " "].includes(event.key)) { event.preventDefault(); previewSegment(Number(row.dataset.segmentIndex)); }
 });
@@ -383,6 +508,10 @@ $("taskReviewVideo").addEventListener("error", () => {
   $("taskReviewVideoStatus").textContent = "视频加载失败";
 });
 $("taskAIReviewForm").addEventListener("submit", saveAIReview);
+$("taskSegmentEditForm").addEventListener("submit", submitTaskSegmentEdit);
+$("restoreTaskSegmentEdit").addEventListener("click", restoreTaskSegmentEdit);
+[$("closeTaskSegmentEdit"), $("cancelTaskSegmentEdit")].forEach((button) => button.addEventListener("click", () => $("taskSegmentEditDialog").close()));
+$("taskSegmentEditDialog").addEventListener("close", () => { state.segmentEditTarget = null; });
 $("resplitReviewedTask").addEventListener("click", () => state.selectedTask && resplitTask(state.selectedTask.id));
 [$("closeTaskReviewDialog"), $("doneTaskReviewDialog")].forEach((button) => button.addEventListener("click", () => $("taskReviewDialog").close()));
 $("taskReviewDialog").addEventListener("close", resetVideo);

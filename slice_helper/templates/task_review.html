@@ -91,7 +91,7 @@
         </div>
         <div class="table-scroll task-review-segments-scroll">
           <table class="data-table compact task-review-segments-table">
-            <thead><tr><th>#</th><th>标题</th><th>节目类型</th><th>起止时间</th><th>状态</th></tr></thead>
+            <thead><tr><th>#</th><th>标题</th><th>节目类型</th><th>起止时间</th><th>状态</th><th>操作</th></tr></thead>
             <tbody id="taskReviewSegmentsBody"></tbody>
           </table>
         </div>
@@ -108,6 +108,32 @@
       <button id="resplitReviewedTask" class="button danger" type="button">重新拆分</button>
       <button id="doneTaskReviewDialog" class="button primary" type="button">关闭</button>
     </div>
+  </dialog>
+
+  <dialog id="taskSegmentEditDialog" class="segment-edit-dialog">
+    <form id="taskSegmentEditForm" method="dialog">
+      <div class="dialog-header">
+        <h2>编辑拆条结果</h2>
+        <button id="closeTaskSegmentEdit" class="icon-button" type="button" aria-label="关闭编辑">×</button>
+      </div>
+      <div class="form-grid segment-edit-grid">
+        <label class="full">标题<input id="taskSegmentEditTitle" maxlength="500"></label>
+        <label class="full">节目类型
+          <select id="taskSegmentEditContentType">
+            <option id="taskSegmentEditContentTypeCurrent" value="">保持当前值</option>
+            {% for content_type in content_types %}<option value="{{ content_type }}">{{ content_type }}</option>{% endfor %}
+          </select>
+        </label>
+        <label class="full checkbox-field"><input id="taskSegmentEditIgnored" type="checkbox"> 忽略</label>
+      </div>
+      <p id="taskSegmentEditRestoreHint" class="muted segment-restore-hint" hidden></p>
+      <p id="taskSegmentEditError" class="form-error" hidden></p>
+      <div class="dialog-actions">
+        <button id="restoreTaskSegmentEdit" class="button secondary restore-action" type="button">还原</button>
+        <button id="cancelTaskSegmentEdit" class="button secondary" type="button">取消</button>
+        <button id="submitTaskSegmentEdit" class="button primary" type="submit">保存</button>
+      </div>
+    </form>
   </dialog>
 
   <div id="toast" class="toast" hidden></div>

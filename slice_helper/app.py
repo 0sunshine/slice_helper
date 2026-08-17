@@ -1127,11 +1127,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @application.get("/api/task-reviews/{attempt_id}/segments")
-    async def get_task_review_segments(request: Request, attempt_id: int):
+    async def get_task_review_segments(
+        request: Request,
+        attempt_id: int,
+        content_type: str | None = Query(default=None, alias="contentType"),
+    ):
+        if content_type and content_type not in CONTENT_TYPES:
+            raise HTTPException(status_code=400, detail="Unknown content type")
         task = await request.app.state.database.get_completed_task(attempt_id)
         if task is None:
             raise HTTPException(status_code=404, detail="Completed task not found")
-        rows = await request.app.state.database.get_segments_for_attempt(attempt_id)
+        rows = await request.app.state.database.get_segments_for_attempt(
+            attempt_id, content_type=content_type
+        )
         rows = await _resolve_archive_media(
             request.app.state.database, request.app.state.archive_catalog, rows
         )
