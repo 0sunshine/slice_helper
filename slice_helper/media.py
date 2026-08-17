@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
 from .config import Settings
@@ -17,6 +18,10 @@ from .time_ocr import TimeOcrError, TimeReference, recognize_time_reference
 logger = logging.getLogger(__name__)
 
 
+FFMPEG_DEFAULT_DTS_DELTA_THRESHOLD_SECONDS = 10.0
+TIMELINE_THRESHOLD_MARGIN_SECONDS = 1.0
+
+
 class MediaError(RuntimeError):
     pass
 
@@ -25,9 +30,148 @@ class FastSeekError(MediaError):
     """The input-side seek produced an empty or wrongly sized chunk."""
 
 
+@dataclass(frozen=True, slots=True)
+class TimelineDiscontinuities:
+    max_forward_gap: float = 0.0
+    min_backward_jump: float | None = None
+
+
+def _select_dts_delta_threshold(discontinuities: TimelineDiscontinuities) -> float | None:
+    """Keep real forward gaps while still allowing FFmpeg to repair backward jumps."""
+    forward_gap = discontinuities.max_forward_gap
+    if forward_gap <= FFMPEG_DEFAULT_DTS_DELTA_THRESHOLD_SECONDS:
+        return None
+    threshold = forward_gap + max(
+        TIMELINE_THRESHOLD_MARGIN_SECONDS,
+        forward_gap * 0.05,
+    )
+    backward_jump = discontinuities.min_backward_jump
+    if backward_jump is not None and threshold >= backward_jump:
+        raise MediaError(
+            "Source timeline cannot be repaired safely: the largest forward gap "
+            f"is {forward_gap:.2f}s and the smallest backward jump is "
+            f"{backward_jump:.2f}s"
+        )
+    return threshold
+
+
 class MediaService:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self._timeline_threshold_cache: dict[tuple[str, int, int], float | None] = {}
+        self._timeline_threshold_locks: dict[tuple[str, int, int], asyncio.Lock] = {}
+
+    async def _scan_timeline_discontinuities(
+        self, source: Path
+    ) -> TimelineDiscontinuities:
+        command = [
+            self.settings.ffprobe_path,
+            "-v",
+            "error",
+            "-show_entries",
+            "packet=stream_index,pts_time,dts_time",
+            "-of",
+            "compact=p=0:nk=0",
+            str(source),
+        ]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise MediaError(f"Executable not found: {command[0]}") from exc
+        assert process.stdout is not None
+        assert process.stderr is not None
+
+        async def scan_stdout() -> TimelineDiscontinuities:
+            previous_by_stream: dict[str, float] = {}
+            max_forward_gap = 0.0
+            min_backward_jump: float | None = None
+            async for raw_line in process.stdout:
+                fields: dict[str, str] = {}
+                for item in raw_line.decode("utf-8", errors="replace").strip().split("|"):
+                    key, separator, value = item.partition("=")
+                    if separator:
+                        fields[key] = value
+                stream_index = fields.get("stream_index")
+                raw_timestamp = fields.get("dts_time")
+                if not raw_timestamp or raw_timestamp == "N/A":
+                    raw_timestamp = fields.get("pts_time")
+                if not stream_index or not raw_timestamp or raw_timestamp == "N/A":
+                    continue
+                try:
+                    timestamp = float(raw_timestamp)
+                except ValueError:
+                    continue
+                previous = previous_by_stream.get(stream_index)
+                previous_by_stream[stream_index] = timestamp
+                if previous is None:
+                    continue
+                delta = timestamp - previous
+                if delta > FFMPEG_DEFAULT_DTS_DELTA_THRESHOLD_SECONDS:
+                    max_forward_gap = max(max_forward_gap, delta)
+                elif delta < -FFMPEG_DEFAULT_DTS_DELTA_THRESHOLD_SECONDS:
+                    jump = abs(delta)
+                    min_backward_jump = (
+                        jump
+                        if min_backward_jump is None
+                        else min(min_backward_jump, jump)
+                    )
+            return TimelineDiscontinuities(max_forward_gap, min_backward_jump)
+
+        stderr_task = asyncio.create_task(process.stderr.read())
+        try:
+            discontinuities = await asyncio.wait_for(
+                scan_stdout(), timeout=self.settings.ffmpeg_timeout_seconds
+            )
+            return_code = await process.wait()
+            stderr = (await stderr_task).decode("utf-8", errors="replace")
+        except TimeoutError as exc:
+            process.kill()
+            await process.wait()
+            await stderr_task
+            raise MediaError(
+                "Source timeline analysis timed out after "
+                f"{self.settings.ffmpeg_timeout_seconds:.0f}s"
+            ) from exc
+        if return_code != 0:
+            message = stderr.strip().splitlines()[-1] if stderr.strip() else "unknown error"
+            raise MediaError(f"ffprobe timeline analysis failed: {message}")
+        return discontinuities
+
+    async def _get_accurate_seek_dts_delta_threshold(
+        self, source: Path
+    ) -> float | None:
+        try:
+            stat = source.stat()
+        except OSError as exc:
+            logger.warning("Could not inspect source timeline metadata: %s", exc)
+            return None
+        cache_key = (str(source.resolve()), stat.st_size, stat.st_mtime_ns)
+        if cache_key in self._timeline_threshold_cache:
+            return self._timeline_threshold_cache[cache_key]
+        lock = self._timeline_threshold_locks.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            if cache_key in self._timeline_threshold_cache:
+                return self._timeline_threshold_cache[cache_key]
+            discontinuities = await self._scan_timeline_discontinuities(source)
+            threshold = _select_dts_delta_threshold(discontinuities)
+            self._timeline_threshold_cache[cache_key] = threshold
+            logger.info(
+                "Source timeline analysis completed for %s: max forward gap %.2fs, "
+                "minimum backward jump %s, accurate-seek DTS threshold %s",
+                source,
+                discontinuities.max_forward_gap,
+                (
+                    f"{discontinuities.min_backward_jump:.2f}s"
+                    if discontinuities.min_backward_jump is not None
+                    else "none"
+                ),
+                f"{threshold:.2f}s" if threshold is not None else "default",
+            )
+            return threshold
 
     async def _run(self, *args: str, timeout: float) -> tuple[str, str]:
         try:
@@ -103,6 +247,7 @@ class MediaService:
             repair_audio: bool = False,
             validate_aac_bitstream: bool = True,
             accurate_seek: bool = False,
+            dts_delta_threshold: float | None = None,
         ) -> MediaProbe:
             partial.unlink(missing_ok=True)
             command = [
@@ -116,6 +261,10 @@ class MediaService:
                 "-err_detect",
                 "ignore_err",
             ]
+            if accurate_seek and dts_delta_threshold is not None:
+                command.extend(
+                    ["-dts_delta_threshold", f"{dts_delta_threshold:.3f}"]
+                )
             if not accurate_seek:
                 command.extend(["-ss", f"{start:.3f}"])
             command.extend(["-i", str(source)])
@@ -187,16 +336,23 @@ class MediaService:
 
         try:
             accurate_seek = False
+            dts_delta_threshold: float | None = None
             try:
                 try:
                     result = await render()
                 except FastSeekError as fast_seek_error:
                     accurate_seek = True
+                    dts_delta_threshold = (
+                        await self._get_accurate_seek_dts_delta_threshold(source)
+                    )
                     logger.warning(
                         "Fast chunk seek failed; retrying with sequential accurate seek: %s",
                         fast_seek_error,
                     )
-                    result = await render(accurate_seek=True)
+                    result = await render(
+                        accurate_seek=True,
+                        dts_delta_threshold=dts_delta_threshold,
+                    )
             except MediaError as initial_error:
                 if str(mode) != CutMode.COPY.value:
                     raise
@@ -214,6 +370,7 @@ class MediaService:
                         repair_audio=True,
                         validate_aac_bitstream=False,
                         accurate_seek=accurate_seek,
+                        dts_delta_threshold=dts_delta_threshold,
                     )
                 except MediaError as repair_error:
                     raise MediaError(

@@ -40,6 +40,7 @@ cp .env.example .env
 - `DATA_DIR`：SQLite、原始响应和结果 JSON，默认 `./data`
 - `TEMP_DIR`：临时小时 TS，默认 `./temp`
 - `FFMPEG_PATH`、`FFPROBE_PATH`：可执行文件名或绝对路径
+- MPEG-TS 快速定位失败时，helper 会按源文件签名缓存一次时间戳分析，动态保留向前的媒体时间空洞并修正明显回跳；无法安全区分两者时停止处理，不会按错误时间轴下发 iSlice。
 - `MAX_ACTIVE_JOBS_PER_ISLICE`：每个 iSlice 实例的活动作业上限，默认 `10`
 - `POLL_INTERVAL_SECONDS`：iSlice 轮询间隔，默认 `15`
 - `PIPELINE_PROGRESS_THRESHOLD`：同一 iSlice 的当前子任务达到该进度后，把下一次子任务提交机会交给等待队列中的另一个长文件作业，默认 `71`。单个作业内部始终严格串行，必须等当前窗口拆条完成并确定交接点后，才能排队提交下一窗口。

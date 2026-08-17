@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 from slice_helper.config import Settings
-from slice_helper.media import MediaError, MediaService
+from slice_helper.media import (
+    MediaError,
+    MediaService,
+    TimelineDiscontinuities,
+    _select_dts_delta_threshold,
+)
 from slice_helper.models import MediaProbe
 
 
@@ -154,6 +159,13 @@ async def test_copy_cut_retries_with_accurate_seek_after_empty_fast_cut(
     monkeypatch.setattr(media, "_run", fake_run)
     monkeypatch.setattr(media, "probe", fake_probe)
 
+    async def fake_threshold(_source: Path) -> float:
+        return 18.72
+
+    monkeypatch.setattr(
+        media, "_get_accurate_seek_dts_delta_threshold", fake_threshold
+    )
+
     target = tmp_path / "window.ts"
     await media.cut(tmp_path / "source.ts", target, 53_557.1, 57_600.0, "copy")
 
@@ -161,6 +173,9 @@ async def test_copy_cut_retries_with_accurate_seek_after_empty_fast_cut(
     assert len(cut_commands) == 2
     assert cut_commands[0].index("-ss") < cut_commands[0].index("-i")
     assert cut_commands[1].index("-ss") > cut_commands[1].index("-i")
+    threshold_index = cut_commands[1].index("-dts_delta_threshold")
+    assert cut_commands[1][threshold_index + 1] == "18.720"
+    assert threshold_index < cut_commands[1].index("-i")
     assert ("-c", "copy") in list(zip(cut_commands[1], cut_commands[1][1:]))
     assert "libx264" not in cut_commands[1]
     assert target.is_file()
@@ -200,3 +215,36 @@ async def test_copy_cut_fails_after_repaired_audio_is_still_invalid(
     assert "libx264" not in cut_commands[1]
     assert not target.exists()
     assert not (tmp_path / "window.partial.ts").exists()
+
+
+def test_dynamic_dts_threshold_preserves_forward_gaps_and_repairs_backtracks() -> None:
+    threshold = _select_dts_delta_threshold(
+        TimelineDiscontinuities(
+            max_forward_gap=17.72,
+            min_backward_jump=29_580.85,
+        )
+    )
+
+    assert threshold == pytest.approx(18.72)
+
+
+def test_dynamic_dts_threshold_keeps_ffmpeg_default_without_large_forward_gap() -> None:
+    assert (
+        _select_dts_delta_threshold(
+            TimelineDiscontinuities(
+                max_forward_gap=9.9,
+                min_backward_jump=29_580.85,
+            )
+        )
+        is None
+    )
+
+
+def test_dynamic_dts_threshold_rejects_ambiguous_timeline() -> None:
+    with pytest.raises(MediaError, match="cannot be repaired safely"):
+        _select_dts_delta_threshold(
+            TimelineDiscontinuities(
+                max_forward_gap=20.0,
+                min_backward_jump=20.5,
+            )
+        )
