@@ -322,6 +322,7 @@ dialog::backdrop { background: #1c252180; }
 .task-review-player-info .mono, .task-review-player-info .muted { color: #aeb7b1; font-size: 12px; }
 .task-review-segments-panel { min-width: 0; min-height: 0; padding: 12px; overflow: hidden; display: flex; flex-direction: column; background: #fff; }
 .task-review-segments-toolbar { flex: 0 0 auto; min-height: 34px; display: flex; align-items: baseline; gap: 10px; }
+.task-review-segments-toolbar .task-review-job-reviewed { display: inline-flex; align-items: center; gap: 6px; color: #4f5751; font-size: 12px; }
 .task-review-segments-toolbar small { margin-left: auto; }
 .task-review-segments-scroll { min-height: 0; flex: 1; overflow: scroll; scrollbar-gutter: stable both-edges; border: 1px solid #dfe3df; }
 .task-review-segments-scroll::-webkit-scrollbar { width: 13px; height: 13px; }

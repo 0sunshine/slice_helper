@@ -197,6 +197,8 @@ async function openTaskReview(attemptId) {
   $("taskDialogDate").textContent = task.broadcast_date || "-";
   $("taskDialogWindow").textContent = `第 ${Number(task.window_index) + 1} 个`;
   $("taskDialogSubmitted").textContent = formatDate(task.submitted_at);
+  $("taskJobReviewed").checked = Boolean(task.job_reviewed);
+  $("taskJobReviewed").setAttribute("aria-label", `${task.job_reviewed ? "取消" : "标记"}${task.channel_name || task.task_id}作业已审核`);
   $("taskAIReviewScore").value = task.ai_review_score === null || task.ai_review_score === undefined ? "" : task.ai_review_score;
   $("taskAIReviewComment").value = task.ai_review_comment || "";
   $("openTaskJob").href = `/?jobId=${encodeURIComponent(task.job_id)}`;
@@ -204,6 +206,31 @@ async function openTaskReview(attemptId) {
   resetVideo();
   renderSegments();
   $("taskReviewDialog").showModal();
+}
+
+async function saveTaskJobReviewed() {
+  const task = state.selectedTask;
+  const checkbox = $("taskJobReviewed");
+  if (!task?.job_id) return;
+  const reviewed = checkbox.checked;
+  checkbox.disabled = true;
+  try {
+    const updated = await api(`/api/jobs/${task.job_id}/review`, {
+      method: "PATCH", body: JSON.stringify({ reviewed })
+    });
+    task.job_reviewed = updated.reviewed;
+    state.tasks.forEach((item) => {
+      if (item.job_id === task.job_id) item.job_reviewed = updated.reviewed;
+    });
+    checkbox.checked = updated.reviewed;
+    checkbox.setAttribute("aria-label", `${updated.reviewed ? "取消" : "标记"}${updated.channel_name || task.task_id}作业已审核`);
+    showToast(updated.reviewed ? "作业已标记为审核完成" : "已取消作业审核标记");
+  } catch (error) {
+    checkbox.checked = !reviewed;
+    showToast(error.message, true);
+  } finally {
+    checkbox.disabled = false;
+  }
 }
 
 function segmentStatus(segment) {
@@ -508,6 +535,7 @@ $("taskReviewVideo").addEventListener("error", () => {
   $("taskReviewVideoStatus").textContent = "视频加载失败";
 });
 $("taskAIReviewForm").addEventListener("submit", saveAIReview);
+$("taskJobReviewed").addEventListener("change", saveTaskJobReviewed);
 $("taskSegmentEditForm").addEventListener("submit", submitTaskSegmentEdit);
 $("restoreTaskSegmentEdit").addEventListener("click", restoreTaskSegmentEdit);
 [$("closeTaskSegmentEdit"), $("cancelTaskSegmentEdit")].forEach((button) => button.addEventListener("click", () => $("taskSegmentEditDialog").close()));

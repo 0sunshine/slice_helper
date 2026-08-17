@@ -222,7 +222,11 @@ async function updateJobReview(checkbox) {
     const job = state.jobs.find((item) => item.id === jobId);
     if (job) job.reviewed = updated.reviewed;
     if (state.detail?.job?.id === jobId) state.detail.job.reviewed = updated.reviewed;
-    checkbox.setAttribute("aria-label", `${updated.reviewed ? "取消" : "标记"}${updated.channel_name || sourceName(updated)}已审核`);
+    document.querySelectorAll(".review-checkbox").forEach((item) => {
+      if (item.dataset.jobId !== jobId) return;
+      item.checked = updated.reviewed;
+      item.setAttribute("aria-label", `${updated.reviewed ? "取消" : "标记"}${updated.channel_name || sourceName(updated)}已审核`);
+    });
     showToast(updated.reviewed ? "作业已标记为审核完成" : "已取消作业审核标记");
   } catch (error) {
     checkbox.checked = !reviewed;
@@ -346,6 +350,9 @@ function renderDetail() {
   $("detailId").textContent = job.id;
   $("detailTitle").textContent = sourceName(job);
   $("detailPath").textContent = sourceDisplay(job);
+  $("detailReviewed").dataset.jobId = job.id;
+  $("detailReviewed").checked = Boolean(job.reviewed);
+  $("detailReviewed").setAttribute("aria-label", `${job.reviewed ? "取消" : "标记"}${job.channel_name || sourceName(job)}已审核`);
   $("summaryChannel").textContent = job.channel_name || "-";
   $("summaryBroadcastDate").textContent = job.broadcast_date || "-";
   $("summaryISlice").textContent = job.islice_base_url || "-";
@@ -1276,6 +1283,7 @@ $("acceptedOnly").addEventListener("change", () => {
   state.segmentPage = 1;
   if (state.selectedJobId) loadDetail(state.selectedJobId, false);
 });
+$("detailReviewed").addEventListener("change", () => updateJobReview($("detailReviewed")));
 $("previousSegmentPage").addEventListener("click", () => {
   state.segmentPage -= 1;
   renderSegments();

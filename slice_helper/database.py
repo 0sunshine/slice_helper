@@ -1868,6 +1868,7 @@ class Database:
                            j.channel_id,COALESCE(c.name,j.channel_name) AS channel_name,
                            j.broadcast_date,j.source_path,j.source_url,
                            j.islice_base_url,j.status AS job_status,
+                           j.reviewed AS job_reviewed,
                            j.program_start_time AS job_program_start_time,
                            (SELECT COUNT(*) FROM segments s WHERE s.attempt_id=a.id)
                              AS segment_count,
@@ -1888,6 +1889,7 @@ class Database:
         result: list[dict[str, Any]] = []
         for stored in rows:
             row = dict(stored)
+            row["job_reviewed"] = bool(row.get("job_reviewed"))
             row["program_start_time"] = absolute_time(
                 row.pop("job_program_start_time"), float(row["requested_start"])
             )
@@ -1901,7 +1903,8 @@ class Database:
                     """
                     SELECT a.*,w.job_id,w.window_index,w.requested_start,w.nominal_end,
                            j.channel_id,j.channel_name,j.broadcast_date,j.source_path,
-                           j.source_url,j.islice_base_url,j.status AS job_status
+                           j.source_url,j.islice_base_url,j.status AS job_status,
+                           j.reviewed AS job_reviewed
                     FROM attempts a
                     JOIN windows w ON w.id=a.window_id
                     JOIN jobs j ON j.id=w.job_id
@@ -1910,7 +1913,10 @@ class Database:
                     (attempt_id,),
                 )
             ).fetchone()
-        return self._row(row)
+        result = self._row(row)
+        if result is not None:
+            result["job_reviewed"] = bool(result.get("job_reviewed"))
+        return result
 
     async def update_task_review(
         self, attempt_id: int, **fields: Any

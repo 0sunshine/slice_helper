@@ -149,8 +149,9 @@ def test_job_api_control_and_database_backed_chunk_route(
         ):
             assert f'<option value="{content_type}">{content_type}</option>' in home.text
         assert 'id="summaryISlice"' in home.text
-        assert "/static/styles.css?v=0.18.7" in home.text
-        assert "/static/app.js?v=0.18.7" in home.text
+        assert 'id="detailReviewed"' in home.text
+        assert "/static/styles.css?v=0.18.8" in home.text
+        assert "/static/app.js?v=0.18.8" in home.text
         assert 'id="tailRebuildDialog"' in home.text
         assert 'id="timeRefreshDialog"' in home.text
         assert 'id="timeRefreshForm"' in home.text
@@ -1219,9 +1220,10 @@ def test_completed_task_review_page_and_api(tmp_path: Path, monkeypatch) -> None
                 "科教", "文艺", "生活服务", "商业广告", "公益广告", "电视购物", "其他",
             )
         )
-        assert "/static/task_review.js?v=0.18.7" in page.text
+        assert "/static/task_review.js?v=0.18.8" in page.text
         assert 'id="taskReviewSeek"' in page.text
         assert 'id="taskReviewSegmentCount"' in page.text
+        assert 'id="taskJobReviewed"' in page.text
         assert 'id="taskSegmentEditDialog"' in page.text
         assert 'id="taskSegmentEditForm"' in page.text
         assert 'id="restoreTaskSegmentEdit"' in page.text
@@ -1279,6 +1281,7 @@ def test_completed_task_review_page_and_api(tmp_path: Path, monkeypatch) -> None
         assert listed["total"] == 2
         assert [item["id"] for item in listed["items"]] == [newer_id, older_id]
         assert listed["items"][0]["review_status"] == "unreviewed"
+        assert listed["items"][0]["job_reviewed"] is False
         assert listed["items"][0]["ai_review_score"] is None
         assert listed["items"][0]["ai_review_comment"] == ""
 
@@ -1305,7 +1308,16 @@ def test_completed_task_review_page_and_api(tmp_path: Path, monkeypatch) -> None
         ).status_code == 400
         detail = client.get(f"/api/task-reviews/{newer_id}/segments")
         assert detail.status_code == 200
+        assert detail.json()["task"]["job_reviewed"] is False
         assert [item["title"] for item in detail.json()["segments"]] == ["审核片段 1"]
+        job_reviewed = client.patch(
+            "/api/jobs/task-review-job/review", json={"reviewed": True}
+        )
+        assert job_reviewed.status_code == 200
+        assert job_reviewed.json()["reviewed"] is True
+        assert client.get(
+            f"/api/task-reviews/{newer_id}/segments"
+        ).json()["task"]["job_reviewed"] is True
         detail_by_type = client.get(
             f"/api/task-reviews/{newer_id}/segments",
             params={"contentType": "电视剧"},
