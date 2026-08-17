@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
 import re
+import time
 from typing import Any
 from urllib.parse import quote, unquote, urljoin, urlsplit
 
@@ -11,6 +14,11 @@ import httpx
 TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 MAX_SEGMENTS_JSON_BYTES = 10 * 1024 * 1024
+CATALOG_CACHE_SECONDS = 15.0
+TASK_PREVIEW_CACHE_SECONDS = 1800.0
+TASK_PREVIEW_ERROR_CACHE_SECONDS = 30.0
+MAX_ARCHIVE_REQUESTS = 6
+MAX_TASK_PREVIEW_CACHE_ENTRIES = 512
 
 
 class ArchivePreviewError(RuntimeError):
@@ -24,9 +32,56 @@ class ArchiveCatalogReader:
             follow_redirects=True,
             trust_env=False,
         )
+        self._request_semaphore = asyncio.Semaphore(MAX_ARCHIVE_REQUESTS)
+        self._catalog_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._catalog_inflight: dict[str, asyncio.Task[dict[str, Any]]] = {}
+        self._preview_cache: dict[
+            tuple[str, str, str, str], tuple[float, dict[str, Any]]
+        ] = {}
+        self._preview_error_cache: dict[
+            tuple[str, str, str, str], tuple[float, str]
+        ] = {}
+        self._preview_inflight: dict[
+            tuple[str, str, str, str], asyncio.Task[dict[str, Any]]
+        ] = {}
 
     async def close(self) -> None:
+        tasks = [*self._catalog_inflight.values(), *self._preview_inflight.values()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await self.client.aclose()
+
+    async def _read_catalog(self, catalog_url: str) -> dict[str, Any]:
+        now = time.monotonic()
+        cached = self._catalog_cache.get(catalog_url)
+        if cached and cached[0] > now:
+            return cached[1]
+        inflight = self._catalog_inflight.get(catalog_url)
+        if inflight is None:
+            async def load() -> dict[str, Any]:
+                async with self._request_semaphore:
+                    response = await self.client.get(catalog_url)
+                if response.status_code == 404:
+                    raise ValueError("归档代理尚未发布 catalog，请先部署/拉起代理")
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict) or not isinstance(payload.get("tasks"), list):
+                    raise ValueError("catalog 格式无效")
+                self._catalog_cache[catalog_url] = (
+                    time.monotonic() + CATALOG_CACHE_SECONDS,
+                    payload,
+                )
+                return payload
+
+            inflight = asyncio.create_task(load())
+            self._catalog_inflight[catalog_url] = inflight
+        try:
+            return await asyncio.shield(inflight)
+        finally:
+            if self._catalog_inflight.get(catalog_url) is inflight and inflight.done():
+                self._catalog_inflight.pop(catalog_url, None)
 
     async def read(
         self,
@@ -54,13 +109,7 @@ class ArchiveCatalogReader:
                 sources.append(source)
                 continue
             try:
-                response = await self.client.get(catalog_url)
-                if response.status_code == 404:
-                    raise ValueError("归档代理尚未发布 catalog，请先部署/拉起代理")
-                response.raise_for_status()
-                payload = response.json()
-                if not isinstance(payload, dict) or not isinstance(payload.get("tasks"), list):
-                    raise ValueError("catalog 格式无效")
+                payload = await self._read_catalog(catalog_url)
                 payload_source = payload.get("source")
                 catalog_source_id = (
                     str(payload_source.get("id") or "")
@@ -135,6 +184,50 @@ class ArchiveCatalogReader:
         task_id: str,
         revision_digest: str | None = None,
     ) -> dict[str, Any]:
+        catalog_url = str(instance.get("archive_catalog_url") or "")
+        source_id = str(instance.get("source_id") or "")
+        cache_key = (catalog_url, source_id, task_id, revision_digest or "")
+        now = time.monotonic()
+        cached = self._preview_cache.get(cache_key)
+        if cached and cached[0] > now:
+            return copy.deepcopy(cached[1])
+        cached_error = self._preview_error_cache.get(cache_key)
+        if cached_error and cached_error[0] > now:
+            raise ArchivePreviewError(cached_error[1])
+        inflight = self._preview_inflight.get(cache_key)
+        if inflight is None:
+            inflight = asyncio.create_task(
+                self._read_task_preview_uncached(instance, task_id, revision_digest)
+            )
+            self._preview_inflight[cache_key] = inflight
+        try:
+            preview = await asyncio.shield(inflight)
+            if len(self._preview_cache) >= MAX_TASK_PREVIEW_CACHE_ENTRIES:
+                self._preview_cache.pop(next(iter(self._preview_cache)), None)
+            self._preview_cache[cache_key] = (
+                time.monotonic() + TASK_PREVIEW_CACHE_SECONDS,
+                preview,
+            )
+            self._preview_error_cache.pop(cache_key, None)
+            return copy.deepcopy(preview)
+        except ArchivePreviewError as exc:
+            if len(self._preview_error_cache) >= MAX_TASK_PREVIEW_CACHE_ENTRIES:
+                self._preview_error_cache.pop(next(iter(self._preview_error_cache)), None)
+            self._preview_error_cache[cache_key] = (
+                time.monotonic() + TASK_PREVIEW_ERROR_CACHE_SECONDS,
+                str(exc),
+            )
+            raise
+        finally:
+            if self._preview_inflight.get(cache_key) is inflight and inflight.done():
+                self._preview_inflight.pop(cache_key, None)
+
+    async def _read_task_preview_uncached(
+        self,
+        instance: dict[str, Any],
+        task_id: str,
+        revision_digest: str | None = None,
+    ) -> dict[str, Any]:
         if not TASK_ID_PATTERN.fullmatch(task_id):
             raise ArchivePreviewError("task ID 格式无效")
         if revision_digest and not DIGEST_PATTERN.fullmatch(revision_digest):
@@ -143,9 +236,7 @@ class ArchiveCatalogReader:
         if not catalog_url:
             raise ArchivePreviewError("该 iSlice 实例未配置归档 catalog 地址")
         try:
-            response = await self.client.get(catalog_url)
-            response.raise_for_status()
-            catalog = response.json()
+            catalog = await self._read_catalog(catalog_url)
         except (httpx.HTTPError, ValueError) as exc:
             raise ArchivePreviewError(f"无法读取归档 catalog：{exc}") from exc
         if not isinstance(catalog, dict) or not isinstance(catalog.get("tasks"), list):
@@ -205,20 +296,21 @@ class ArchiveCatalogReader:
         archive_url = self._validate_archive_url(archive_url, catalog_root)
         segments_json_url = f"{archive_url}/segments.json"
         try:
-            async with self.client.stream("GET", segments_json_url) as segments_response:
-                segments_response.raise_for_status()
-                final_url = str(segments_response.url)
-                self._validate_archive_url(final_url, catalog_root)
-                declared_size = int(
-                    segments_response.headers.get("Content-Length", "0") or 0
-                )
-                if declared_size > MAX_SEGMENTS_JSON_BYTES:
-                    raise ArchivePreviewError("归档 segments.json 超过 10 MB 限制")
-                content = bytearray()
-                async for chunk in segments_response.aiter_bytes():
-                    content.extend(chunk)
-                    if len(content) > MAX_SEGMENTS_JSON_BYTES:
+            async with self._request_semaphore:
+                async with self.client.stream("GET", segments_json_url) as segments_response:
+                    segments_response.raise_for_status()
+                    final_url = str(segments_response.url)
+                    self._validate_archive_url(final_url, catalog_root)
+                    declared_size = int(
+                        segments_response.headers.get("Content-Length", "0") or 0
+                    )
+                    if declared_size > MAX_SEGMENTS_JSON_BYTES:
                         raise ArchivePreviewError("归档 segments.json 超过 10 MB 限制")
+                    content = bytearray()
+                    async for chunk in segments_response.aiter_bytes():
+                        content.extend(chunk)
+                        if len(content) > MAX_SEGMENTS_JSON_BYTES:
+                            raise ArchivePreviewError("归档 segments.json 超过 10 MB 限制")
             payload = json.loads(content)
         except ArchivePreviewError:
             raise

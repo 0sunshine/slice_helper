@@ -150,8 +150,8 @@ def test_job_api_control_and_database_backed_chunk_route(
             assert f'<option value="{content_type}">{content_type}</option>' in home.text
         assert 'id="summaryISlice"' in home.text
         assert 'id="detailReviewed"' in home.text
-        assert "/static/styles.css?v=0.18.9" in home.text
-        assert "/static/app.js?v=0.18.9" in home.text
+        assert "/static/styles.css?v=0.19.0" in home.text
+        assert "/static/app.js?v=0.19.0" in home.text
         assert 'id="tailRebuildDialog"' in home.text
         assert 'id="timeRefreshDialog"' in home.text
         assert 'id="timeRefreshForm"' in home.text
@@ -1129,7 +1129,18 @@ def test_manual_segment_merge_api_manifest_and_excel(tmp_path: Path, monkeypatch
             return job_id, str(channel["id"])
 
         job_id, channel_id = asyncio.run(add_results())
-        segments = client.get(f"/api/jobs/{job_id}/segments").json()
+        first_page = client.get(
+            f"/api/jobs/{job_id}/segments", params={"page": 1, "pageSize": 2}
+        ).json()
+        assert first_page["total"] == 3
+        assert first_page["totalPages"] == 2
+        assert len(first_page["items"]) == 2
+        assert "raw" not in first_page["items"][0]
+        second_page = client.get(
+            f"/api/jobs/{job_id}/segments", params={"page": 2, "pageSize": 2}
+        ).json()
+        assert len(second_page["items"]) == 1
+        segments = first_page["items"] + second_page["items"]
         first, primary = segments[:2]
         preview_response = client.post(
             f"/api/jobs/{job_id}/segment-merges/preview",
@@ -1220,7 +1231,7 @@ def test_completed_task_review_page_and_api(tmp_path: Path, monkeypatch) -> None
                 "科教", "文艺", "生活服务", "商业广告", "公益广告", "电视购物", "其他",
             )
         )
-        assert "/static/task_review.js?v=0.18.9" in page.text
+        assert "/static/task_review.js?v=0.19.0" in page.text
         assert 'id="taskReviewSeek"' in page.text
         assert 'id="taskReviewSegmentCount"' in page.text
         assert 'id="taskJobReviewed"' in page.text

@@ -1,11 +1,20 @@
 const state = {
   jobs: [], channels: [], isliceInstances: [], selectedJobId: null, detail: null, segments: [],
   jobPage: 1, jobPageSize: 20, jobTotal: 0, jobTotalPages: 1,
-  segmentPage: 1, previewUrl: null, resplitTarget: null, tailRebuildTarget: null,
-  segmentEditTarget: null, selectedSegmentIds: new Set(), mergePreview: null,
+  segmentPage: 1, segmentTotal: 0, segmentTotalPages: 1,
+  previewUrl: null, resplitTarget: null, tailRebuildTarget: null,
+  segmentEditTarget: null, selectedSegmentIds: new Set(), selectedSegments: new Map(), mergePreview: null,
   timeRefreshTarget: null
 };
 const SEGMENTS_PER_PAGE = 10;
+let jobsLoadPromise = null;
+let jobsLoadKey = "";
+let jobsLoadSequence = 0;
+let detailLoadSequence = 0;
+let segmentLoadSequence = 0;
+let selectedDetailRefreshPromise = null;
+let archiveStatusTimer = null;
+let archiveStatusSequence = 0;
 const CONTENT_TYPES = [
   "新闻", "电视剧", "电影", "综艺", "少儿", "体育", "纪录片", "科教",
   "文艺", "生活服务", "商业广告", "公益广告", "电视购物", "其他"
@@ -130,7 +139,7 @@ async function loadHealth() {
   }
 }
 
-async function loadJobs() {
+function loadJobs() {
   const query = new URLSearchParams({
     page: String(state.jobPage),
     pageSize: String(state.jobPageSize)
@@ -139,13 +148,28 @@ async function loadJobs() {
   if ($("channelFilter").value) query.set("channelId", $("channelFilter").value);
   if ($("isliceFilter").value) query.set("isliceBaseUrl", $("isliceFilter").value);
   if ($("dateFilter").value) query.set("broadcastDate", $("dateFilter").value);
+  const requestKey = query.toString();
+  if (jobsLoadPromise && jobsLoadKey === requestKey) return jobsLoadPromise;
+  const loadSequence = ++jobsLoadSequence;
+  jobsLoadKey = requestKey;
+  const request = loadJobsOnce(query, loadSequence).finally(() => {
+    if (jobsLoadPromise === request) {
+      jobsLoadPromise = null;
+      jobsLoadKey = "";
+    }
+  });
+  jobsLoadPromise = request;
+  return request;
+}
+
+async function loadJobsOnce(query, loadSequence) {
   const result = await api(`/api/jobs?${query}`);
+  if (loadSequence !== jobsLoadSequence) return;
   state.jobs = result.items;
   state.jobPage = result.page;
   state.jobTotal = result.total;
   state.jobTotalPages = result.totalPages;
   renderJobs();
-  if (state.selectedJobId) await loadDetail(state.selectedJobId, false);
 }
 
 function renderJobs() {
@@ -270,6 +294,7 @@ async function submitTimeRefresh(event) {
     closeTimeRefresh();
     showToast(result.manual ? `手动时间已保存，同步 ${result.updatedSegmentCount} 个片段` : `首帧时间已更新，尝试 ${result.attemptCount} 次，同步 ${result.updatedSegmentCount} 个片段`);
     await loadJobs();
+    if (state.selectedJobId === job.id) await loadDetail(job.id, false);
   } catch (error) {
     $("timeRefreshError").textContent = error.message;
     $("timeRefreshError").hidden = false;
@@ -323,25 +348,124 @@ function renderChannels() {
 }
 
 async function loadDetail(jobId, scroll) {
+  const loadSequence = ++detailLoadSequence;
+  const pageLoadSequence = ++segmentLoadSequence;
   if (state.selectedJobId && state.selectedJobId !== jobId) {
     resetPreview();
     state.segmentPage = 1;
     state.selectedSegmentIds.clear();
+    state.selectedSegments.clear();
+    if (archiveStatusTimer) window.clearTimeout(archiveStatusTimer);
+    archiveStatusTimer = null;
   }
   state.selectedJobId = jobId;
-  const [detail, segments, archiveStatus] = await Promise.all([
+  state.archiveStatus = { status: "checking" };
+  const segmentQuery = new URLSearchParams({
+    acceptedOnly: String($("acceptedOnly").checked),
+    page: String(state.segmentPage),
+    pageSize: String(SEGMENTS_PER_PAGE)
+  });
+  const [detail, segmentResult] = await Promise.all([
     api(`/api/jobs/${jobId}`),
-    api(`/api/jobs/${jobId}/segments?acceptedOnly=${$("acceptedOnly").checked}`),
-    api(`/api/jobs/${jobId}/archive-status`).catch(() => ({ status: "unavailable" }))
+    api(`/api/jobs/${jobId}/segments?${segmentQuery}`)
   ]);
+  if (loadSequence !== detailLoadSequence || state.selectedJobId !== jobId) return;
   state.detail = detail;
-  state.segments = segments;
-  state.archiveStatus = archiveStatus;
-  if (state.previewUrl && !segments.some((segment) => segment.segment_url === state.previewUrl)) {
+  if (pageLoadSequence === segmentLoadSequence) applySegmentPage(segmentResult);
+  if (state.previewUrl && !state.segments.some((segment) => segment.segment_url === state.previewUrl)) {
     resetPreview();
   }
   renderDetail();
   if (scroll) $("detailBand").scrollIntoView({ behavior: "smooth", block: "start" });
+  loadArchiveStatus(jobId).catch(() => {});
+}
+
+function applySegmentPage(result) {
+  state.segments = result.items || [];
+  state.segmentPage = Number(result.page || 1);
+  state.segmentTotal = Number(result.total || 0);
+  state.segmentTotalPages = Number(result.totalPages || 1);
+  state.segments.forEach((segment) => {
+    const id = Number(segment.id);
+    if (state.selectedSegmentIds.has(id)) state.selectedSegments.set(id, segment);
+  });
+}
+
+async function loadSegmentPage() {
+  const loadSequence = ++segmentLoadSequence;
+  const jobId = state.selectedJobId;
+  if (!jobId) return;
+  const query = new URLSearchParams({
+    acceptedOnly: String($("acceptedOnly").checked),
+    page: String(state.segmentPage),
+    pageSize: String(SEGMENTS_PER_PAGE)
+  });
+  const result = await api(`/api/jobs/${jobId}/segments?${query}`);
+  if (loadSequence !== segmentLoadSequence || state.selectedJobId !== jobId) return;
+  applySegmentPage(result);
+  if (state.previewUrl && !state.segments.some((segment) => segment.segment_url === state.previewUrl)) {
+    resetPreview();
+  }
+  renderSegments();
+}
+
+function renderArchiveStatus() {
+  const archiveStatus = state.archiveStatus || {};
+  const archiveLabel = {
+    checking: "后台检查中，不影响拆条结果浏览",
+    ready: "已归档，可在 iSlice 清理后继续预览",
+    pending: "归档处理中，暂不建议清理 iSlice",
+    error: "归档存在异常，请先处理",
+    unavailable: "归档状态暂不可用",
+    not_applicable: "暂无可归档任务"
+  }[archiveStatus.status] || "归档状态未知";
+  $("archiveStatus").textContent = `归档状态：${archiveLabel}`;
+}
+
+async function loadArchiveStatus(jobId) {
+  const loadSequence = ++archiveStatusSequence;
+  const archiveStatus = await api(`/api/jobs/${jobId}/archive-status`)
+    .catch(() => ({ status: "unavailable" }));
+  if (loadSequence !== archiveStatusSequence || state.selectedJobId !== jobId) return;
+  state.archiveStatus = archiveStatus;
+  renderArchiveStatus();
+  if (archiveStatusTimer) window.clearTimeout(archiveStatusTimer);
+  archiveStatusTimer = null;
+  if (archiveStatus.status === "pending") {
+    archiveStatusTimer = window.setTimeout(() => {
+      if (!document.hidden && state.selectedJobId === jobId) {
+        loadArchiveStatus(jobId).catch(() => {});
+      }
+    }, 30000);
+  }
+}
+
+async function refreshSelectedJobState() {
+  const jobId = state.selectedJobId;
+  const status = state.detail?.job?.status;
+  if (!jobId || !["pending_schedule", "queued", "probing", "running", "pause_requested", "paused", "stop_requested"].includes(status)) return;
+  if (selectedDetailRefreshPromise) return selectedDetailRefreshPromise;
+  selectedDetailRefreshPromise = api(`/api/jobs/${jobId}`)
+    .then((detail) => {
+      if (state.selectedJobId !== jobId) return;
+      const previousSegmentState = segmentRefreshSignature(state.detail);
+      state.detail = detail;
+      renderDetail();
+      if (segmentRefreshSignature(detail) !== previousSegmentState) {
+        return loadSegmentPage();
+      }
+      return null;
+    })
+    .finally(() => { selectedDetailRefreshPromise = null; });
+  return selectedDetailRefreshPromise;
+}
+
+function segmentRefreshSignature(detail) {
+  if (!detail) return "";
+  const windows = (detail.windows || [])
+    .map((item) => `${item.window_index}:${item.status}`)
+    .join("|");
+  return `${detail.job?.current_window || 0}|${detail.job?.status || ""}|${windows}`;
 }
 
 function renderDetail() {
@@ -379,9 +503,7 @@ function renderDetail() {
   $("detailError").hidden = !job.error_message;
   $("detailError").textContent = job.error_message || "";
   $("detailWarnings").innerHTML = (job.warnings || []).map((warning) => `<p>${escapeHtml(warning)}</p>`).join("");
-  const archiveStatus = state.archiveStatus || {};
-  const archiveLabel = {ready: "已归档，可在 iSlice 清理后继续预览", pending: "归档处理中，暂不建议清理 iSlice", error: "归档存在异常，请先处理", unavailable: "归档状态暂不可用", not_applicable: "暂无可归档任务"}[archiveStatus.status] || "归档状态未知";
-  $("archiveStatus").textContent = `归档状态：${archiveLabel}`;
+  renderArchiveStatus();
   renderActions(job);
 
   const latestAttempts = new Map();
@@ -482,21 +604,18 @@ function renderWindowActions(job, windowItem, attempt) {
 }
 
 function renderSegments() {
-  const pageCount = Math.max(1, Math.ceil(state.segments.length / SEGMENTS_PER_PAGE));
+  const pageCount = Math.max(1, state.segmentTotalPages);
   state.segmentPage = Math.max(1, Math.min(pageCount, state.segmentPage));
   const startIndex = (state.segmentPage - 1) * SEGMENTS_PER_PAGE;
-  const pageSegments = state.segments.slice(startIndex, startIndex + SEGMENTS_PER_PAGE);
   $("segmentPageInfo").textContent = `${state.segmentPage} / ${pageCount}`;
   $("previousSegmentPage").disabled = state.segmentPage <= 1;
   $("nextSegmentPage").disabled = state.segmentPage >= pageCount;
 
-  const availableIds = new Set(state.segments.filter(isMergeSelectable).map((segment) => Number(segment.id)));
-  [...state.selectedSegmentIds].forEach((id) => { if (!availableIds.has(id)) state.selectedSegmentIds.delete(id); });
-  $("segmentsBody").innerHTML = pageSegments.map((segment, pageIndex) => {
-    const segmentIndex = startIndex + pageIndex;
+  $("segmentsBody").innerHTML = state.segments.map((segment, segmentIndex) => {
+    const displayIndex = startIndex + segmentIndex;
     const previewable = Boolean(segment.segment_url);
     const active = previewable && segment.segment_url === state.previewUrl;
-    const title = segment.title || `片段 ${segmentIndex + 1}`;
+    const title = segment.title || `片段 ${displayIndex + 1}`;
     const keywords = (segment.keywords || []).join(", ") || "-";
     const isMerge = segment.record_kind === "merge";
     const isMember = Boolean(segment.active_merge_id);
@@ -548,7 +667,8 @@ function isMergeSelectable(segment) {
 }
 
 function renderMergeSelectionBar() {
-  const selected = state.segments.filter((segment) => state.selectedSegmentIds.has(Number(segment.id)) && isMergeSelectable(segment));
+  const selected = [...state.selectedSegments.values()]
+    .filter((segment) => state.selectedSegmentIds.has(Number(segment.id)) && isMergeSelectable(segment));
   $("mergeSelectionBar").hidden = selected.length === 0;
   $("mergeSelectionSummary").textContent = `已选择 ${selected.length} 条`;
   $("openMergeDialogButton").disabled = selected.length < 2;
@@ -653,6 +773,9 @@ async function submitSegmentEdit(event) {
       ? segment.merge_id === updated.merge_id
       : segment.id === updated.id);
     if (index >= 0) state.segments[index] = updated;
+    if (state.selectedSegmentIds.has(Number(updated.id))) {
+      state.selectedSegments.set(Number(updated.id), updated);
+    }
     if (state.previewUrl && updated.segment_url === state.previewUrl) {
       $("previewTitle").textContent = updated.title || `片段 ${index + 1}`;
     }
@@ -670,7 +793,7 @@ async function submitSegmentEdit(event) {
 }
 
 async function openSegmentMerge() {
-  const ids = state.segments
+  const ids = [...state.selectedSegments.values()]
     .filter((segment) => state.selectedSegmentIds.has(Number(segment.id)) && isMergeSelectable(segment))
     .sort((left, right) => Number(left.global_start) - Number(right.global_start))
     .map((segment) => Number(segment.id));
@@ -730,8 +853,9 @@ async function submitSegmentMerge(event) {
     $("segmentMergeDialog").close();
     state.mergePreview = null;
     state.selectedSegmentIds.clear();
+    state.selectedSegments.clear();
     showToast(`已手工合并 ${preview.segmentIds.length} 条结果`);
-    await loadJobs();
+    await Promise.all([loadJobs(), loadDetail(state.selectedJobId, false)]);
   } catch (error) {
     $("segmentMergeError").textContent = error.message;
     $("segmentMergeError").hidden = false;
@@ -747,7 +871,7 @@ async function cancelSegmentMerge(mergeId) {
   try {
     await api(`/api/jobs/${state.selectedJobId}/segment-merges/${mergeId}`, { method: "DELETE" });
     showToast("已取消手工合并，原始结果已恢复");
-    await loadJobs();
+    await Promise.all([loadJobs(), loadDetail(state.selectedJobId, false)]);
   } catch (error) {
     showToast(error.message);
   }
@@ -916,6 +1040,7 @@ async function controlJob(jobId, action, button = null) {
     await api(`/api/jobs/${jobId}/${action}`, { method: "POST" });
     showToast("作业状态已更新");
     await loadJobs();
+    if (state.selectedJobId === jobId) await loadDetail(jobId, false);
   } catch (error) {
     showToast(error.message);
     if (button) button.disabled = false;
@@ -1030,6 +1155,7 @@ async function submitResplit(event) {
     state.resplitTarget = null;
     showToast(`新任务 ${result.taskId} 已进入重新拆分流程`);
     await loadJobs();
+    if (state.selectedJobId === target.jobId) await loadDetail(target.jobId, false);
   } catch (error) {
     $("resplitError").textContent = error.message;
     $("resplitError").hidden = false;
@@ -1084,6 +1210,7 @@ async function submitTailRebuild(event) {
     state.tailRebuildTarget = null;
     showToast(`已删除窗口 ${target.windowIndex + 1} 及之后的数据，作业已重新入队`);
     await loadJobs();
+    if (state.selectedJobId === target.jobId) await loadDetail(target.jobId, false);
   } catch (error) {
     $("tailRebuildError").textContent = error.message;
     $("tailRebuildError").hidden = false;
@@ -1193,8 +1320,14 @@ $("segmentsBody").addEventListener("change", (event) => {
   const checkbox = event.target.closest(".merge-segment-checkbox");
   if (!checkbox) return;
   const segmentId = Number(checkbox.dataset.segmentId);
-  if (checkbox.checked) state.selectedSegmentIds.add(segmentId);
-  else state.selectedSegmentIds.delete(segmentId);
+  if (checkbox.checked) {
+    state.selectedSegmentIds.add(segmentId);
+    const segment = state.segments.find((item) => Number(item.id) === segmentId);
+    if (segment) state.selectedSegments.set(segmentId, segment);
+  } else {
+    state.selectedSegmentIds.delete(segmentId);
+    state.selectedSegments.delete(segmentId);
+  }
   renderSegments();
 });
 $("segmentsBody").addEventListener("keydown", (event) => {
@@ -1241,6 +1374,7 @@ $("segmentEditForm").addEventListener("submit", submitSegmentEdit);
 $("openMergeDialogButton").addEventListener("click", openSegmentMerge);
 $("clearMergeSelectionButton").addEventListener("click", () => {
   state.selectedSegmentIds.clear();
+  state.selectedSegments.clear();
   renderSegments();
 });
 $("segmentMergeMembers").addEventListener("change", (event) => {
@@ -1252,7 +1386,11 @@ $("segmentMergeMembers").addEventListener("change", (event) => {
     false
   );
 });
-$("refreshButton").addEventListener("click", () => loadJobs().catch((error) => showToast(error.message)));
+$("refreshButton").addEventListener("click", () => {
+  const requests = [loadJobs()];
+  if (state.selectedJobId) requests.push(loadDetail(state.selectedJobId, false));
+  Promise.all(requests).catch((error) => showToast(error.message));
+});
 $("saveTimeReferenceButton").addEventListener("click", saveTimeReference);
 $("summaryRealTime").addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
@@ -1281,16 +1419,18 @@ $("nextJobPage").addEventListener("click", () => {
 });
 $("acceptedOnly").addEventListener("change", () => {
   state.segmentPage = 1;
-  if (state.selectedJobId) loadDetail(state.selectedJobId, false);
+  state.selectedSegmentIds.clear();
+  state.selectedSegments.clear();
+  if (state.selectedJobId) loadSegmentPage().catch((error) => showToast(error.message));
 });
 $("detailReviewed").addEventListener("change", () => updateJobReview($("detailReviewed")));
 $("previousSegmentPage").addEventListener("click", () => {
   state.segmentPage -= 1;
-  renderSegments();
+  loadSegmentPage().catch((error) => showToast(error.message));
 });
 $("nextSegmentPage").addEventListener("click", () => {
   state.segmentPage += 1;
-  renderSegments();
+  loadSegmentPage().catch((error) => showToast(error.message));
 });
 
 Promise.all([loadHealth(), loadChannels().then(loadJobs), loadISliceInstances()])
@@ -1306,5 +1446,18 @@ priorityButton.type = "button";
 priorityButton.textContent = "\u8c03\u5ea6\u7b56\u7565";
 priorityButton.addEventListener("click", () => configureSchedulingPriority().catch((error) => showToast(error.message)));
 document.querySelector(".topbar-actions")?.insertBefore(priorityButton, $("openCreateButton"));
-window.setInterval(() => loadJobs().catch(() => {}), 5000);
+window.setInterval(() => {
+  if (!document.hidden) loadJobs().catch(() => {});
+}, 5000);
+window.setInterval(() => {
+  if (!document.hidden) refreshSelectedJobState().catch(() => {});
+}, 10000);
 window.setInterval(() => loadHealth().catch(() => {}), 30000);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  loadJobs().catch(() => {});
+  refreshSelectedJobState().catch(() => {});
+  if (state.selectedJobId && state.archiveStatus?.status === "pending") {
+    loadArchiveStatus(state.selectedJobId).catch(() => {});
+  }
+});

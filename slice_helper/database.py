@@ -2713,10 +2713,22 @@ class Database:
             await db.commit()
 
     async def get_segments(
-        self, job_id: str, accepted_only: bool = False
+        self,
+        job_id: str,
+        accepted_only: bool = False,
+        *,
+        include_raw: bool = True,
     ) -> list[dict[str, Any]]:
-        query = """
-            SELECT s.*, w.window_index, j.islice_base_url,
+        segment_columns = "s.*" if include_raw else """
+                    s.id, s.job_id, s.window_id, s.source_index, s.accepted,
+                    s.ignored, s.reason, s.local_start, s.local_end,
+                    s.global_start, s.global_end, s.absolute_start,
+                    s.absolute_end, s.title, s.content_type,
+                    s.news_event_type, s.topic, s.keywords_json, s.summary,
+                    s.segment_url, s.cover_img_url, s.attempt_id, s.task_id
+                """
+        query = f"""
+            SELECT {segment_columns}, w.window_index, j.islice_base_url,
                    mm.merge_id AS active_merge_id,
                    mm.member_order AS merge_member_order,
                    mm.role AS merge_role,

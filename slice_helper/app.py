@@ -171,12 +171,12 @@ async def _resolve_archive_media(
             task_rows.setdefault((base_url, task_id), []).append(row)
     resolved: dict[tuple[str, str], dict[int, dict[str, Any]]] = {}
     errors: dict[tuple[str, str], str] = {}
-    for key in task_rows:
+    async def resolve_task(key: tuple[str, str]) -> None:
         base_url, task_id = key
         instance = by_url.get(base_url)
         if not instance:
             errors[key] = "未找到对应的 iSlice 归档配置"
-            continue
+            return
         try:
             preview = await archive_catalog.read_task_preview(instance, task_id)
             resolved[key] = {
@@ -190,6 +190,8 @@ async def _resolve_archive_media(
                 row["archive_url"] = preview.get("archiveUrl") or ""
         except ArchivePreviewError as exc:
             errors[key] = str(exc)
+
+    await asyncio.gather(*(resolve_task(key) for key in task_rows))
     for row in rows:
         key = (
             str(row.get("islice_base_url") or "").rstrip("/"),
@@ -1196,21 +1198,59 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request,
         job_id: str,
         accepted_only: bool = Query(default=False, alias="acceptedOnly"),
+        page: int | None = Query(default=None, ge=1),
+        page_size: int | None = Query(default=None, alias="pageSize", ge=1, le=100),
     ):
         if not await request.app.state.database.get_job(job_id):
             raise HTTPException(status_code=404, detail="Job not found")
-        rows = await request.app.state.database.get_segments(job_id, accepted_only=accepted_only)
-        rows = await _resolve_archive_media(
-            request.app.state.database, request.app.state.archive_catalog, rows
+        pagination_requested = page is not None or page_size is not None
+        rows = await request.app.state.database.get_segments(
+            job_id,
+            accepted_only=accepted_only,
+            include_raw=not pagination_requested,
         )
-        return [_public_segment(row) for row in rows]
+        # Keep the original unpaginated list response for API clients that do
+        # not send pagination parameters. The browser always requests pages.
+        if not pagination_requested:
+            rows = await _resolve_archive_media(
+                request.app.state.database, request.app.state.archive_catalog, rows
+            )
+            return [_public_segment(row) for row in rows]
+        page = page or 1
+        page_size = page_size or 10
+        total = len(rows)
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        if page > total_pages:
+            page = total_pages
+        start = (page - 1) * page_size
+        page_rows = rows[start : start + page_size]
+        page_rows = await _resolve_archive_media(
+            request.app.state.database, request.app.state.archive_catalog, page_rows
+        )
+        items = []
+        for row in page_rows:
+            item = _public_segment(row)
+            # The list never renders the full original iSlice payload.  Keep it
+            # behind the existing per-segment task-values endpoint instead of
+            # sending it on every page view.
+            item.pop("raw", None)
+            items.append(item)
+        return {
+            "items": items,
+            "page": page,
+            "pageSize": page_size,
+            "total": total,
+            "totalPages": total_pages,
+        }
 
     @application.get("/api/jobs/{job_id}/archive-status")
     async def job_archive_status(request: Request, job_id: str):
         job = await request.app.state.database.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
-        rows = await request.app.state.database.get_segments(job_id, accepted_only=False)
+        rows = await request.app.state.database.get_segments(
+            job_id, accepted_only=False, include_raw=False
+        )
         rows = await _resolve_archive_media(
             request.app.state.database, request.app.state.archive_catalog, rows
         )

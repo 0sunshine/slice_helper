@@ -289,6 +289,62 @@ async def test_archive_preview_rewrites_islice_media_to_archive_http() -> None:
 
 
 @pytest.mark.asyncio
+async def test_archive_preview_coalesces_concurrent_requests_and_uses_cache() -> None:
+    requests = {"catalog": 0, "segments": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/catalog.json"):
+            requests["catalog"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    "source": {"id": "islice-128"},
+                    "tasks": [
+                        {
+                            "task_id": "task-cache",
+                            "manifest_digest": "b" * 64,
+                            "archive_url": "http://archive.test/sources/islice-128/tasks/task-cache",
+                        }
+                    ],
+                },
+            )
+        if request.url.path.endswith("/tasks/task-cache/segments.json"):
+            requests["segments"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    "segments": [
+                        {
+                            "segmentUrl": "http://islice/download/task-cache/segments/one.mp4",
+                            "coverImgUrl": "",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    reader = ArchiveCatalogReader()
+    await reader.client.aclose()
+    reader.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    instance = {
+        "source_id": "islice-128",
+        "name": "iSlice 128",
+        "archive_catalog_url": "http://archive.test/sources/islice-128/catalog.json",
+    }
+    try:
+        previews = await asyncio.gather(
+            *(reader.read_task_preview(instance, "task-cache") for _ in range(5))
+        )
+        previews[0]["segments"][0]["segmentUrl"] = "changed"
+        cached = await reader.read_task_preview(instance, "task-cache")
+    finally:
+        await reader.close()
+
+    assert requests == {"catalog": 1, "segments": 1}
+    assert cached["segments"][0]["segmentUrl"].endswith("/segments/one.mp4")
+
+
+@pytest.mark.asyncio
 async def test_archive_preview_rejects_catalog_url_outside_source_root() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
