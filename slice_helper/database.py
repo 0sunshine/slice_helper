@@ -56,6 +56,9 @@ class Database:
         "started_at",
         "completed_at",
         "islice_base_url",
+        "source_duration",
+        "prepared_source_path",
+        "timeline_repaired",
         "program_start_time",
         "time_reference_source",
         "time_reference_text",
@@ -195,6 +198,8 @@ class Database:
                     source_size INTEGER NOT NULL,
                     source_mtime_ns INTEGER NOT NULL,
                     source_duration REAL NOT NULL,
+                    prepared_source_path TEXT NOT NULL DEFAULT '',
+                    timeline_repaired INTEGER NOT NULL DEFAULT 0,
                     source_url TEXT NOT NULL DEFAULT '',
                     islice_base_url TEXT NOT NULL DEFAULT '',
                     template_id TEXT NOT NULL,
@@ -373,6 +378,8 @@ class Database:
                 "superseded_by_job_id": "TEXT",
                 "reviewed": "INTEGER NOT NULL DEFAULT 0",
                 "rebuild_revision": "INTEGER NOT NULL DEFAULT 0",
+                "prepared_source_path": "TEXT NOT NULL DEFAULT ''",
+                "timeline_repaired": "INTEGER NOT NULL DEFAULT 0",
             }
             for column, declaration in migrations.items():
                 if column not in job_columns:
@@ -697,6 +704,10 @@ class Database:
             )
             await db.execute(
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(26, ?)",
+                (utc_now(),),
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(27, ?)",
                 (utc_now(),),
             )
             await db.commit()
@@ -2247,7 +2258,8 @@ class Database:
                 key: job.get(key)
                 for key in (
                     "id", "status", "current_window", "next_window_start",
-                    "total_windows", "rebuild_revision", "source_size",
+                    "total_windows", "source_duration", "prepared_source_path",
+                    "timeline_repaired", "rebuild_revision", "source_size",
                     "source_mtime_ns", "updated_at",
                 )
             },
@@ -2361,6 +2373,11 @@ class Database:
         start_window_index: int,
         expected_token: str,
         snapshot_path: str,
+        *,
+        source_duration: float | None = None,
+        total_windows: int | None = None,
+        prepared_source_path: str | None = None,
+        timeline_repaired: bool | None = None,
     ) -> dict[str, Any]:
         now = utc_now()
         rebuild_id = uuid.uuid4().hex
@@ -2384,6 +2401,28 @@ class Database:
                 await db.rollback()
                 raise ValueError("The window before the rebuild point is not completed")
 
+            rebuilt_duration = float(
+                source_duration
+                if source_duration is not None
+                else job["source_duration"]
+            )
+            rebuilt_total_windows = int(
+                total_windows if total_windows is not None else job["total_windows"]
+            )
+            if rebuilt_total_windows <= start_window_index:
+                await db.rollback()
+                raise ValueError("The repaired source ends before the rebuild point")
+            rebuilt_source_path = (
+                str(prepared_source_path)
+                if prepared_source_path is not None
+                else str(job.get("prepared_source_path") or "")
+            )
+            rebuilt_timeline_repaired = int(
+                bool(timeline_repaired)
+                if timeline_repaired is not None
+                else bool(job.get("timeline_repaired"))
+            )
+
             generation = int(job.get("rebuild_revision") or 0) + 1
             next_window_start = 0.0
             if previous is not None:
@@ -2391,6 +2430,11 @@ class Database:
                     previous["handoff_start"]
                     if previous["handoff_start"] is not None
                     else previous["nominal_end"]
+                )
+            if next_window_start >= rebuilt_duration:
+                await db.rollback()
+                raise ValueError(
+                    "The repaired source ends before the retained windows"
                 )
             await db.execute(
                 """
@@ -2423,14 +2467,20 @@ class Database:
                 """
                 UPDATE jobs SET status='pending_schedule', current_window=?, next_window_start=?,
                     progress=?, pause_requested=0, stop_requested=0, reviewed=0,
-                    error_message='', completed_at=NULL, rebuild_revision=?, updated_at=?
+                    error_message='', completed_at=NULL, rebuild_revision=?,
+                    source_duration=?, total_windows=?, prepared_source_path=?,
+                    timeline_repaired=?, updated_at=?
                 WHERE id=?
                 """,
                 (
                     start_window_index,
                     next_window_start,
-                    min(100.0, start_window_index / int(job["total_windows"]) * 100.0),
+                    min(100.0, start_window_index / rebuilt_total_windows * 100.0),
                     generation,
+                    rebuilt_duration,
+                    rebuilt_total_windows,
+                    rebuilt_source_path,
+                    rebuilt_timeline_repaired,
                     now,
                     job_id,
                 ),

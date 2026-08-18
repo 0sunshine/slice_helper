@@ -38,7 +38,7 @@ async def test_database_persists_and_recovers_jobs(tmp_path: Path) -> None:
 
     async with database.connect() as db:
         versions = await (await db.execute("SELECT version FROM schema_version ORDER BY version")).fetchall()
-    assert [row["version"] for row in versions] == list(range(1, 27))
+    assert [row["version"] for row in versions] == list(range(1, 28))
     async with database.connect() as db:
         segment_columns = {
             row["name"]
@@ -78,9 +78,13 @@ async def test_database_persists_and_recovers_jobs(tmp_path: Path) -> None:
     assert "time_reference_frame_offset" in job_columns
     assert "reviewed" in job_columns
     assert "rebuild_revision" in job_columns
+    assert "prepared_source_path" in job_columns
+    assert "timeline_repaired" in job_columns
     assert recovered["reviewed"] == 0
     assert recovered["islice_base_url"] == ""
     assert recovered["source_url"] == ""
+    assert recovered["prepared_source_path"] == ""
+    assert recovered["timeline_repaired"] == 0
 
     window = await database.upsert_window("job1", 0, 0, 3600)
     same_window = await database.upsert_window("job1", 0, 99, 999)
@@ -166,7 +170,14 @@ async def test_tail_rebuild_truncates_atomically_and_cascades_results(tmp_path: 
     assert len(preview["attempts"]) == 2
     assert len(preview["segments"]) == 2
     rebuild = await database.truncate_job_for_rebuild(
-        "tail-job", 1, preview["preview_token"], str(tmp_path / "snapshot.json")
+        "tail-job",
+        1,
+        preview["preview_token"],
+        str(tmp_path / "snapshot.json"),
+        source_duration=14_400.0,
+        total_windows=4,
+        prepared_source_path=str(tmp_path / "repaired.ts"),
+        timeline_repaired=True,
     )
 
     assert rebuild["generation"] == 1
@@ -179,6 +190,10 @@ async def test_tail_rebuild_truncates_atomically_and_cascades_results(tmp_path: 
     assert job["next_window_start"] == 3600
     assert job["reviewed"] == 0
     assert job["rebuild_revision"] == 1
+    assert job["source_duration"] == 14_400.0
+    assert job["total_windows"] == 4
+    assert job["prepared_source_path"] == str(tmp_path / "repaired.ts")
+    assert job["timeline_repaired"] == 1
     assert rebuild["status"] == "queued"
 
 

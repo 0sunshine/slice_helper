@@ -26,6 +26,15 @@ class FakeMedia:
         return MediaProbe(duration=3600, format_name="mpegts", video_codec="h264")
 
 
+class ExplodingPrepareMedia(FakeMedia):
+    def __init__(self) -> None:
+        self.prepare_calls = 0
+
+    async def prepare_timeline_source(self, _source):
+        self.prepare_calls += 1
+        raise AssertionError("legacy active jobs must not be prepared automatically")
+
+
 class InvalidMedia:
     async def cut(self, _source, _target, _start, _end, _mode):
         raise MediaError("chunk failed validation after audio repair")
@@ -394,6 +403,26 @@ async def wait_for_jobs_running(database: Database, expected: int) -> None:
             return
         await asyncio.sleep(0.002)
     raise AssertionError(f"Expected {expected} running jobs")
+
+
+@pytest.mark.asyncio
+async def test_legacy_job_keeps_original_source_without_timeline_preparation(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "legacy.ts"
+    source.write_bytes(b"source")
+    configured = make_settings(tmp_path)
+    database = Database(configured.database_path)
+    await database.initialize()
+    await create_job(database, source, duration=3600)
+    media = ExplodingPrepareMedia()
+    orchestrator = Orchestrator(configured, database, media, FakeISlice())
+    job = await database.get_job("abc123")
+
+    selected = await orchestrator._cut_source_for_job(job)
+
+    assert selected == source
+    assert media.prepare_calls == 0
 
 
 @pytest.mark.asyncio

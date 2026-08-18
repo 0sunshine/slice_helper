@@ -20,6 +20,7 @@ from .media import MediaError, MediaService
 from .models import CutMode, JobStatus, WindowStatus
 from .processing import (
     SegmentValidationError,
+    calculate_total_windows,
     calculate_window_end,
     process_segments,
 )
@@ -258,6 +259,15 @@ class Orchestrator:
         required_text = f"从窗口 {start_window_index + 1} 重跑"
         if confirmation_text != required_text:
             raise RebuildValidationError(f"Type exactly: {required_text}")
+        initial_job = await self.database.get_job(job_id)
+        self._validate_tail_rebuild_job(job_id, initial_job)
+        assert initial_job is not None
+        (
+            prepared_source_path,
+            repaired_source_duration,
+            repaired_total_windows,
+            timeline_repaired,
+        ) = await self._prepare_tail_rebuild_source(initial_job)
         async with self._rebuild_lock:
             job = await self.database.get_job(job_id)
             self._validate_tail_rebuild_job(job_id, job)
@@ -288,6 +298,10 @@ class Orchestrator:
                 "segments": state["segments"],
                 "merges": state["merges"],
                 "mergeMembers": state["merge_members"],
+                "preparedSourcePath": str(prepared_source_path),
+                "repairedSourceDuration": repaired_source_duration,
+                "repairedTotalWindows": repaired_total_windows,
+                "timelineRepaired": timeline_repaired,
             }
             try:
                 await asyncio.to_thread(self._atomic_json, snapshot_path, snapshot)
@@ -301,6 +315,10 @@ class Orchestrator:
                     start_window_index,
                     preview_token,
                     str(snapshot_path),
+                    source_duration=repaired_source_duration,
+                    total_windows=repaired_total_windows,
+                    prepared_source_path=str(prepared_source_path),
+                    timeline_repaired=timeline_repaired,
                 )
             except ValueError as exc:
                 snapshot_path.unlink(missing_ok=True)
@@ -310,6 +328,41 @@ class Orchestrator:
                 raise RebuildValidationError(message) from exc
             self.notify()
             return self._public_rebuild(rebuild)
+
+    async def _prepare_tail_rebuild_source(
+        self, job: dict[str, Any]
+    ) -> tuple[Path, float, int, bool]:
+        raw_prepared = str(job.get("prepared_source_path") or "")
+        if raw_prepared:
+            path = await self._cut_source_for_job(job)
+            return (
+                path,
+                float(job["source_duration"]),
+                int(job["total_windows"]),
+                bool(job.get("timeline_repaired")),
+            )
+        # Empty prepared_source_path identifies a legacy job. Only an explicit,
+        # confirmed tail rebuild opts it into the new timeline preparation flow.
+        prepare = getattr(self.media, "prepare_timeline_source", None)
+        if prepare is None:
+            return (
+                Path(job["source_path"]),
+                float(job["source_duration"]),
+                int(job["total_windows"]),
+                False,
+            )
+        prepared = await prepare(Path(job["source_path"]))
+        total_windows = calculate_total_windows(
+            prepared.probe.duration,
+            self.settings.window_seconds,
+            self.settings.window_boundary_tolerance_seconds,
+        )
+        return (
+            prepared.path,
+            prepared.probe.duration,
+            total_windows,
+            prepared.repaired,
+        )
 
     def _validate_tail_rebuild_job(
         self, job_id: str, job: dict[str, Any] | None
@@ -618,8 +671,9 @@ class Orchestrator:
             await self.database.update_window(
                 window["id"], status=WindowStatus.CUTTING.value, error_message=""
             )
+            cut_source = await self._cut_source_for_job(job)
             await self.media.cut(
-                Path(job["source_path"]),
+                cut_source,
                 chunk_path,
                 start,
                 end,
@@ -956,6 +1010,24 @@ class Orchestrator:
             return False
         return stat.st_size == job["source_size"] and stat.st_mtime_ns == job["source_mtime_ns"]
 
+    async def _cut_source_for_job(self, job: dict[str, Any]) -> Path:
+        """Use the source pinned at creation without changing legacy jobs."""
+        original = Path(job["source_path"])
+        raw_prepared = str(job.get("prepared_source_path") or "")
+        if not raw_prepared:
+            return original
+        prepared_path = Path(raw_prepared)
+        if prepared_path.is_file():
+            return prepared_path
+        if not bool(job.get("timeline_repaired")):
+            return original
+        prepared = await self.media.prepare_timeline_source(original)
+        if not prepared.repaired:
+            raise MediaError(
+                "The job's repaired timeline source is missing and could not be recreated"
+            )
+        return prepared.path
+
     def _islice_client(self, job: dict[str, Any]) -> ISliceClient:
         if isinstance(self.islice, ISlicePool):
             return self.islice.get_client(str(job.get("islice_base_url") or ""))
@@ -985,8 +1057,9 @@ class Orchestrator:
         if not chunk_path.is_file():
             await self.database.update_window(window["id"], status=WindowStatus.CUTTING.value)
             try:
+                cut_source = await self._cut_source_for_job(job)
                 await self.media.cut(
-                    Path(job["source_path"]),
+                    cut_source,
                     chunk_path,
                     start,
                     end,
@@ -1601,6 +1674,7 @@ class Orchestrator:
         payload["pause_requested"] = bool(payload["pause_requested"])
         payload["stop_requested"] = bool(payload["stop_requested"])
         payload["reviewed"] = bool(payload.get("reviewed"))
+        payload["timeline_repaired"] = bool(payload.get("timeline_repaired"))
         payload["warnings"] = json.loads(payload.pop("warnings_json") or "[]")
         return payload
 

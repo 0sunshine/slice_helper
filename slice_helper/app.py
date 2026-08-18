@@ -128,6 +128,7 @@ def _public_job(job: dict[str, Any]) -> dict[str, Any]:
     result["pause_requested"] = bool(result.get("pause_requested"))
     result["stop_requested"] = bool(result.get("stop_requested"))
     result["reviewed"] = bool(result.get("reviewed"))
+    result["timeline_repaired"] = bool(result.get("timeline_repaired"))
     result["warnings"] = json.loads(result.pop("warnings_json", "[]") or "[]")
     result["accepted_segment_count"] = int(result.get("accepted_segment_count") or 0)
     result["window_count"] = int(result.get("window_count") or 0)
@@ -964,8 +965,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "job stopped"
         )
 
+        try:
+            prepared_source = await request.app.state.media.prepare_timeline_source(
+                source, probe
+            )
+        except (OSError, MediaError) as exc:
+            if managed_source:
+                shutil.rmtree(job_dir, ignore_errors=True)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if prepared_source.repaired:
+            warnings.append(
+                "Source timestamp discontinuities were repaired without video "
+                "re-encoding; slicing uses the prepared timeline source: "
+                f"duration {prepared_source.original_duration:.2f}s -> "
+                f"{prepared_source.probe.duration:.2f}s"
+            )
+
         total_windows = calculate_total_windows(
-            probe.duration,
+            prepared_source.probe.duration,
             configured.window_seconds,
             configured.window_boundary_tolerance_seconds,
         )
@@ -976,7 +993,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "source_path": str(source),
                 "source_size": stat.st_size,
                 "source_mtime_ns": stat.st_mtime_ns,
-                "source_duration": probe.duration,
+                "source_duration": prepared_source.probe.duration,
+                "prepared_source_path": str(prepared_source.path),
+                "timeline_repaired": int(prepared_source.repaired),
                 "source_url": source_url,
                 "islice_base_url": selected_islice_url,
                 "template_id": body.template_id,

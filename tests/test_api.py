@@ -14,7 +14,7 @@ from slice_helper.app import _random_ocr_frame_offsets, create_app
 from slice_helper.config import Settings
 from slice_helper.database import Database
 from slice_helper.excel_export import HEADERS, TEMPLATE_PATH
-from slice_helper.media import MediaError
+from slice_helper.media import MediaError, PreparedMedia
 from slice_helper.models import MediaProbe
 from slice_helper.orchestrator import Orchestrator
 from slice_helper.source_download import SourceDownloadError
@@ -150,8 +150,8 @@ def test_job_api_control_and_database_backed_chunk_route(
             assert f'<option value="{content_type}">{content_type}</option>' in home.text
         assert 'id="summaryISlice"' in home.text
         assert 'id="detailReviewed"' in home.text
-        assert "/static/styles.css?v=0.19.0" in home.text
-        assert "/static/app.js?v=0.19.0" in home.text
+        assert "/static/styles.css?v=0.20.0" in home.text
+        assert "/static/app.js?v=0.20.0" in home.text
         assert 'id="tailRebuildDialog"' in home.text
         assert 'id="timeRefreshDialog"' in home.text
         assert 'id="timeRefreshForm"' in home.text
@@ -197,6 +197,8 @@ def test_job_api_control_and_database_backed_chunk_route(
         assert job["islice_base_url"] == "http://islice.test"
         assert job["channel_name"] == "测试频道"
         assert job["reviewed"] is False
+        assert job["prepared_source_path"] == str(source.resolve())
+        assert job["timeline_repaired"] is False
         listed_job = client.get("/api/jobs").json()["items"][0]
         assert "current_task_id" in listed_job
         assert "current_task_progress" in listed_job
@@ -410,6 +412,22 @@ def test_create_job_uses_manual_time_only_when_ocr_fails(
         attempted_offsets.append(kwargs["frame_offset_seconds"])
         raise MediaError("timestamp not found")
 
+    async def fake_prepare(_self, _source, original_probe):
+        repaired = tmp_path / "repaired.ts"
+        repaired.write_bytes(b"repaired")
+        return PreparedMedia(
+            path=repaired,
+            probe=MediaProbe(
+                duration=7200.0,
+                format_name="mpegts",
+                video_codec="h264",
+                audio_codec="aac",
+            ),
+            repaired=True,
+            original_duration=original_probe.duration,
+            dts_delta_threshold=24.28,
+        )
+
     async def no_start(_self):
         return None
 
@@ -419,6 +437,9 @@ def test_create_job_uses_manual_time_only_when_ocr_fails(
     monkeypatch.setattr("slice_helper.media.MediaService.probe", fake_probe)
     monkeypatch.setattr(
         "slice_helper.media.MediaService.detect_time_reference", failed_time_reference
+    )
+    monkeypatch.setattr(
+        "slice_helper.media.MediaService.prepare_timeline_source", fake_prepare
     )
     monkeypatch.setattr(
         "slice_helper.app._random_ocr_frame_offsets",
@@ -449,6 +470,10 @@ def test_create_job_uses_manual_time_only_when_ocr_fails(
     assert job["time_reference_error"].startswith("5s: timestamp not found")
     assert job["time_reference_error"].endswith("113s: timestamp not found")
     assert "fallback" in job["warnings"][0].lower()
+    assert job["source_duration"] == 7200.0
+    assert job["total_windows"] == 2
+    assert job["prepared_source_path"] == str(tmp_path / "repaired.ts")
+    assert job["timeline_repaired"] is True
 
 
 def test_create_job_retries_ocr_and_back_calculates_first_frame_time(
@@ -1231,7 +1256,7 @@ def test_completed_task_review_page_and_api(tmp_path: Path, monkeypatch) -> None
                 "科教", "文艺", "生活服务", "商业广告", "公益广告", "电视购物", "其他",
             )
         )
-        assert "/static/task_review.js?v=0.19.0" in page.text
+        assert "/static/task_review.js?v=0.20.0" in page.text
         assert 'id="taskReviewSeek"' in page.text
         assert 'id="taskReviewSegmentCount"' in page.text
         assert 'id="taskJobReviewed"' in page.text
