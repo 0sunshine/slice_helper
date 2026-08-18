@@ -608,6 +608,10 @@ function renderSegments() {
   state.segmentPage = Math.max(1, Math.min(pageCount, state.segmentPage));
   const startIndex = (state.segmentPage - 1) * SEGMENTS_PER_PAGE;
   $("segmentPageInfo").textContent = `${state.segmentPage} / ${pageCount}`;
+  $("segmentPageInput").max = String(pageCount);
+  $("segmentPageInput").value = String(state.segmentPage);
+  $("segmentPageInput").disabled = pageCount <= 1;
+  $("goToSegmentPage").disabled = pageCount <= 1;
   $("previousSegmentPage").disabled = state.segmentPage <= 1;
   $("nextSegmentPage").disabled = state.segmentPage >= pageCount;
 
@@ -657,6 +661,24 @@ function renderSegments() {
      </tr>`;
   }).join("") || '<tr><td class="empty-table-row" colspan="10">暂无拆条结果</td></tr>';
   renderMergeSelectionBar();
+}
+
+function goToSegmentPage() {
+  const input = $("segmentPageInput");
+  const page = Number(input.value);
+  const pageCount = Math.max(1, state.segmentTotalPages);
+  if (!Number.isInteger(page) || page < 1 || page > pageCount) {
+    showToast(`请输入 1 到 ${pageCount} 之间的整数页码`, true);
+    input.focus();
+    input.select();
+    return;
+  }
+  if (page === state.segmentPage) {
+    input.value = String(state.segmentPage);
+    return;
+  }
+  state.segmentPage = page;
+  loadSegmentPage().catch((error) => showToast(error.message, true));
 }
 
 function isMergeSelectable(segment) {
@@ -1425,12 +1447,19 @@ $("acceptedOnly").addEventListener("change", () => {
 });
 $("detailReviewed").addEventListener("change", () => updateJobReview($("detailReviewed")));
 $("previousSegmentPage").addEventListener("click", () => {
-  state.segmentPage -= 1;
+  if (state.segmentPage > 1) state.segmentPage -= 1;
   loadSegmentPage().catch((error) => showToast(error.message));
 });
 $("nextSegmentPage").addEventListener("click", () => {
-  state.segmentPage += 1;
+  if (state.segmentPage < state.segmentTotalPages) state.segmentPage += 1;
   loadSegmentPage().catch((error) => showToast(error.message));
+});
+$("goToSegmentPage").addEventListener("click", goToSegmentPage);
+$("segmentPageInput").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    goToSegmentPage();
+  }
 });
 
 Promise.all([loadHealth(), loadChannels().then(loadJobs), loadISliceInstances()])

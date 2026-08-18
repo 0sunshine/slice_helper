@@ -50,7 +50,9 @@ main { width: 100%; }
 .job-filters { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 9px; }
 .job-filters input, .job-filters select { min-height: 34px; }
 .segments-controls, .segment-pagination { display: flex; align-items: center; gap: 8px; }
-.segment-pagination { color: #626a64; font-size: 12px; }
+.segment-pagination { color: #626a64; font-size: 12px; flex-wrap: wrap; justify-content: flex-end; }
+.segment-page-jump { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.segment-page-jump input { width: 66px; min-height: 28px; padding: 3px 6px; text-align: center; }
 .pagination-button { width: 28px; height: 28px; min-height: 28px; border: 1px solid #cbd2cd; border-radius: 5px; background: #ffffff; font-size: 20px; line-height: 1; }
 .pagination-button:disabled { cursor: default; opacity: .4; }
 .jobs-pagination { min-height: 46px; display: flex; align-items: center; justify-content: flex-end; gap: 9px; color: #626a64; font-size: 12px; }

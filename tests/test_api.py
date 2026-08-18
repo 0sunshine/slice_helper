@@ -120,6 +120,9 @@ def test_job_api_control_and_database_backed_chunk_route(
         assert 'id="segmentPageInfo"' in home.text
         assert 'id="previousSegmentPage"' in home.text
         assert 'id="nextSegmentPage"' in home.text
+        assert 'id="segmentPageInput"' in home.text
+        assert 'id="goToSegmentPage"' in home.text
+        assert "拆条结果页码" in home.text
         assert 'id="previewDialog"' not in home.text
         assert 'class="media-workspace"' in home.text
         assert 'class="segment-results-panel"' in home.text
@@ -150,8 +153,8 @@ def test_job_api_control_and_database_backed_chunk_route(
             assert f'<option value="{content_type}">{content_type}</option>' in home.text
         assert 'id="summaryISlice"' in home.text
         assert 'id="detailReviewed"' in home.text
-        assert "/static/styles.css?v=0.20.0" in home.text
-        assert "/static/app.js?v=0.20.0" in home.text
+        assert "/static/styles.css?v=0.20.1" in home.text
+        assert "/static/app.js?v=0.20.1" in home.text
         assert 'id="tailRebuildDialog"' in home.text
         assert 'id="timeRefreshDialog"' in home.text
         assert 'id="timeRefreshForm"' in home.text
@@ -1256,7 +1259,7 @@ def test_completed_task_review_page_and_api(tmp_path: Path, monkeypatch) -> None
                 "科教", "文艺", "生活服务", "商业广告", "公益广告", "电视购物", "其他",
             )
         )
-        assert "/static/task_review.js?v=0.20.0" in page.text
+        assert "/static/task_review.js?v=0.20.1" in page.text
         assert 'id="taskReviewSeek"' in page.text
         assert 'id="taskReviewSegmentCount"' in page.text
         assert 'id="taskJobReviewed"' in page.text

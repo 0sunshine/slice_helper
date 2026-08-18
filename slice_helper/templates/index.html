@@ -139,9 +139,15 @@
               <label><input id="detailReviewed" class="review-checkbox" type="checkbox"> 作业已审核</label>
               <label><input id="acceptedOnly" type="checkbox" checked> 仅最终采用</label>
               <div class="segment-pagination" aria-label="拆条结果分页">
-                <span id="segmentPageInfo">1 / 1</span>
                 <button id="previousSegmentPage" class="icon-button pagination-button" type="button" aria-label="上一页" title="上一页">&lsaquo;</button>
+                <span id="segmentPageInfo">1 / 1</span>
                 <button id="nextSegmentPage" class="icon-button pagination-button" type="button" aria-label="下一页" title="下一页">&rsaquo;</button>
+                <label class="segment-page-jump" for="segmentPageInput">
+                  跳至
+                  <input id="segmentPageInput" type="number" min="1" step="1" value="1" inputmode="numeric" aria-label="拆条结果页码">
+                  页
+                </label>
+                <button id="goToSegmentPage" class="button secondary small" type="button">跳转</button>
               </div>
             </div>
           </div>
